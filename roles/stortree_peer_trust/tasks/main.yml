@@ -1,0 +1,42 @@
+---
+# Declarative cross-host SSH trust for peer-sourced Samba data (spec.md
+# §7). Runs against every host in the same play, so by the time this
+# task file runs for host H, stortree_facts has already resolved every
+# other host too (linear strategy processes stortree_facts for the
+# whole batch before stortree_peer_trust starts) -- no separate
+# bootstrap/join step needed, and re-running keeps trust current as
+# peer dependencies change.
+#
+# Terminology matches spec.md §7: the "serving" side is the host that
+# needs another host's data (stortree.peer_dependencies here); the
+# "owning" side is delegated to and gets the serving host's pubkey
+# added to its authorized_keys.
+
+- name: Ensure this host has an SSH keypair for peer sftp mounts
+  community.crypto.openssh_keypair:
+    path: "{{ stortree_etc }}/peer_ssh_key"
+    type: ed25519
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0600"
+  when: stortree.peer_dependencies | length > 0
+  tags: [peer_trust]
+
+- name: Read this host's public key back
+  ansible.builtin.slurp:
+    src: "{{ stortree_etc }}/peer_ssh_key.pub"
+  register: stortree_peer_trust_pubkey_raw
+  when: stortree.peer_dependencies | length > 0
+  tags: [peer_trust]
+
+- name: Authorize this host's key on every host it peer-depends on
+  ansible.posix.authorized_key:
+    user: "{{ stortree_user }}"
+    key: "{{ stortree_peer_trust_pubkey_raw.content | b64decode }}"
+    key_options: >-
+      command="internal-sftp",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty
+    state: present
+  delegate_to: "{{ item }}"
+  loop: "{{ stortree.peer_dependencies | map(attribute='owning_host') | unique | list }}"
+  when: stortree.peer_dependencies | length > 0
+  tags: [peer_trust]

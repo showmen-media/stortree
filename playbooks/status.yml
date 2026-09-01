@@ -1,0 +1,55 @@
+---
+# Read-only report: resolved role, active mount unit states, Samba share
+# status, and an SSSD sanity check, printed per host (spec.md §8). No
+# state-changing modules -- safe to run any time.
+#
+# Usage: ansible-playbook playbooks/status.yml
+
+- name: Report resolved state and live status per host
+  hosts: all
+  become: true
+  gather_facts: false
+  roles:
+    - stortree_facts
+  tasks:
+    - name: Collect mount unit states
+      # No ansible.builtin.systemd_service query mode covers "list every
+      # unit matching a wildcard"; command is the actual right tool here.
+      ansible.builtin.command:  # noqa: command-instead-of-module
+        cmd: >-
+          systemctl list-units --type=service --all --plain --no-legend
+          'stortree-mount@*.service'
+      register: stortree_status_mounts
+      changed_when: false
+      failed_when: false
+      tags: [status]
+
+    - name: Collect Samba share status
+      ansible.builtin.command:
+        cmd: smbstatus --shares
+      register: stortree_status_smb
+      changed_when: false
+      failed_when: false
+      tags: [status]
+
+    - name: Check SSSD domain status
+      ansible.builtin.command:
+        cmd: sssctl domain-status stortree
+      register: stortree_status_sssd
+      changed_when: false
+      failed_when: false
+      tags: [status]
+
+    - name: Print per-host summary
+      ansible.builtin.debug:
+        msg:
+          - "== {{ inventory_hostname }} =="
+          - "server subtrees owned: {{ stortree.server_subtrees | map(attribute='path') | list }}"
+          - "client mount: {{ 'yes' if stortree.client_mounts else 'no' }}"
+          - "samba shares exported: {{ stortree.samba_shares | map(attribute='node_path') | list }}"
+          - "peer dependencies: {{ stortree.peer_dependencies | length }}"
+          - "peer served by: {{ stortree.peer_served_by | map(attribute='serving_host') | unique | list }}"
+          - "mount units: {{ stortree_status_mounts.stdout_lines }}"
+          - "smbstatus: {{ stortree_status_smb.stdout_lines }}"
+          - "sssd domain status: {{ stortree_status_sssd.stdout_lines }}"
+      tags: [status]

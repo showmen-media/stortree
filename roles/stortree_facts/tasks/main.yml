@@ -1,0 +1,19 @@
+---
+# Thin role: wraps the pure stortree_resolve() filter into per-host facts
+# so every later role/template works with plain `stortree.*` facts rather
+# than calling the filter directly (spec.md §1). Runs first in both
+# playbooks. `lookup('file', ...)` transparently decrypts a vaulted
+# config.yml when a vault password is available (spec.md "Config layout").
+
+- name: Load stortree/config.yml
+  ansible.builtin.set_fact:  # noqa: var-naming[no-role-prefix]
+    stortree_tree: "{{ lookup('file', stortree_config_path) | from_yaml }}"
+  tags: [facts]
+
+- name: Resolve this host's slice of the tree
+  ansible.builtin.set_fact:  # noqa: var-naming[no-role-prefix]
+    # `stortree` (not `stortree_facts_*`) is deliberate: this is the
+    # shared, cross-role fact every other role reads (spec.md §1), not a
+    # role-private working variable.
+    stortree: "{{ stortree_tree | stortree_resolve(inventory_hostname, stortree_all_hosts) }}"
+  tags: [facts]

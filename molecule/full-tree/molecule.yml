@@ -1,0 +1,65 @@
+---
+# Multi-host scenario exercising the whole flow -- config resolution,
+# mounts, Samba, ACLs, SSSD/LDAP, and peer-dependency provisioning
+# (spec.md §9) -- against a genuine two-owner peer dependency, plus a
+# third host with no mention in stortree/config.yml at all. Not run as
+# part of this build (docs/plan.md "What's verified").
+dependency:
+  name: galaxy
+  options:
+    requirements-file: ../../requirements.yml
+driver:
+  name: docker
+platforms:
+  - name: storage-node-alpha
+    image: "geerlingguy/docker-debian12-ansible:latest"
+    command: /lib/systemd/systemd
+    privileged: true
+    pre_build_image: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    tmpfs: [/run, /run/lock]
+    cap_add: [SYS_ADMIN]
+    devices: [/dev/fuse]
+  - name: storage-node-bravo
+    image: "geerlingguy/docker-debian12-ansible:latest"
+    command: /lib/systemd/systemd
+    privileged: true
+    pre_build_image: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    tmpfs: [/run, /run/lock]
+    cap_add: [SYS_ADMIN]
+    devices: [/dev/fuse]
+  - name: some-storage-gadget
+    image: "geerlingguy/docker-debian12-ansible:latest"
+    command: /lib/systemd/systemd
+    privileged: true
+    pre_build_image: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    tmpfs: [/run, /run/lock]
+    cap_add: [SYS_ADMIN]
+    devices: [/dev/fuse]
+  # Mocked dependencies (spec.md §9)
+  - name: openldap
+    image: "osixia/openldap:latest"
+    groups: [mocks]
+  - name: storagebox-mock
+    image: "atmoz/sftp:latest"
+    command: "stortree:stortree:::stortree"
+    groups: [mocks]
+  - name: some-remote-mock
+    image: "atmoz/sftp:latest"
+    command: "stortree:stortree:::stortree"
+    groups: [mocks]
+provisioner:
+  name: ansible
+  playbooks:
+    converge: converge.yml
+    verify: verify.yml
+verifier:
+  name: ansible

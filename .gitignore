@@ -1,0 +1,21 @@
+# Real, site-specific config -- never committed. Copy the *.example
+# files instead (see README.md "Setup").
+inventory/hosts.yml
+stortree/config.yml
+stortree/ldap.yml
+stortree/rclone.conf
+stortree/sshd_config
+*.vault-pass
+.vault_pass
+
+# Local tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.cache/
+collections/
+
+# Molecule / Ansible run artifacts
+.molecule/
+*.retry

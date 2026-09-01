@@ -1,0 +1,61 @@
+---
+# The worked example from docs/config-schema.md, verbatim. Every name
+# here -- hosts, groups, the `jd` user -- is fictional.
+#
+# Copy to stortree/config.yml and edit for your fleet. This file is
+# non-secret and does not need vault encryption on its own (unlike
+# ldap.yml/rclone.conf), though nothing stops you from vaulting it too.
+host: storage-node-alpha
+rclone.remote: storagebox:/
+
+client-defaults:
+  rclone.args:
+    vfs-cache-mode: full
+    vfs-cache-max-age: 100h
+    dir-cache-time: 5m
+
+clients:
+  some-storage-gadget:
+    rclone.args:
+      vfs-cache-max-size: 20G
+      cache-dir: /mnt/some-volume/.rclone-cache
+  storage-node-bravo:
+    rclone.args:
+      vfs-cache-max-size: 5G
+      cache-dir: /srv/stortree/.cache/storage-node-bravo
+
+subdirs:
+  .cache.subdirs:
+    storage-node-bravo:
+      host: storage-node-bravo
+      rclone.remote: some-remote:/.stortree-cache
+    some-gcs-bucket: {}
+  backups: {}
+  home:
+    samba:
+      subpath: "%U"
+    user-subdirs:
+      whitfield-media:
+        access:
+          - group: "Whitfield Family & Friends"
+            permissions: rx
+          - group: "Michael Whitfield Family"
+            permissions: rwx
+        host: storage-node-bravo
+        rclone.remote: some-remote:/media
+      sys-configs:
+        access.user: jd
+      mw-fam:
+        access.group: "Michael Whitfield Family"
+        host: storage-node-bravo
+        rclone.remote: some-remote:/fam
+      media-prod:
+        access.group: Media Production
+        rclone:
+          remote: some-gcs-bucket:/
+          args:
+            vfs-cache-mode: full
+            vfs-cache-max-size: 5G
+            vfs-cache-max-age: 100h
+            dir-cache-time: 5m
+            cache-dir: /srv/stortree/.cache/some-gcs-bucket

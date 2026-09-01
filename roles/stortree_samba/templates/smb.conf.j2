@@ -1,0 +1,24 @@
+# Managed by stortree (roles/stortree_samba) -- do not edit by hand.
+# One stanza per samba-configured node in the tree, for every
+# participating host (spec.md §4, config-schema.md "Samba sharing is
+# universal") -- not only the nodes this host happens to own.
+
+[global]
+workgroup = WORKGROUP
+security = user
+map to guest = never
+nt acl support = yes
+map acl inherit = yes
+inherit permissions = yes
+passdb backend = tdbsam
+
+{% for share in stortree.samba_shares %}
+[{{ share.node_path | regex_replace('[^A-Za-z0-9_-]', '_') }}]
+   path = {{ stortree_root }}/{{ share.node_path }}{{ '/' ~ share.subpath if share.subpath else '' }}
+   read only = no
+   valid users = {% for a in share.access %}{{ '@' if 'group' in a else '' }}{{ a.group | default(a.user) }}{{ ' ' if not loop.last else '' }}{% endfor %}
+
+   write list = {% for a in share.access if 'w' in a.permissions %}{{ '@' if 'group' in a else '' }}{{ a.group | default(a.user) }}{{ ' ' if not loop.last else '' }}{% endfor %}
+
+
+{% endfor %}

@@ -1,0 +1,5 @@
+---
+stortree_root: /srv/stortree
+stortree_etc: /etc/stortree
+stortree_user: stortree
+stortree_group: stortree

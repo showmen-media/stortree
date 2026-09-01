@@ -1,0 +1,21 @@
+# rclone's own native config format -- config.yml's rclone.remote fields
+# reference these section names directly (docs/config-schema.md
+# "rclone.conf"). Copy to stortree/rclone.conf, fill in real credentials
+# (or run `rclone config` against this path), then:
+#   ansible-vault encrypt stortree/rclone.conf
+
+[storagebox]
+type = sftp
+host = CHANGEME
+user = CHANGEME
+pass = CHANGEME
+
+[some-remote]
+type = sftp
+host = CHANGEME
+user = CHANGEME
+pass = CHANGEME
+
+[some-gcs-bucket]
+type = google cloud storage
+service_account_credentials = CHANGEME

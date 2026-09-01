@@ -1,0 +1,10 @@
+---
+# skip_list rationale:
+# - var-naming[no-role-prefix]: stortree deliberately uses one flat
+#   `stortree_*` namespace for facts/defaults shared *across* roles
+#   (the `stortree` fact itself, path defaults in stortree_facts,
+#   stortree_root/user/group in stortree_common, ...) rather than
+#   role-private variables -- that's the point of the shared contract
+#   described in docs/spec.md §1, not an oversight.
+skip_list:
+  - var-naming[no-role-prefix]

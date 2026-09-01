@@ -1,0 +1,17 @@
+---
+# Filtered, host-specific rclone.conf: only the remote sections this
+# host's resolved role actually needs, plus a synthesized sftp section
+# per peer dependency (spec.md §3). The master rclone.conf never leaves
+# the control node.
+
+- name: Render this host's filtered rclone.conf
+  ansible.builtin.copy:
+    content: >-
+      {{ lookup('file', stortree_rclone_conf_path)
+         | stortree_filter_rclone_conf(stortree, hostvars) }}
+    dest: "{{ stortree_etc }}/rclone.conf"
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0600"
+  no_log: true
+  tags: [secrets]

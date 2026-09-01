@@ -1,0 +1,40 @@
+---
+# Local `stortree` service account + the fixed mount root and per-host
+# state directory (spec.md §7). A plain local account, not resolved via
+# LDAP/SSSD -- it exists purely to own mount processes and any
+# peer-to-peer SSH relationship, independent of any human identity.
+
+- name: Create the stortree group
+  ansible.builtin.group:
+    name: "{{ stortree_group }}"
+    system: true
+    state: present
+  tags: [common]
+
+- name: Create the stortree service account
+  ansible.builtin.user:
+    name: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+    state: present
+  tags: [common]
+
+- name: Ensure the fixed mount root exists
+  ansible.builtin.file:
+    path: "{{ stortree_root }}"
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0750"
+  tags: [common]
+
+- name: Ensure the per-host rendered-state directory exists
+  ansible.builtin.file:
+    path: "{{ stortree_etc }}"
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0750"
+  tags: [common]

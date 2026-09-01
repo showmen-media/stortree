@@ -1,0 +1,11 @@
+---
+- name: Verify
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Stortree_facts produced the resolved stortree fact
+      ansible.builtin.assert:
+        that:
+          - stortree is defined
+          - stortree.server_subtrees is defined
+          - stortree.client_mounts is defined

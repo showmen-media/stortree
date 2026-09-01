@@ -1,0 +1,70 @@
+---
+# Applies each resolved `access` grant with ansible.posix.acl, directly
+# on the physical path, on whichever host actually serves that subtree
+# (spec.md §6) -- POSIX-level, so it governs access uniformly whether the
+# path is reached via Samba, SSH, or a local process. Reuses
+# stortree_plan_mounts' path expansion (same one stortree_mounts uses)
+# so a user-subdirs grant is applied at every authorized user's own
+# expanded path (docs/plan.md interpretation call #2), not a shared
+# %U-templated path that doesn't exist on disk.
+#
+# ACLs are naturally idempotent to reapply with the same spec, so this
+# always recomputes and reapplies from the resolved facts rather than
+# diffing against a previous run.
+
+- name: Look up membership for every group referenced in per-user access grants
+  ansible.builtin.getent:
+    database: group
+    key: "{{ item }}"
+  loop: >-
+    {{ stortree.server_subtrees
+       | selectattr('per_user')
+       | map(attribute='access')
+       | sum(start=[])
+       | selectattr('group', 'defined')
+       | map(attribute='group')
+       | unique
+       | list }}
+  tags: [acl]
+
+- name: Compute this host's flat mount plan (path + access, per user where applicable)
+  ansible.builtin.set_fact:
+    stortree_acl_plan: >-
+      {{ stortree
+         | stortree_plan_mounts(ansible_facts.getent_group | default({}) | stortree_group_members) }}
+  tags: [acl]
+
+- name: Flatten access grants to one (path, grant) pair per task
+  ansible.builtin.set_fact:
+    stortree_acl_targets: >-
+      {{ stortree_acl_plan
+         | subelements('access', skip_missing=true) }}
+  tags: [acl]
+
+- name: Apply effective ACLs
+  ansible.posix.acl:
+    path: "{{ stortree_root }}/{{ item.0.local_path }}"
+    etype: "{{ 'user' if 'user' in item.1 else 'group' }}"
+    entity: "{{ item.1.user | default(item.1.group) }}"
+    permissions: "{{ item.1.permissions }}"
+    recursive: true
+    default: false
+    state: present
+  loop: "{{ stortree_acl_targets }}"
+  loop_control:
+    label: "{{ item.0.local_path }}: {{ item.1 }}"
+  tags: [acl]
+
+- name: Apply matching default ACLs (so new files/dirs inherit the grant)
+  ansible.posix.acl:
+    path: "{{ stortree_root }}/{{ item.0.local_path }}"
+    etype: "{{ 'user' if 'user' in item.1 else 'group' }}"
+    entity: "{{ item.1.user | default(item.1.group) }}"
+    permissions: "{{ item.1.permissions }}"
+    recursive: true
+    default: true
+    state: present
+  loop: "{{ stortree_acl_targets }}"
+  loop_control:
+    label: "{{ item.0.local_path }}: {{ item.1 }}"
+  tags: [acl]

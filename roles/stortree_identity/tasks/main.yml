@@ -1,0 +1,20 @@
+---
+# SSSD against the LDAP server in stortree/ldap.yml, purely for POSIX
+# identity (spec.md §5). Not specific to any particular LDAP product.
+
+- name: Load stortree/ldap.yml
+  ansible.builtin.set_fact:
+    stortree_identity_ldap: "{{ lookup('file', stortree_ldap_path) | from_yaml }}"
+  no_log: true
+  tags: [identity]
+
+- name: Render sssd.conf
+  ansible.builtin.template:
+    src: sssd.conf.j2
+    dest: /etc/sssd/sssd.conf
+    owner: root
+    group: root
+    mode: "0600"
+  notify: stortree sssd.conf changed
+  no_log: true
+  tags: [identity]

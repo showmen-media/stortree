@@ -1,0 +1,15 @@
+---
+# Paths on the control node, relative to the playbook. Override if your
+# stortree/ checkout lives somewhere else (spec.md "Config layout").
+stortree_repo_root: "{{ playbook_dir }}/.."
+stortree_config_path: "{{ stortree_repo_root }}/stortree/config.yml"
+stortree_ldap_path: "{{ stortree_repo_root }}/stortree/ldap.yml"
+stortree_rclone_conf_path: "{{ stortree_repo_root }}/stortree/rclone.conf"
+stortree_sshd_config_path: "{{ stortree_repo_root }}/stortree/sshd_config"
+
+# The fleet stortree_resolve() treats as "all_hosts" (spec.md §1 -- every
+# host here participates whether or not it's named in config.yml).
+# Defaults to the whole inventory; override when the same inventory also
+# holds hosts that aren't part of the stortree fleet (e.g. the mocked
+# LDAP/sftp containers in the `full-tree` Molecule scenario).
+stortree_all_hosts: "{{ groups['all'] }}"

@@ -1,0 +1,31 @@
+---
+# Applies the real playbook (1:1 with playbooks/site.yml) to just the
+# three "real" storage hosts -- the openldap/*-mock platforms exist only
+# to be connected to, never to have stortree applied to them.
+
+- name: Apply the resolved stortree (full-tree scenario)
+  hosts: storage-node-alpha,storage-node-bravo,some-storage-gadget
+  become: true
+  vars:
+    # Exclude the mocked LDAP/sftp platforms (spec.md §9) from the
+    # resolved fleet -- they exist to be connected to, not to be
+    # resolved as stortree participants themselves.
+    stortree_all_hosts:
+      - storage-node-alpha
+      - storage-node-bravo
+      - some-storage-gadget
+    stortree_config_path: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') }}/molecule/fixtures/stortree/config.yml"
+    stortree_ldap_path: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') }}/molecule/full-tree/fixtures/ldap.yml"
+    stortree_rclone_conf_path: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') }}/molecule/full-tree/fixtures/rclone.conf"
+    stortree_sshd_config_path: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') }}/molecule/fixtures/stortree/sshd_config"
+  roles:
+    - stortree_facts
+    - stortree_common
+    - stortree_identity
+    - stortree_peer_trust
+    - stortree_secrets
+    - stortree_mounts
+    - stortree_acl
+    - stortree_samba
+    - stortree_pam_smbpass
+    - stortree_sshd

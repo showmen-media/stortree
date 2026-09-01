@@ -1,0 +1,25 @@
+---
+# Optional, freeform sshd_config fragment (spec.md §6). Only runs when
+# stortree/sshd_config is present in the repo -- never generates or
+# auto-populates its contents, only pushes and includes whatever's
+# written there.
+
+- name: Check whether an optional sshd_config fragment is present
+  ansible.builtin.stat:
+    path: "{{ stortree_sshd_config_path }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: stortree_sshd_config_stat
+  tags: [sshd]
+
+- name: Push the sshd_config fragment as a drop-in include
+  ansible.builtin.copy:
+    src: "{{ stortree_sshd_config_path }}"
+    dest: /etc/ssh/sshd_config.d/stortree.conf
+    owner: root
+    group: root
+    mode: "0600"
+  when: stortree_sshd_config_stat.stat.exists
+  notify: stortree sshd_config changed
+  tags: [sshd]

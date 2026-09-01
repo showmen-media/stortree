@@ -1,0 +1,7 @@
+ansible-core>=2.16,<2.18
+molecule>=25.1
+molecule-plugins[docker]>=23.6
+pytest>=8.0
+PyYAML>=6.0
+ansible-lint>=24.2
+yamllint>=1.35

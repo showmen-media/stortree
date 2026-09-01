@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  author: Philip Psychias
+  role_name: acl
+  namespace: stortree
+  description: "See docs/spec.md for what this role does."
+  license: GPL-3.0-only
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Debian
+      versions: [bookworm]
+    - name: Ubuntu
+      versions: [jammy, noble]
+dependencies: []

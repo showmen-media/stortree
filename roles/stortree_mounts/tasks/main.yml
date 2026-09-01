@@ -1,0 +1,102 @@
+---
+# One rclone-mount@<slug>.service per resolved mount (server subtree or
+# client mount), expanding user-subdirs entries into one mount per
+# authorized user (spec.md §2, docs/plan.md interpretation call #2).
+# Ansible's own idempotence (template only rewrites on change,
+# systemd_service only touches state that's out of sync) covers what a
+# hand-rolled reconciler would otherwise need to implement; only the
+# "stale unit no longer in the resolved set" case needs an explicit
+# cleanup step below.
+
+- name: Look up membership for every group referenced in per-user access grants
+  ansible.builtin.getent:
+    database: group
+    key: "{{ item }}"
+  loop: >-
+    {{ stortree.server_subtrees
+       | selectattr('per_user')
+       | map(attribute='access')
+       | sum(start=[])
+       | selectattr('group', 'defined')
+       | map(attribute='group')
+       | unique
+       | list }}
+  tags: [mounts]
+
+- name: Compute this host's flat mount plan
+  ansible.builtin.set_fact:
+    stortree_mounts_plan: >-
+      {{ stortree
+         | stortree_plan_mounts(ansible_facts.getent_group | default({}) | stortree_group_members) }}
+  tags: [mounts]
+
+- name: Ensure every mount point exists
+  ansible.builtin.file:
+    path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0750"
+  loop: "{{ stortree_mounts_plan }}"
+  loop_control:
+    label: "{{ item.local_path or '(root)' }}"
+  tags: [mounts]
+
+- name: Render systemd units for every resolved mount
+  ansible.builtin.template:
+    src: stortree-mount@.service.j2
+    dest: "/etc/systemd/system/stortree-mount@{{ item.slug }}.service"
+    mode: "0644"
+  loop: "{{ stortree_mounts_plan }}"
+  loop_control:
+    loop_var: entry
+    label: "{{ entry.local_path or '(root)' }}"
+  notify: stortree mounts changed
+  tags: [mounts]
+
+- name: Flush handlers so newly rendered units are known to systemd before enabling
+  ansible.builtin.meta: flush_handlers
+  tags: [mounts]
+
+- name: Enable and start every resolved mount
+  ansible.builtin.systemd_service:
+    name: "stortree-mount@{{ item.slug }}.service"
+    enabled: true
+    state: started
+  loop: "{{ stortree_mounts_plan }}"
+  loop_control:
+    label: "{{ item.local_path or '(root)' }}"
+  tags: [mounts]
+
+- name: Find currently installed stortree mount units
+  ansible.builtin.find:
+    paths: /etc/systemd/system
+    patterns: "stortree-mount@*.service"
+  register: stortree_mounts_installed_units
+  tags: [mounts]
+
+- name: Determine stale units no longer in the resolved set
+  ansible.builtin.set_fact:
+    stortree_mounts_stale_units: >-
+      {{ stortree_mounts_installed_units.files
+         | map(attribute='path')
+         | map('basename')
+         | reject('in', stortree_mounts_plan | stortree_mount_unit_names)
+         | list }}
+  tags: [mounts]
+
+- name: Stop and disable stale mount units
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop: "{{ stortree_mounts_stale_units }}"
+  tags: [mounts]
+
+- name: Remove stale mount unit files
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}"
+    state: absent
+  loop: "{{ stortree_mounts_stale_units }}"
+  notify: stortree mounts changed
+  tags: [mounts]

@@ -1,0 +1,5 @@
+# Fixture for the optional sshd_config fragment (spec.md §6) -- exercises
+# stortree_sshd actually running (the role no-ops when this file is
+# absent). Kept intentionally trivial.
+Match Group smb-sync
+    ForceCommand /bin/true

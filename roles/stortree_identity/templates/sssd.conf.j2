@@ -1,0 +1,23 @@
+# Managed by stortree (roles/stortree_identity) -- do not edit by hand.
+# POSIX identity only (uidNumber/gidNumber/group membership), against
+# whatever LDAP-compatible server stortree/ldap.yml points at (spec.md
+# §5). ldap_id_mapping is left unset (defaults to false for
+# id_provider=ldap), i.e. SSSD reads the directory's own POSIX
+# attributes rather than algorithmically synthesizing them -- confirm
+# your server actually exposes those attributes, see spec.md §5.
+
+[sssd]
+services = nss, pam
+domains = stortree
+
+[domain/stortree]
+id_provider = ldap
+auth_provider = ldap
+ldap_uri = {{ stortree_identity_ldap.server.url }}
+ldap_search_base = {{ stortree_identity_ldap.server.base_dn }}
+ldap_default_bind_dn = {{ stortree_identity_ldap.server.bind_dn }}
+ldap_default_authtok = {{ stortree_identity_ldap.server.bind_password }}
+ldap_user_uid_number = {{ stortree_identity_ldap.posix.uid_attr }}
+ldap_group_gid_number = {{ stortree_identity_ldap.posix.gid_attr }}
+cache_credentials = true
+enumerate = false

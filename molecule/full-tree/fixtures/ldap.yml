@@ -1,0 +1,13 @@
+---
+# full-tree-scenario-only override, pointed at the throwaway OpenLDAP
+# container (spec.md §9 "Mocked dependencies") instead of a real
+# directory.
+server:
+  url: ldap://openldap:389
+  base_dn: "dc=example,dc=internal"
+  bind_dn: "cn=admin,dc=example,dc=internal"
+  bind_password: admin
+
+posix:
+  uid_attr: uidNumber
+  gid_attr: gidNumber

@@ -1,0 +1,16 @@
+# Minimal tree exercising a mutual peer dependency: host-a and host-b
+# each own one piece of the same samba-shared node that the other needs.
+host: host-a
+rclone.remote: "remote-a:/"
+
+subdirs:
+  shared:
+    samba:
+      subpath: ""
+    subdirs:
+      piece-a:
+        host: host-a
+        rclone.remote: "remote-a:/piece-a"
+      piece-b:
+        host: host-b
+        rclone.remote: "remote-b:/piece-b"

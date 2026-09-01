@@ -1,0 +1,51 @@
+---
+- name: Verify
+  hosts: storage-node-alpha,storage-node-bravo,some-storage-gadget
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Alpha owns backups and home's non-bravo pieces
+      ansible.builtin.assert:
+        that:
+          - "'backups' in (stortree.server_subtrees | map(attribute='path') | list)"
+      when: inventory_hostname == 'storage-node-alpha'
+
+    - name: Bravo has a genuine peer dependency on alpha
+      ansible.builtin.assert:
+        that:
+          - stortree.peer_dependencies | selectattr('owning_host', 'equalto', 'storage-node-alpha') | list | length > 0
+      when: inventory_hostname == 'storage-node-bravo'
+
+    - name: Gadget owns nothing but exports the full home share via peers
+      ansible.builtin.assert:
+        that:
+          - stortree.server_subtrees | length == 0
+          - stortree.samba_shares | length == 1
+          - stortree.peer_dependencies | length > 0
+      when: inventory_hostname == 'some-storage-gadget'
+
+    - name: Every resolved mount unit is active
+      # No systemd_service query mode for "is this unit active"; command
+      # is the actual right tool here (same as playbooks/status.yml).
+      ansible.builtin.command:  # noqa: command-instead-of-module
+        cmd: systemctl is-active "stortree-mount@{{ item.slug }}.service"
+      loop: "{{ stortree | stortree_plan_mounts({}) }}"
+      loop_control:
+        label: "{{ item.local_path or '(root)' }}"
+      changed_when: false
+
+    - name: Smb.conf is valid
+      ansible.builtin.command:
+        cmd: testparm -s /etc/samba/smb.conf
+      changed_when: false
+
+    - name: SSSD domain is up
+      ansible.builtin.command:
+        cmd: sssctl domain-status stortree
+      changed_when: false
+      failed_when: false
+      register: stortree_verify_sssd
+
+    - name: Report SSSD status
+      ansible.builtin.debug:
+        var: stortree_verify_sssd.stdout_lines

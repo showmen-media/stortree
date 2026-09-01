@@ -1,0 +1,16 @@
+---
+# LDAP server connection + POSIX mapping (docs/config-schema.md
+# "ldap.yml"). Copy to stortree/ldap.yml, fill in real values, then:
+#   ansible-vault encrypt stortree/ldap.yml
+server:
+  url: ldaps://ldap.example.internal:636
+  base_dn: "dc=example,dc=internal"
+  bind_dn: "cn=stortree,ou=service-accounts,dc=example,dc=internal"
+  bind_password: CHANGEME
+
+# How SSSD should map directory users/groups to POSIX identity. Verify
+# against your server: uidNumber/gidNumber must be real, exposed
+# attributes -- see spec.md §5.
+posix:
+  uid_attr: uidNumber
+  gid_attr: gidNumber

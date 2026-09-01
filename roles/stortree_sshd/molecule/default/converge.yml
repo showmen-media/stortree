@@ -1,0 +1,24 @@
+---
+# Maps 1:1 onto the same role prefix playbooks/site.yml applies, up to
+# and including stortree_sshd itself (spec.md §9), against fixture config under
+# molecule/fixtures/ (repo-root, via $MOLECULE_PROJECT_DIRECTORY).
+
+- name: Converge
+  hosts: all
+  become: true
+  vars:
+    stortree_config_path: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') }}/molecule/fixtures/stortree/config.yml"
+    stortree_ldap_path: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') }}/molecule/fixtures/stortree/ldap.yml"
+    stortree_rclone_conf_path: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') }}/molecule/fixtures/stortree/rclone.conf"
+    stortree_sshd_config_path: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') }}/molecule/fixtures/stortree/sshd_config"
+  roles:
+    - stortree_facts
+    - stortree_common
+    - stortree_identity
+    - stortree_peer_trust
+    - stortree_secrets
+    - stortree_mounts
+    - stortree_acl
+    - stortree_samba
+    - stortree_pam_smbpass
+    - stortree_sshd

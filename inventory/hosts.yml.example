@@ -1,0 +1,17 @@
+---
+# Ordinary Ansible inventory. Every host listed here participates in the
+# resolved tree (spec.md "Config layout", config-schema.md "Every
+# inventory host participates") whether or not it's named in
+# stortree/config.yml.
+#
+# Copy to inventory/hosts.yml and edit for your fleet.
+all:
+  hosts:
+    storage-node-alpha:
+      ansible_host: 10.0.0.11
+    storage-node-bravo:
+      ansible_host: 10.0.0.12
+    some-storage-gadget:
+      ansible_host: 10.0.0.13
+  vars:
+    ansible_user: root

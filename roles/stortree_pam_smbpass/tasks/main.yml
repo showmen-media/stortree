@@ -1,0 +1,47 @@
+---
+# Stacks pam_smbpass.so into the host's PAM auth/password chain, after
+# SSSD's own module, so a successful PAM auth (SSH login, sudo, ...)
+# also syncs that user's Samba NT-hash entry with their LDAP password
+# (spec.md §5 -- Samba's `security = user` needs an NT-compatible hash,
+# not a plain LDAP bind, and this is the ready-made answer that doesn't
+# require the LDAP server to maintain the Samba schema itself).
+#
+# Declarative/idempotent via community.general.pamd (spec.md says
+# ansible.builtin.pamd; the module has always shipped in
+# community.general, not ansible-core, so that's what's actually used
+# here) rather than hand-patching /etc/pam.d/common-auth.
+#
+# `control` below (`[success=1 default=ignore]`) is Debian/Ubuntu's
+# pam-auth-update default for pam_sss.so's auth line. Verify it against
+# the target host's actual /etc/pam.d/common-auth before relying on
+# this in production -- pamd's `state: after` matches on
+# (type, control, module_path) together, so a mismatched control value
+# means no insertion happens rather than a loud failure.
+#
+# The module has no separate field for the new rule's own arguments --
+# `new_module_path` carries the module and its arguments together, the
+# same way a raw PAM line would (`pam_smbpass.so migrate`).
+
+- name: Stack pam_smbpass into the auth chain, after pam_sss
+  community.general.pamd:
+    name: common-auth
+    type: auth
+    control: "[success=1 default=ignore]"
+    module_path: pam_sss.so
+    new_type: auth
+    new_control: sufficient
+    new_module_path: pam_smbpass.so migrate
+    state: after
+  tags: [pam_smbpass]
+
+- name: Stack pam_smbpass into the password chain, after pam_sss
+  community.general.pamd:
+    name: common-password
+    type: password
+    control: "[success=1 user_unknown=ignore default=ignore]"
+    module_path: pam_sss.so
+    new_type: password
+    new_control: sufficient
+    new_module_path: pam_smbpass.so use_authtok
+    state: after
+  tags: [pam_smbpass]

@@ -9,10 +9,10 @@ participates. There's no daemon and no custom CLI: a control node (an
 operator's machine or CI) runs `ansible-playbook` against the fleet over
 plain SSH, the same way you'd run any other Ansible project.
 
-> 🚧 **Design phase.** There are no roles or playbooks implemented yet —
-> this repo is currently the architecture doc and config schema the
-> implementation will follow. See [docs/plan.md](docs/plan.md) for the
-> full design, including a phased build plan.
+> 🚧 **Implemented, not yet run against real hosts.** All roles and both
+> playbooks exist; the Docker-based test harness is scaffolded but hasn't
+> been executed here. See [docs/plan.md](docs/plan.md) for current status
+> and [docs/spec.md](docs/spec.md) for the full design.
 
 ## Why
 
@@ -107,31 +107,53 @@ hand-rolled `apply`/`reconcile` split would otherwise exist to provide.
 Full details — config resolution, secrets scoping, the Samba/ACL layer,
 SSSD/LDAP identity, `pam_smbpass`, peer trust provisioning, the role/
 playbook layout, and the Molecule test harness — are in
-[docs/plan.md](docs/plan.md).
+[docs/spec.md](docs/spec.md).
 
-## Requirements (once implemented)
+## Requirements
 
 On the control node: `ansible` plus the `ansible.posix` and
-`community.crypto` collections. On every managed host: existing,
-well-known Linux storage/identity tooling that the roles configure rather
-than reinvent — `rclone`, `samba`, `sssd`, `acl`, and `libpam-smbpass`.
-See [docs/plan.md §9](docs/plan.md) for the full dependency list and
+`community.crypto` collections (see `requirements.txt`/`requirements.yml`).
+On every managed host: existing, well-known Linux storage/identity
+tooling that the roles configure rather than reinvent — `rclone`, `samba`,
+`sssd`, `acl`, and `libpam-smbpass`. See
+[docs/spec.md §9](docs/spec.md) for the full dependency list and
 test-harness design.
+
+## Setup
+
+Real config (`inventory/hosts.yml`, `stortree/config.yml`,
+`stortree/ldap.yml`, `stortree/rclone.conf`) is never committed here —
+copy the `*.example` files, edit them for your fleet, and vault-encrypt
+the two that hold credentials:
+
+```
+cp inventory/hosts.yml.example inventory/hosts.yml
+cp stortree/config.yml.example stortree/config.yml
+cp stortree/ldap.yml.example stortree/ldap.yml
+cp stortree/rclone.conf.example stortree/rclone.conf
+ansible-vault encrypt stortree/ldap.yml stortree/rclone.conf
+```
+
+Then `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+&& .venv/bin/ansible-galaxy collection install -r requirements.yml`. See
+[docs/runbook.md](docs/runbook.md) for day-to-day operator commands.
 
 ## Docs
 
-- [docs/plan.md](docs/plan.md) — architecture, role/playbook layout, the
-  Molecule-based test harness design, and the phased build plan.
+- [docs/spec.md](docs/spec.md) — architecture, role/playbook layout, and
+  the Molecule-based test harness design.
 - [docs/config-schema.md](docs/config-schema.md) — full schema reference
   for `config.yml`, `ldap.yml`, and `rclone.conf`.
+- [docs/plan.md](docs/plan.md) — build status and the phased build plan.
+- [docs/runbook.md](docs/runbook.md) — operator commands.
 
 ## Status
 
-Nothing is implemented yet. The next milestone (phase 0 in
-[docs/plan.md](docs/plan.md#phased-build-plan)) is the Ansible repo
-skeleton — role scaffolding, a sample inventory, the `resolve()` filter
-plugin stub, and Molecule scaffolding to exercise it against. Contributions
-and design feedback are welcome via issues.
+All roles and both playbooks are implemented — see
+[docs/plan.md](docs/plan.md) for exactly what's been verified so far
+(unit tests, syntax checks, lint) versus what still needs a live Molecule
+run before trusting this against real hosts. Contributions and design
+feedback are welcome via issues.
 
 ## License
 

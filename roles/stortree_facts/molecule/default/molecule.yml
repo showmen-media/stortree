@@ -1,0 +1,26 @@
+---
+# Not run as part of this build (docs/plan.md "What's verified") --
+# needs privileged, systemd-in-Docker containers. Kept here so
+# `molecule test` works once someone has Docker capacity to spare.
+dependency:
+  name: galaxy
+  options:
+    requirements-file: ../../../../requirements.yml
+driver:
+  name: docker
+platforms:
+  - name: stortree-facts-instance
+    image: "geerlingguy/docker-debian12-ansible:latest"
+    command: /lib/systemd/systemd
+    privileged: true
+    pre_build_image: true
+    cgroupns_mode: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    tmpfs:
+      - /run
+      - /run/lock
+provisioner:
+  name: ansible
+verifier:
+  name: ansible
