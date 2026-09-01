@@ -1,0 +1,138 @@
+# stortree
+
+Declarative storage-tree management for a small fleet of Linux hosts:
+one config describes a directory tree, and an Ansible playbook turns it
+into [rclone](https://rclone.org/) mounts, [Samba](https://www.samba.org/)
+shares with POSIX-consistent ACLs, and Unix identity resolved from your
+existing LDAP directory — kept in sync across every host that
+participates. There's no daemon and no custom CLI: a control node (an
+operator's machine or CI) runs `ansible-playbook` against the fleet over
+plain SSH, the same way you'd run any other Ansible project.
+
+> 🚧 **Design phase.** There are no roles or playbooks implemented yet —
+> this repo is currently the architecture doc and config schema the
+> implementation will follow. See [docs/plan.md](docs/plan.md) for the
+> full design, including a phased build plan.
+
+## Why
+
+Once storage spans more than one box — a primary server plus a couple of
+smaller hosts each backing a share or two — keeping rclone mounts, Samba
+config, and ACLs consistent by hand across all of them gets tedious and
+error-prone. `stortree` lets one tree, resolved from a single config, drive
+every host from a control node that applies each host only the slice it
+needs.
+
+## What it does
+
+- **One declarative tree** (`config.yml`) describes every host, client
+  mount, subdirectory, and access rule — see
+  [docs/config-schema.md](docs/config-schema.md).
+- **rclone mounts**, generated as systemd units, either as a host's own
+  client mount or as the local storage backing a Samba share.
+- **Samba shares** with `nt acl support`, reading the same POSIX ACLs the
+  playbook applies via `setfacl` — one ACL system, not two that can drift
+  apart.
+- **LDAP-backed identity** via SSSD, so a group resolves to the same
+  Unix GID on every host, plus `pam_smbpass` to keep Samba's NT-hash
+  password store in sync with your directory.
+- **Scoped secrets** — every host receives only the `rclone.conf`
+  sections its own resolved role actually needs, rendered from an
+  `ansible-vault`-encrypted master copy that never leaves the control
+  node.
+- **Every participating host shares everything** — every host in the
+  fleet, including one with no subtree of its own and no mention in
+  `config.yml` at all, exposes a Samba share for every directory in the
+  tree that carries a `samba:` config. There's no "designated Samba
+  host," and a host doesn't need to be named in `config.yml` to join in
+  — see [docs/config-schema.md](docs/config-schema.md).
+- **Automatic peer routing** — a host that needs data owned by another
+  host in the tree — most often to assemble a complete Samba share it
+  doesn't itself own, per the point above — gets SSH trust to that owning
+  host provisioned automatically and sources the data peer-to-peer,
+  instead of re-mounting the original remote a second time with a second
+  set of credentials.
+
+## How it works, briefly
+
+```mermaid
+flowchart LR
+    subgraph Control["Control node (operator machine / CI)"]
+        cfg["config.yml + ldap.yml<br/>+ rclone.conf (vaulted)"]
+        resolve["resolve<br/>(pure function, Ansible filter plugin)"]
+        pb["ansible-playbook site.yml"]
+        cfg --> resolve --> pb
+    end
+    subgraph A["Host A"]
+        ma["rclone mounts"]
+        sa["Samba shares"]
+    end
+    subgraph B["Host B"]
+        mb["rclone mounts"]
+        sb["Samba shares"]
+    end
+    subgraph Cc["Host C"]
+        mc["rclone mounts"]
+        sc["Samba shares"]
+    end
+    ldap[("LDAP directory")]
+    pb -- "SSH" --> A
+    pb -- "SSH" --> B
+    pb -- "SSH" --> Cc
+    B -. "peer sftp mount,<br/>host-to-host SSH" .-> A
+    Cc -. "peer sftp mount(s),<br/>host-to-host SSH" .-> A
+    Cc -. "peer sftp mount(s),<br/>host-to-host SSH" .-> B
+    ldap -. "POSIX identity via SSSD" .-> A
+    ldap -. "POSIX identity via SSSD" .-> B
+    ldap -. "POSIX identity via SSSD" .-> Cc
+```
+
+No host is special at runtime — the control node applies the same roles
+to every host, and any host can serve subtrees, mount as a client, and
+authenticate against LDAP. Samba sharing in particular is universal:
+every participating host — including one that owns no subtree of its own
+and one with no mention in `config.yml` at all, present only in the
+Ansible inventory — exposes every `samba:`-configured directory as a
+share, peer-sourcing whatever data it doesn't already own. There's no
+"root host" holding elevated privileges over its peers, and no
+"designated Samba host" either.
+
+Only the control node holds the master config. `ansible-playbook
+site.yml` resolves the whole tree and applies every host's slice of it
+directly over SSH — no manifest push/pull step, since Ansible already
+models "act on every host from one place." Re-running it converges to the
+same end state rather than accumulating drift, the same guarantee a
+hand-rolled `apply`/`reconcile` split would otherwise exist to provide.
+
+Full details — config resolution, secrets scoping, the Samba/ACL layer,
+SSSD/LDAP identity, `pam_smbpass`, peer trust provisioning, the role/
+playbook layout, and the Molecule test harness — are in
+[docs/plan.md](docs/plan.md).
+
+## Requirements (once implemented)
+
+On the control node: `ansible` plus the `ansible.posix` and
+`community.crypto` collections. On every managed host: existing,
+well-known Linux storage/identity tooling that the roles configure rather
+than reinvent — `rclone`, `samba`, `sssd`, `acl`, and `libpam-smbpass`.
+See [docs/plan.md §9](docs/plan.md) for the full dependency list and
+test-harness design.
+
+## Docs
+
+- [docs/plan.md](docs/plan.md) — architecture, role/playbook layout, the
+  Molecule-based test harness design, and the phased build plan.
+- [docs/config-schema.md](docs/config-schema.md) — full schema reference
+  for `config.yml`, `ldap.yml`, and `rclone.conf`.
+
+## Status
+
+Nothing is implemented yet. The next milestone (phase 0 in
+[docs/plan.md](docs/plan.md#phased-build-plan)) is the Ansible repo
+skeleton — role scaffolding, a sample inventory, the `resolve()` filter
+plugin stub, and Molecule scaffolding to exercise it against. Contributions
+and design feedback are welcome via issues.
+
+## License
+
+GNU General Public License v3.0 — see [LICENSE](LICENSE).
