@@ -97,9 +97,12 @@ filter directly:
 
 - **Server subtrees** — every node in `config.yml`'s tree where
   `host == this host` (inheriting the nearest ancestor's `host` when a node
-  doesn't override it). Each entry resolves to: local path, rclone remote,
-  merged rclone args, Samba export settings (if any), and resolved `access`
-  rules.
+  doesn't override it). Each entry resolves to: local path, rclone remote
+  (its own, if set — `rclone` never inherits, see below), rclone args
+  (also never inherited), Samba export settings (if any), and resolved
+  `access` rules. A node with no `rclone.remote` of its own resolves with
+  no remote at all — it's a plain directory that has to exist, not a
+  separate rclone mount; §2 covers what that means for mount planning.
 - **Client mounts** — a direct rclone mount of the root remote for local
   use, for every host in `all_hosts` that isn't itself a server subtree's
   resolved `host`. If the host has an entry under the root `clients:`
@@ -126,12 +129,14 @@ it as an ordinary resolved subtree instead and point `cache-dir` at that
 subtree's local path — see the `cache-dir` fields in the example config in
 [docs/config-schema.md](config-schema.md), which shows both patterns.
 
-`rclone.remote` itself is always used verbatim — whatever a node's own
-value or inherited value resolves to is passed to `rclone mount` exactly
-as written, never combined with the node's position in the tree. See
+`rclone.remote` itself is always used verbatim when a node sets one —
+whatever its own value resolves to is passed to `rclone mount` exactly as
+written, never combined with the node's position in the tree, and never
+inherited from an ancestor (`rclone` — both `remote` and `args` — is
+never inherited; only `host` is). See "Node inheritance" and
 "`rclone.remote` is verbatim" in
-[docs/config-schema.md](config-schema.md) for what that implies for
-inheritance.
+[docs/config-schema.md](config-schema.md) for the full rule and what a
+node with no `rclone.remote` of its own resolves to instead.
 
 A host can appear in both lists (e.g. serve one subtree, direct-mount
 another host's remote for itself).
@@ -178,9 +183,11 @@ samba-configured node, and a case where a host present only in
 `all_hosts` — no `host:`, no `clients:` entry, no mention in `config.yml`
 at all — resolves the same way, to lock all three invariants in.
 
-`rclone.args` is handled differently in each role — it's the one field
-that does *not* follow the ancestor-inheritance rule the rest of Node
-inheritance (config-schema.md) sets out for `host`/`rclone.remote`:
+`rclone` — `remote` and `args` alike — never follows the ancestor-
+inheritance rule Node inheritance (config-schema.md) sets out for `host`;
+only the client-mount role layers anything resembling inheritance on top
+of a node's own `rclone.args`, and even that is a distinct, one-time merge
+rather than tree inheritance:
 
 - **Client-mount role**: `client-defaults.rclone.args` sets the defaults
   applied to every peer that mounts this host's remote, then
@@ -188,24 +195,33 @@ inheritance (config-schema.md) sets out for `host`/`rclone.remote`:
   specific peer. This is the one intentional merge chain, exactly two
   levels deep (defaults, then a single per-client override) — later
   entries win on key conflicts.
-- **Server role**: a subdir node's `rclone.args` is used exactly as set on
-  that node, full stop — never merged with, or substituted from, any
-  ancestor or descendant subdir's `rclone.args`. A node without its own
-  `rclone.args` resolves to no args at all, even if an ancestor sets some;
-  a node's own `rclone.args`, once set, isn't affected by what its
-  children set either. `host`/`rclone.remote` still inherit down the tree
-  as usual (Node inheritance, config-schema.md) — only `rclone.args` is
-  exempt.
+- **Server role**: a subdir node's `rclone.remote`/`rclone.args` are used
+  exactly as set on that node, full stop — never merged with, substituted
+  from, or inherited from any ancestor or descendant subdir's `rclone`. A
+  node without its own `rclone` resolves to no remote and no args at all,
+  even if an ancestor sets some; a node's own `rclone`, once set, isn't
+  affected by what its children set either. `host` still inherits down
+  the tree as usual (Node inheritance, config-schema.md) — `rclone` is the
+  one field, at every level, that's exempt.
 
 ### 2. Mount management (rclone)
 
-The `stortree_mounts` role takes every resolved mount (server or client
-role) from `stortree_facts` and templates one systemd unit per mount
-(`templates/rclone-mount@.service.j2`: `rclone mount <remote> <path>
-<merged args...>`, `Restart=on-failure`, `After=network-online.target`,
-`RequiresMountsFor=` where one mount nests under another), using the
-`template` module plus `systemd_service` (`daemon_reload: true`,
-`enabled`/`state: started`).
+The `stortree_mounts` role flattens `stortree_facts`' resolved server
+subtrees and client mounts into one plan (`stortree_plan_mounts`) and,
+for every entry that actually has a `remote` (§1 — a server-subtree node
+with no `rclone.remote` of its own resolves with none, since `rclone`
+never inherits), templates one systemd
+unit per mount (`templates/rclone-mount@.service.j2`: `rclone mount
+<remote> <path> <merged args...>`, `Restart=on-failure`,
+`After=network-online.target`, `RequiresMountsFor=` where one mount nests
+under another — skipping over any remote-less ancestor in between, since
+those have no unit of their own to require), using the `template` module
+plus `systemd_service` (`daemon_reload: true`, `enabled`/`state:
+started`). Every entry in the plan, mount or not, still gets its local
+directory created (`ansible.builtin.file`) — a remote-less entry is a
+plain directory that has to exist (nested inside a mounted ancestor, or
+as real local storage on its own resolved host if not), it just gets no
+rclone unit.
 
 Ansible's own idempotence covers what a hand-rolled reconciler would
 otherwise have to implement: `template` only rewrites a unit file when its

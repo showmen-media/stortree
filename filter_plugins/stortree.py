@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import configparser
 import io
+import re
 
 # Interpretation call #1 (docs/plan.md): the dotted access shorthand
 # (`access.group: X`, `access.user: X`) never specifies `permissions` in
@@ -103,16 +104,23 @@ def _walk_tree(tree):
     Returns (root_host, root_remote, nodes) where `nodes` is a flat list
     of every resolved subdirs/user-subdirs node (root itself is excluded
     -- it's the inheritance anchor, not a mountable node of its own, see
-    docs/spec.md "Node inheritance"). `host`/`rclone.remote` inherit down
-    the tree; `rclone.args` never inherits (spec.md §1).
+    docs/spec.md "Node inheritance"). `host` inherits down the tree;
+    `rclone` -- both `remote` and `args` -- never inherits (spec.md §1):
+    a node with no `rclone.remote` of its own resolves to `remote: None`,
+    regardless of what any ancestor (root included) sets.
+
+    A node that resolves with `remote: None` isn't a separate mounted
+    subtree -- see docs/config-schema.md "Node inheritance" for what that
+    means downstream (plan_mounts() below turns it into a plain directory
+    to create rather than an rclone mount).
     """
     root_host = tree.get("host")
     root_remote = (tree.get("rclone") or {}).get("remote")
     nodes = []
 
-    def _visit(node, path_parts, host, remote, per_user):
+    def _visit(node, path_parts, host, per_user):
         h = node.get("host", host)
-        r = (node.get("rclone") or {}).get("remote", remote)
+        r = (node.get("rclone") or {}).get("remote")
         args = (node.get("rclone") or {}).get("args") or {}
         access = _normalize_access(node.get("access"))
         samba = node.get("samba")
@@ -130,17 +138,16 @@ def _walk_tree(tree):
                 }
             )
         for name, child in (node.get("subdirs") or {}).items():
-            _visit(child or {}, path_parts + [name], h, r, per_user)
+            _visit(child or {}, path_parts + [name], h, per_user)
         for name, child in (node.get("user-subdirs") or {}).items():
             _visit(
                 child or {},
                 path_parts + [PER_USER_PLACEHOLDER, name],
                 h,
-                r,
                 True,
             )
 
-    _visit(tree, [], root_host, root_remote, False)
+    _visit(tree, [], root_host, False)
     return root_host, root_remote, nodes
 
 
@@ -321,8 +328,32 @@ def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None):
     return buf.getvalue()
 
 
+_SLUG_UNSAFE_CHAR = re.compile(r"[^A-Za-z0-9_.]")
+
+
+def _escape_slug_segment(segment):
+    """Escape one path segment so "-" is only ever a literal segment
+    separator in the slug it's joined into -- a "-" (or any other
+    non-[A-Za-z0-9_.] character, e.g. the "%" in PER_USER_PLACEHOLDER)
+    that's part of the segment's own name becomes \\xHH instead, using
+    the same convention systemd-escape itself uses for generated unit
+    instance names."""
+    return _SLUG_UNSAFE_CHAR.sub(lambda m: f"\\x{ord(m.group()):02x}", segment)
+
+
 def _slug(path):
-    return path.replace("/", "-").replace("%", "pct").strip("-") or "root"
+    """Turn a resolved node's `/`-joined tree path into a systemd
+    instance name, unambiguously: each segment is escaped on its own
+    (see _escape_slug_segment) before being rejoined with "-", so a
+    segment literally named "foo-bar" can no longer collapse onto the
+    same slug as nested "foo/bar" the way a naive "/" -> "-" replacement
+    would. The empty (root) path maps to the reserved "root" -- see the
+    explicit uniqueness check in plan_mounts() for the backstop against
+    the one remaining case this doesn't rule out on its own (a real
+    top-level segment literally named "root")."""
+    if not path:
+        return "root"
+    return "-".join(_escape_slug_segment(seg) for seg in path.split("/"))
 
 
 def group_members_from_getent(getent_group):
@@ -356,17 +387,27 @@ def access_grant_usernames(access, group_members=None):
 
 def plan_mounts(resolved, group_members=None):
     """Flatten this host's resolved server_subtrees/client_mounts into
-    one concrete mount per systemd unit (spec.md §2), expanding a
-    user-subdirs entry's %U-templated path into one mount per user
-    actually granted access to it (interpretation call #2) using
+    one flat plan of every local path that has to exist (spec.md §2),
+    expanding a user-subdirs entry's %U-templated path into one entry per
+    user actually granted access to it (interpretation call #2) using
     `group_members` (e.g. `ansible_facts.getent_group |
     stortree_group_members`).
 
+    Not every entry is an rclone mount: a server_subtrees entry with
+    `remote: None` (a node with no `rclone.remote` of its own -- it never
+    inherits one, see _walk_tree()/docs/config-schema.md "Node
+    inheritance") is a plain directory that has to exist, not a mount --
+    callers should render an rclone unit only for entries with a
+    truthy `remote`, e.g. `stortree_mounts_plan | selectattr('remote')`.
+    A client_mounts entry always has a remote (the root `rclone.remote`).
+
     Each returned entry: {local_path, remote, args, slug, requires_slug}.
-    `requires_slug` names the mount whose local_path is the longest
-    proper-prefix ancestor of this one, if any -- for systemd
-    RequiresMountsFor= so a nested mount starts after the one it nests
-    under (spec.md §2).
+    `requires_slug` names the nearest ancestor entry that's an actual
+    mount (truthy `remote`) whose local_path is the longest proper-prefix
+    ancestor of this one, if any -- for systemd RequiresMountsFor= so a
+    nested mount starts after the mount it nests under, skipping over any
+    non-mounted (plain-directory) ancestor in between, which has no unit
+    of its own to require (spec.md §2).
     """
     group_members = group_members or {}
     entries = []
@@ -400,9 +441,21 @@ def plan_mounts(resolved, group_members=None):
     for e in entries:
         e["slug"] = _slug(e["local_path"])
 
+    mount_entries = [e for e in entries if e["remote"]]
+
+    seen_slugs = {}
+    for e in mount_entries:
+        clash = seen_slugs.get(e["slug"])
+        if clash is not None:
+            raise ValueError(
+                f"stortree: {clash!r} and {e['local_path']!r} both resolve to "
+                f"systemd unit slug {e['slug']!r} -- rename one of them"
+            )
+        seen_slugs[e["slug"]] = e["local_path"]
+
     for e in entries:
         best = None
-        for other in entries:
+        for other in mount_entries:
             if other is e:
                 continue
             op = other["local_path"]
@@ -416,9 +469,11 @@ def plan_mounts(resolved, group_members=None):
 
 def mount_unit_names(mount_plan):
     """The full `stortree-mount@<slug>.service` unit filename for every
-    entry in a stortree_plan_mounts() result -- used by stortree_mounts
-    to work out which currently-installed units are stale."""
-    return [f"stortree-mount@{e['slug']}.service" for e in mount_plan]
+    actual rclone mount in a stortree_plan_mounts() result (entries with
+    no `remote` are plain directories, not mounts -- see plan_mounts())
+    -- used by stortree_mounts to work out which currently-installed
+    units are stale."""
+    return [f"stortree-mount@{e['slug']}.service" for e in mount_plan if e["remote"]]
 
 
 class FilterModule(object):

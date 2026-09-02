@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import yaml
 
 from filter_plugins.stortree import (
@@ -45,9 +46,11 @@ def test_alpha_owns_everything_not_overridden():
         "home/%U/sys-configs",
         "home/%U/media-prod",
     }
-    # backups takes root's host/remote as-is, verbatim, no override
+    # backups sets neither its own rclone nor a different host -- rclone
+    # never inherits, so it resolves with no remote at all (just a plain
+    # directory that has to exist under alpha's own local tree)
     backups = by_path(r["server_subtrees"], "backups")
-    assert backups["remote"] == "storagebox:/"
+    assert backups["remote"] is None
     assert backups["args"] == {}
     # root host never gets a generic client mount of its own remote
     assert r["client_mounts"] == []
@@ -119,12 +122,56 @@ def test_sys_configs_access_defaults_permissions_and_is_per_user():
     ]
 
 
-def test_rclone_remote_is_verbatim_not_position_dependent():
+def test_rclone_remote_does_not_inherit():
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
+    # neither sets its own rclone nor a different host -- no inheritance
+    # from root or from each other means both resolve with no remote
+    cache = by_path(r["server_subtrees"], ".cache")
     cache_gcs = by_path(r["server_subtrees"], ".cache/some-gcs-bucket")
-    backups = by_path(r["server_subtrees"], "backups")
-    # both inherit the exact same root remote, unmodified by tree position
-    assert cache_gcs["remote"] == backups["remote"] == "storagebox:/"
+    assert cache["remote"] is None
+    assert cache_gcs["remote"] is None
+    # host still inherits though -- both are still alpha's own subtrees
+    assert cache["host"] == cache_gcs["host"] == "storage-node-alpha"
+
+
+def test_rclone_remote_is_verbatim_when_set_explicitly():
+    r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
+    whitfield_media = by_path(r["server_subtrees"], "home/%U/whitfield-media")
+    mw_fam = by_path(r["server_subtrees"], "home/%U/mw-fam")
+    # each sets its own rclone.remote explicitly, path included, and
+    # resolve() never appends the node's tree position to it
+    assert whitfield_media["remote"] == "some-remote:/media"
+    assert mw_fam["remote"] == "some-remote:/fam"
+
+
+def test_node_with_no_rclone_and_unchanged_host_has_no_remote():
+    # case 1 (docs/config-schema.md "Node inheritance"): no rclone of its
+    # own, host unchanged from the inherited ancestor -- just a plain
+    # directory that has to exist, not a mount
+    tree = {
+        "host": "h1",
+        "rclone.remote": "r1:/",
+        "subdirs": {"plain": {}},
+    }
+    r = resolve(tree, "h1", ["h1"])
+    plain = by_path(r["server_subtrees"], "plain")
+    assert plain["host"] == "h1"
+    assert plain["remote"] is None
+
+
+def test_node_with_changed_host_and_no_rclone_is_local_only():
+    # case 2 (docs/config-schema.md "Node inheritance"): host changes but
+    # no rclone of its own -- the new host keeps the directory locally,
+    # no remote to mount from
+    tree = {
+        "host": "h1",
+        "rclone.remote": "r1:/",
+        "subdirs": {"local-on-h2": {"host": "h2"}},
+    }
+    r = resolve(tree, "h2", ["h1", "h2"])
+    local_only = by_path(r["server_subtrees"], "local-on-h2")
+    assert local_only["host"] == "h2"
+    assert local_only["remote"] is None
 
 
 # -- invariants spec.md §1 explicitly calls out -------------------------
@@ -179,8 +226,8 @@ def test_rclone_args_do_not_inherit():
         "rclone": {"remote": "r1:/", "args": {}},
         "subdirs": {
             "parent": {
-                "rclone": {"args": {"vfs-cache-mode": "full"}},
-                "subdirs": {"child": {}},
+                "rclone": {"remote": "r1:/parent", "args": {"vfs-cache-mode": "full"}},
+                "subdirs": {"child": {"rclone.remote": "r1:/child"}},
             }
         },
     }
@@ -188,9 +235,28 @@ def test_rclone_args_do_not_inherit():
     parent = by_path(r["server_subtrees"], "parent")
     child = by_path(r["server_subtrees"], "parent/child")
     assert parent["args"] == {"vfs-cache-mode": "full"}
-    assert child["args"] == {}  # not inherited, even though host/remote are
+    assert child["args"] == {}  # not inherited, even though host is
     assert child["host"] == "h1"
-    assert child["remote"] == "r1:/"
+    assert child["remote"] == "r1:/child"  # child sets its own; not inherited either
+
+
+def test_rclone_remote_does_not_inherit_from_parent_node():
+    tree = {
+        "host": "h1",
+        "rclone.remote": "r1:/",
+        "subdirs": {
+            "parent": {
+                "rclone.remote": "r1:/parent",
+                "subdirs": {"child": {}},
+            }
+        },
+    }
+    r = resolve(tree, "h1", ["h1"])
+    child = by_path(r["server_subtrees"], "parent/child")
+    # child sets no rclone of its own -- gets none, not parent's r1:/parent
+    # nor root's r1:/
+    assert child["remote"] is None
+    assert child["host"] == "h1"
 
 
 def test_dotted_and_nested_forms_are_equivalent():
@@ -326,17 +392,97 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
 
 
 def test_plan_mounts_nested_nonuser_paths_require_their_parent():
-    r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
+    r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
     plan = plan_mounts(r, {})
     by_local_path = {e["local_path"]: e for e in plan}
 
-    cache_slug = by_local_path[".cache"]["slug"]
-    assert by_local_path[".cache/some-gcs-bucket"]["requires_slug"] == cache_slug
+    root_slug = by_local_path[""]["slug"]
+    assert by_local_path[".cache/storage-node-bravo"]["requires_slug"] == root_slug
+
+
+def test_plan_mounts_skips_remote_less_ancestors_for_requires_slug():
+    # a node with no rclone of its own is a plain directory, not a mount
+    # (no systemd unit of its own) -- a real mount nested underneath it
+    # has to require the nearest *actual* mounted ancestor instead,
+    # skipping over the remote-less one in between
+    tree = {
+        "host": "h1",
+        "rclone.remote": "r1:/",
+        "subdirs": {
+            "top": {
+                "rclone.remote": "r1:/top",
+                "subdirs": {
+                    "plain": {
+                        "subdirs": {
+                            "nested": {"rclone.remote": "r1:/nested"},
+                        }
+                    }
+                },
+            }
+        },
+    }
+    r = resolve(tree, "h1", ["h1"])
+    plan = plan_mounts(r, {})
+    by_local_path = {e["local_path"]: e for e in plan}
+
+    top = by_local_path["top"]
+    plain = by_local_path["top/plain"]
+    nested = by_local_path["top/plain/nested"]
+
+    assert plain["remote"] is None
+    assert plain["requires_slug"] == top["slug"]
+    assert nested["requires_slug"] == top["slug"]
 
 
 def test_mount_unit_names():
-    plan = [{"slug": "backups"}, {"slug": "root"}]
+    plan = [
+        {"slug": "backups", "remote": "r1:/"},
+        {"slug": "root", "remote": "r1:/"},
+    ]
     assert mount_unit_names(plan) == [
         "stortree-mount@backups.service",
         "stortree-mount@root.service",
     ]
+
+
+def test_mount_unit_names_excludes_remote_less_entries():
+    # a plain directory (no rclone.remote) gets no systemd unit at all
+    plan = [
+        {"slug": "backups", "remote": "r1:/"},
+        {"slug": "plain-dir", "remote": None},
+    ]
+    assert mount_unit_names(plan) == ["stortree-mount@backups.service"]
+
+
+def test_plan_mounts_slug_distinguishes_hyphen_from_nesting():
+    # a segment literally named "media-prod" and a nested "media/prod"
+    # both naively collapse to "media-prod" under a plain "/" -> "-"
+    # substitution -- they must not share a systemd unit slug
+    tree = {
+        "host": "h1",
+        "rclone.remote": "r1:/",
+        "subdirs": {
+            "media-prod": {"rclone.remote": "r1:/a"},
+            "media": {"subdirs": {"prod": {"rclone.remote": "r1:/b"}}},
+        },
+    }
+    r = resolve(tree, "h1", ["h1"])
+    plan = plan_mounts(r, {})
+    by_local_path = {e["local_path"]: e for e in plan}
+
+    assert by_local_path["media-prod"]["slug"] != by_local_path["media/prod"]["slug"]
+
+
+def test_plan_mounts_raises_on_slug_collision():
+    # a top-level segment literally named "root" collides with the
+    # reserved slug for a client's own root mount (local_path "") --
+    # plan_mounts must fail loudly rather than let the two systemd units
+    # silently clobber each other
+    tree = {
+        "host": "h1",
+        "rclone.remote": "r1:/",
+        "subdirs": {"root": {"host": "h2", "rclone.remote": "r2:/"}},
+    }
+    r = resolve(tree, "h2", ["h1", "h2"])
+    with pytest.raises(ValueError, match="root"):
+        plan_mounts(r, {})

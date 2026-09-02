@@ -27,9 +27,12 @@
     - name: Every resolved mount unit is active
       # No systemd_service query mode for "is this unit active"; command
       # is the actual right tool here (same as playbooks/status.yml).
+      # Only entries with a `remote` get a unit at all -- a plain-directory
+      # entry (no rclone.remote of its own; rclone never inherits, see
+      # docs/config-schema.md "Node inheritance") has none to check.
       ansible.builtin.command:  # noqa: command-instead-of-module
         cmd: systemctl is-active "stortree-mount@{{ item.slug }}.service"
-      loop: "{{ stortree | stortree_plan_mounts({}) }}"
+      loop: "{{ stortree | stortree_plan_mounts({}) | selectattr('remote') | list }}"
       loop_control:
         label: "{{ item.local_path or '(root)' }}"
       changed_when: false

@@ -31,7 +31,8 @@ clients:
 subdirs:
   <name>:
     host: <hostname>          # optional; inherits nearest ancestor's host if omitted
-    rclone.remote: <remote-spec>  # optional; inherits nearest ancestor's remote if omitted
+    rclone.remote: <remote-spec>  # optional; never inherits — see "Node inheritance" below
+                               # for what a node with no rclone.remote of its own resolves to
     rclone.args: {...}        # optional; used as-is for this node only, does not inherit
     access: [...] | access.group | access.user   # see Access below
     samba:
@@ -114,16 +115,21 @@ subdirs:
 ```
 
 `storage-node-alpha` is the tree's default host: it owns everything under
-`subdirs` that doesn't override `host`, and its `rclone.remote:
-storagebox` is what those inherit too — `backups` is the one node that
-takes that inheritance as-is, so it resolves to `storagebox`'s own root,
-verbatim. This is purely a resolution default — it does not make
-`storage-node-alpha` special at runtime (there is no "root host" in the
-Ansible design; see [spec.md](spec.md)). Any host in `config.yml` is
+`subdirs` that doesn't override `host`. Unlike `host`, `rclone` never
+inherits (see "Node inheritance" below), so a node under
+`storage-node-alpha` that sets neither its own `rclone` nor a different
+`host` — `backups`, `.cache`, `.cache/some-gcs-bucket`, `sys-configs` —
+resolves with no remote at all: each is just a plain directory that has
+to exist under `storage-node-alpha`'s own local tree
+(`/srv/stortree/backups`, `/srv/stortree/.cache`, and so on), not a
+separate rclone mount. This is purely a resolution default — it does not
+make `storage-node-alpha` special at runtime (there is no "root host" in
+the Ansible design; see [spec.md](spec.md)). Any host in `config.yml` is
 applied to the same way, from the same control node, over the same
 `ansible-playbook` run. `storage-node-bravo` owns three subtrees of its
 own (its `.cache.subdirs` cache mount, `whitfield-media`, `mw-fam`), each
-pointed at a different remote (`some-remote`) than the one it inherits.
+setting its own `rclone.remote` explicitly, pointed at a different remote
+(`some-remote`) than the one `storage-node-alpha` mounts.
 
 `.cache.subdirs.storage-node-bravo` is itself a resolved subtree, like any
 other — server-owned by `storage-node-bravo`, mounted from `some-remote`
@@ -156,31 +162,52 @@ consistently.
 
 ### Node inheritance
 
-Every node under `subdirs`/`user-subdirs` inherits `host` and
-`rclone.remote` from its nearest ancestor unless it overrides them. An
-empty node (`backups: {}`) is valid and just means "use everything
-inherited, no overrides."
+Every node under `subdirs`/`user-subdirs` inherits `host` from its
+nearest ancestor unless it overrides it. `rclone` — both `remote` and
+`args` — is different: it **never** inherits, from an ancestor node or
+from the root. A node's `rclone` config is used exactly as set on that
+node, full stop; a node with no `rclone.remote` of its own resolves to no
+remote at all, regardless of what any ancestor (root included) sets — see
+spec.md §1 for the full rationale.
 
-`rclone.args` is the exception: it does **not** inherit. A node's
-`rclone.args` is used exactly as set on that node, and a node with no
-`rclone.args` of its own resolves to no args, regardless of what any
-ancestor sets — see spec.md §1 for the full rationale and how this
-differs from the client-mount role's `client-defaults` merge.
+A node that resolves with no `rclone.remote` isn't a separate mounted
+subtree — there's no remote for it to mount from. What that means
+depends on whether it also changes `host`:
+
+- **Same `host` (inherited, not overridden)**: the node is just a plain
+  subdirectory that has to exist inside the tree its inherited `host`
+  already serves. `backups: {}`, `.cache`, `.cache/some-gcs-bucket`, and
+  `sys-configs` (`access.user: jd`) in the example above are all exactly
+  this — none of them set their own `rclone` or a different `host`, so
+  each resolves to an ordinary, empty directory under
+  `storage-node-alpha`'s own local tree (`/srv/stortree/backups`,
+  `/srv/stortree/.cache`, `/srv/stortree/.cache/some-gcs-bucket`,
+  `/srv/stortree/home/<user>/sys-configs`) — nothing is mounted at any of
+  those paths. `resolve()`/`stortree_plan_mounts` still track the node
+  (for ACLs, Samba export, per-user expansion), just without an rclone
+  unit backing it.
+- **Different `host`, still no `rclone` of its own**: that `host` has to
+  keep the directory's data locally — there's no remote configured for it
+  to mount from, so whatever ends up there is real local storage on that
+  host, not synced from anywhere, and it's that host's own responsibility
+  to back it up/preserve it like any other local disk contents.
+
+An empty node (`backups: {}`) is valid either way — it just means "use
+the inherited `host`, no remote, no overrides."
 
 #### `rclone.remote` is verbatim
 
-Whatever a node's `rclone.remote` resolves to — its own value, or the
-nearest ancestor's — is passed to `rclone mount` exactly as written,
-unchanged. `resolve()` never appends a node's position in the tree to it.
-A bare section name (`storagebox`) mounts that remote's own root; a
-`<section>:<path>` value (`some-remote:/media`) mounts exactly that path
-on that remote. Two nodes that resolve to the same `rclone.remote` value
-— by inheriting it, or by setting it explicitly — mount identical remote
-content, at whatever two local paths their own tree positions give them;
-nothing about being a different node makes the source differ. This is why
-every node in the example above that needs distinct source content sets
-its own `rclone.remote` explicitly, path included, rather than relying on
-inheritance.
+When a node does set its own `rclone.remote`, it's passed to `rclone
+mount` exactly as written, unchanged — `resolve()` never appends a node's
+position in the tree to it. A bare section name (`storagebox`) mounts
+that remote's own root; a `<section>:<path>` value (`some-remote:/media`)
+mounts exactly that path on that remote. Two nodes that each explicitly
+set the same `rclone.remote` value mount identical remote content, at
+whatever two local paths their own tree positions give them; nothing
+about being a different node makes the source differ. Every node in the
+example above that needs distinct source content sets its own
+`rclone.remote` explicitly, path included — since `rclone` never
+inherits (above), that's the only way for a node to have one at all.
 
 ### `subdirs` vs `user-subdirs`
 

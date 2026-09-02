@@ -7,6 +7,13 @@
 # hand-rolled reconciler would otherwise need to implement; only the
 # "stale unit no longer in the resolved set" case needs an explicit
 # cleanup step below.
+#
+# `rclone` never inherits down the tree (docs/config-schema.md "Node
+# inheritance"), so not every entry in the flat mount plan is an actual
+# rclone mount -- an entry with no `remote` is a plain directory that has
+# to exist (either nested inside an ancestor's mount, or kept as real
+# local storage on its resolved host) but has no rclone unit of its own;
+# only entries with a `remote` get one below.
 
 - name: Install rclone and fuse
   ansible.builtin.apt:
@@ -51,7 +58,7 @@
          | stortree_plan_mounts(ansible_facts.getent_group | default({}) | stortree_group_members) }}
   tags: [mounts]
 
-- name: Ensure every mount point exists
+- name: Ensure every resolved path exists (mount points and plain directories alike)
   ansible.builtin.file:
     path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
     state: directory
@@ -68,7 +75,7 @@
     src: stortree-mount@.service.j2
     dest: "/etc/systemd/system/stortree-mount@{{ entry.slug }}.service"
     mode: "0644"
-  loop: "{{ stortree_mounts_plan }}"
+  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
   loop_control:
     loop_var: entry
     label: "{{ entry.local_path or '(root)' }}"
@@ -84,7 +91,7 @@
     name: "stortree-mount@{{ item.slug }}.service"
     enabled: true
     state: started
-  loop: "{{ stortree_mounts_plan }}"
+  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
   loop_control:
     label: "{{ item.local_path or '(root)' }}"
   tags: [mounts]
