@@ -8,6 +8,16 @@
 # "stale unit no longer in the resolved set" case needs an explicit
 # cleanup step below.
 
+- name: Install rclone and fuse
+  ansible.builtin.apt:
+    name:
+      - rclone
+      - fuse
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  tags: [mounts]
+
 - name: Look up membership for every group referenced in per-user access grants
   ansible.builtin.getent:
     database: group

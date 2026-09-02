@@ -8,6 +8,14 @@
   no_log: true
   tags: [identity]
 
+- name: Install sssd
+  ansible.builtin.apt:
+    name: sssd
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  tags: [identity]
+
 - name: Render sssd.conf
   ansible.builtin.template:
     src: sssd.conf.j2

@@ -22,6 +22,14 @@
 # `new_module_path` carries the module and its arguments together, the
 # same way a raw PAM line would (`pam_smbpass.so migrate`).
 
+- name: Install libpam-smbpass
+  ansible.builtin.apt:
+    name: libpam-smbpass
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  tags: [pam_smbpass]
+
 - name: Stack pam_smbpass into the auth chain, after pam_sss
   community.general.pamd:
     name: common-auth

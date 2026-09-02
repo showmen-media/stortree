@@ -12,6 +12,14 @@
 # always recomputes and reapplies from the resolved facts rather than
 # diffing against a previous run.
 
+- name: Install acl
+  ansible.builtin.apt:
+    name: acl
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  tags: [acl]
+
 - name: Look up membership for every group referenced in per-user access grants
   ansible.builtin.getent:
     database: group
