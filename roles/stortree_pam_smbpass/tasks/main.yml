@@ -1,10 +1,21 @@
 ---
-# Stacks pam_smbpass.so into the host's PAM auth/password chain, after
+# Stacks a sync script into the host's PAM auth/password chain, after
 # SSSD's own module, so a successful PAM auth (SSH login, sudo, ...)
-# also syncs that user's Samba NT-hash entry with their LDAP password
-# (spec.md §5 -- Samba's `security = user` needs an NT-compatible hash,
-# not a plain LDAP bind, and this is the ready-made answer that doesn't
-# require the LDAP server to maintain the Samba schema itself).
+# or password change also syncs that user's Samba NT-hash entry with
+# their LDAP password (spec.md §5 -- Samba's `security = user` needs
+# an NT-compatible hash, not a plain LDAP bind, and this is the
+# ready-made answer that doesn't require the LDAP server to maintain
+# the Samba schema itself).
+#
+# This used to be Samba's own pam_smbpass.so (package libpam-smbpass),
+# spec.md's originally documented answer -- but upstream Samba dropped
+# pam_smbpass in 4.4, and Debian/Ubuntu removed the package along with
+# it, years before any of this role's supported platforms (Debian
+# bookworm, Ubuntu jammy/noble) existed. It is not installable on any
+# of them. pam_exec.so (ships in libpam-modules, always present)
+# stacked with `expose_authtok` is the modern replacement: it hands
+# the plaintext credential to files/pam-smbpass-sync.sh on stdin,
+# which drives `smbpasswd -s -a` the same way pam_smbpass used to.
 #
 # Declarative/idempotent via community.general.pamd (spec.md says
 # ansible.builtin.pamd; the module has always shipped in
@@ -18,38 +29,52 @@
 # (type, control, module_path) together, so a mismatched control value
 # means no insertion happens rather than a loud failure.
 #
-# The module has no separate field for the new rule's own arguments --
-# `new_module_path` carries the module and its arguments together, the
-# same way a raw PAM line would (`pam_smbpass.so migrate`).
+# `optional` (rather than pam_smbpass's old `sufficient`) is
+# deliberate: this module is a side effect, not a source of truth for
+# whether auth/password-change succeeds, so it must never be able to
+# short-circuit or gate the rest of the stack. `seteuid` matters most
+# for the password-chain stacking: `passwd` is setuid root, so its
+# real UID is the invoking user and only the effective UID is root --
+# without `seteuid`, pam_exec would run the sync script as that user,
+# who can't write the local smbpasswd database.
 
-- name: Install libpam-smbpass
+- name: Install samba-common-bin (smbpasswd)
   ansible.builtin.apt:
-    name: libpam-smbpass
+    name: samba-common-bin
     state: present
     update_cache: true
     cache_valid_time: 3600
   tags: [pam_smbpass]
 
-- name: Stack pam_smbpass into the auth chain, after pam_sss
+- name: Deploy the Samba NT-hash sync script
+  ansible.builtin.copy:
+    src: pam-smbpass-sync.sh
+    dest: /usr/local/sbin/stortree-pam-smbpass-sync
+    owner: root
+    group: root
+    mode: "0700"
+  tags: [pam_smbpass]
+
+- name: Stack the sync script into the auth chain, after pam_sss
   community.general.pamd:
     name: common-auth
     type: auth
     control: "[success=1 default=ignore]"
     module_path: pam_sss.so
     new_type: auth
-    new_control: sufficient
-    new_module_path: pam_smbpass.so migrate
+    new_control: optional
+    new_module_path: pam_exec.so expose_authtok seteuid /usr/local/sbin/stortree-pam-smbpass-sync
     state: after
   tags: [pam_smbpass]
 
-- name: Stack pam_smbpass into the password chain, after pam_sss
+- name: Stack the sync script into the password chain, after pam_sss
   community.general.pamd:
     name: common-password
     type: password
     control: "[success=1 user_unknown=ignore default=ignore]"
     module_path: pam_sss.so
     new_type: password
-    new_control: sufficient
-    new_module_path: pam_smbpass.so use_authtok
+    new_control: optional
+    new_module_path: pam_exec.so expose_authtok seteuid /usr/local/sbin/stortree-pam-smbpass-sync
     state: after
   tags: [pam_smbpass]

@@ -115,7 +115,7 @@ On the control node: `ansible` plus the `ansible.posix` and
 `community.crypto` collections (see `requirements.txt`/`requirements.yml`).
 On every managed host: existing, well-known Linux storage/identity
 tooling that the roles configure rather than reinvent — `rclone`, `samba`,
-`sssd`, `acl`, and `libpam-smbpass`. See
+`sssd`, `acl`, and `samba-common-bin`/`libpam-modules`. See
 [docs/spec.md §9](docs/spec.md) for the full dependency list and
 test-harness design.
 

@@ -289,17 +289,28 @@ POSIX attributes rather than algorithmically synthesizing them).
 without relying on NTLM/NT-hash support from the LDAP server, since Samba's
 `security = user` model needs an NT-compatible hash, not a plain LDAP bind
 — true of most directories that don't specifically maintain the Samba
-schema (`sambaSAMAccount`/`sambaNTPassword`). The standard, ready-made
-answer for this exact situation is Samba's own `pam_smbpass` module (ships
-with Samba, e.g. `libpam-smbpass`), wired up by the `stortree_pam_smbpass`
-role: stacked into the host's PAM `auth`/`password` chain *after* SSSD's
-module (via `ansible.builtin.pamd` for a declarative, idempotent edit
-rather than hand-patching `/etc/pam.d/common-auth`), it captures the
-plaintext credential on any successful PAM authentication (SSH login,
-`sudo`, etc.) and uses it to update that user's local
+schema (`sambaSAMAccount`/`sambaNTPassword`). Samba's own answer to this,
+historically, was the `pam_smbpass` module (`libpam-smbpass`) — but
+upstream Samba dropped it in 4.4, and Debian/Ubuntu removed the package
+along with it well before any platform this project targets existed, so
+it's not installable anywhere `stortree_pam_smbpass` would run. The
+`stortree_pam_smbpass` role instead stacks `pam_exec.so
+expose_authtok seteuid` into the host's PAM `auth`/`password` chain
+*after* SSSD's module (via `ansible.builtin.pamd` for a declarative,
+idempotent edit rather than hand-patching `/etc/pam.d/common-auth`),
+pointed at a small script the role deploys
+(`roles/stortree_pam_smbpass/files/pam-smbpass-sync.sh`). `pam_exec`
+hands that script the plaintext credential on stdin on any successful PAM
+authentication (SSH login, `sudo`, etc.) or password change, and the
+script drives `smbpasswd -s -a` to update that user's local
 `smbpasswd`/`tdbsam` NT-hash entry — so the Samba password stays in sync
 with the LDAP password, with the NT hash generated and kept locally on
-each host.
+each host, the same end result `pam_smbpass` used to produce. Both
+stackings use `optional` control (a sync side effect must never be able
+to gate or short-circuit the real auth/password decision) and `seteuid`
+(`passwd` is setuid root, so its real UID is the invoking user — without
+`seteuid` the script would run as that user and be unable to write the
+local smbpasswd database).
 
 Caveat: the sync only fires on an actual PAM event *on that specific
 host*, so a user's first SMB connection to a given host fails until
@@ -434,8 +445,9 @@ failure handling instead of bespoke retry logic.
   `community.crypto` collection (`community.crypto.openssh_keypair` in
   §7).
 - **Every managed host**: `rclone` (§2), `samba` (§4), `sssd` (§5), `acl`
-  (§6), and `libpam-smbpass` (§5) — existing, well-known Linux
-  storage/identity tooling the roles configure rather than reinvent.
+  (§6), and `samba-common-bin`/`libpam-modules` (`smbpasswd` and
+  `pam_exec.so`, §5) — existing, well-known Linux storage/identity
+  tooling the roles configure rather than reinvent.
 - **Test harness only** (not needed in production): Molecule, Docker, and
   the mocked-dependency containers below.
 
