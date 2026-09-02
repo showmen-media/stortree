@@ -4,11 +4,31 @@
 # per peer dependency (spec.md §3). The master rclone.conf never leaves
 # the control node.
 
+- name: Look up membership for every group referenced in a per-user access grant
+  # A per-user peer dependency's %U has to be expanded to the real
+  # username actually granted access before its synthesized sftp section
+  # can point at the right path (spec.md §3) -- the same group_members
+  # map stortree_mounts/stortree_acl need for their own %U expansion
+  # (spec.md §2/§6), resolved once here since this is the first role in
+  # site.yml's order that needs it (runs after stortree_identity, so SSSD
+  # is already configured); stortree_mounts/stortree_acl reuse this same
+  # `stortree_group_members` fact rather than re-deriving their own.
+  ansible.builtin.getent:
+    database: group
+    key: "{{ item }}"
+  loop: "{{ stortree | stortree_needed_groups }}"
+  tags: [secrets]
+
+- name: Compute this host's resolved group membership
+  ansible.builtin.set_fact:  # noqa: var-naming[no-role-prefix]
+    stortree_group_members: "{{ ansible_facts.getent_group | default({}) | stortree_group_members }}"
+  tags: [secrets]
+
 - name: Render this host's filtered rclone.conf
   ansible.builtin.copy:
     content: >-
       {{ lookup('file', stortree_rclone_conf_path)
-         | stortree_filter_rclone_conf(stortree, hostvars) }}
+         | stortree_filter_rclone_conf(stortree, hostvars, stortree_group_members) }}
     dest: "{{ stortree_etc }}/rclone.conf"
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"

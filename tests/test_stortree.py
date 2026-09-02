@@ -10,6 +10,7 @@ from filter_plugins.stortree import (
     filter_rclone_conf,
     group_members_from_getent,
     mount_unit_names,
+    needed_groups,
     plan_mounts,
     resolve,
 )
@@ -69,7 +70,10 @@ def test_bravo_owns_three_subtrees_with_a_different_remote():
     # bravo also has a `clients:` entry -- both lists at once (spec.md §1)
     assert len(r["client_mounts"]) == 1
     mount = r["client_mounts"][0]
-    assert mount["remote"] == "storagebox:/"
+    # the root client mount is peer-sourced from alpha (root_host), not a
+    # direct mount of the tree's own rclone.remote -- see the matching
+    # peer_dependencies entry below
+    assert mount["remote"] == "peer-storage-node-alpha-root"
     # client-defaults merged with clients.storage-node-bravo overrides
     assert mount["args"]["vfs-cache-mode"] == "full"  # from client-defaults
     assert mount["args"]["vfs-cache-max-size"] == "5G"  # bravo's own override
@@ -111,6 +115,48 @@ def test_alpha_peer_served_by_includes_bravo_and_gadget():
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     servers = {p["serving_host"] for p in r["peer_served_by"]}
     assert servers == {"storage-node-bravo", "some-storage-gadget"}
+
+
+def test_every_non_root_host_peer_sources_its_client_mount_from_root_host():
+    # A client mount is never a direct mount of the tree's own
+    # rclone.remote -- it's a peer-sftp mount of root_host's own
+    # /srv/stortree, sourced the same way as any samba peer dependency
+    # (docs/spec.md §1).
+    for hostname in ("storage-node-bravo", "some-storage-gadget"):
+        r = resolve(EXAMPLE_TREE, hostname, EXAMPLE_HOSTS)
+        root_peers = [
+            p
+            for p in r["peer_dependencies"]
+            if p["owning_host"] == "storage-node-alpha" and p["local_path"] == ""
+        ]
+        assert len(root_peers) == 1
+        assert r["client_mounts"][0]["remote"] == "peer-storage-node-alpha-root"
+
+    # root_host itself never peer-sources its own client mount -- it has
+    # none (test_alpha_owns_everything_not_overridden already asserts
+    # client_mounts == [] for it)
+    alpha = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
+    assert not any(
+        p["local_path"] == "" for p in alpha["peer_dependencies"]
+    )
+
+    # ...and alpha's peer_served_by reflects serving that root mount to
+    # every other host, in addition to whatever samba pieces it serves
+    root_served = [p for p in alpha["peer_served_by"] if p["local_path"] == ""]
+    assert {p["serving_host"] for p in root_served} == {
+        "storage-node-bravo",
+        "some-storage-gadget",
+    }
+
+
+def test_root_with_no_remote_gets_no_root_peer_dependency():
+    # A root with no rclone.remote of its own has nothing to peer for --
+    # the client still resolves (local root directory gets created by
+    # stortree_mounts), just no mount and no peer dependency for it.
+    tree = {"host": "h1", "subdirs": {"plain": {"host": "h2"}}}
+    r = resolve(tree, "h2", ["h1", "h2"])
+    assert r["client_mounts"] == [{"remote": None, "path": "", "args": {}}]
+    assert not any(p["local_path"] == "" for p in r["peer_dependencies"])
 
 
 def test_sys_configs_access_defaults_permissions_and_is_per_user():
@@ -340,7 +386,76 @@ def test_filter_rclone_conf_scopes_to_needed_sections_plus_peers():
     assert "path = /srv/stortree/shared/piece-b" in out
 
 
-# -- group_members_from_getent / access_grant_usernames -----------------
+def test_filter_rclone_conf_expands_per_user_peer_sections():
+    # a per-user peer dependency's %U has to become one real INI section
+    # per actual user -- plan_mounts() independently expands the same
+    # entry into one mount per user, and both have to compute the exact
+    # same section name for a mount's `remote` to actually resolve
+    resolved = {
+        "server_subtrees": [],
+        "client_mounts": [],
+        "samba_shares": [],
+        "peer_dependencies": [
+            {
+                "owning_host": "host-b",
+                "local_path": "home/%U/sys-configs",
+                "remote_path": "home/%U/sys-configs",
+                "samba_node": "home",
+                "per_user": True,
+                "access": [{"user": "jd", "permissions": "rwx"}],
+            }
+        ],
+    }
+    hostvars = {"host-b": {"ansible_host": "10.0.0.2"}}
+
+    out = filter_rclone_conf(MASTER_INI, resolved, hostvars, group_members={})
+
+    assert "[peer-host-b-home-jd-sys-configs]" in out
+    assert "path = /srv/stortree/home/jd/sys-configs" in out
+    # no section synthesized for the un-expanded %U template itself
+    assert "peer-host-b-home-pctU-sys-configs" not in out
+
+
+# -- group_members_from_getent / access_grant_usernames / needed_groups ---
+
+
+def test_needed_groups_covers_server_subtrees_and_peer_dependencies():
+    # gadget owns nothing (no server_subtrees at all) -- every group it
+    # needs getent'd for comes from peer_dependencies alone, since that's
+    # the only place its per-user access grants show up
+    r = resolve(EXAMPLE_TREE, "some-storage-gadget", EXAMPLE_HOSTS)
+    assert needed_groups(r) == [
+        "Media Production",
+        "Michael Whitfield Family",
+        "Whitfield Family & Friends",
+    ]
+
+    # bravo owns some per-user pieces itself (server_subtrees: mw-fam,
+    # whitfield-media) and peer depends on the rest (alpha's sys-configs,
+    # a user-only grant with no group; and media-prod, group-granted) --
+    # same combined group set as gadget's, just split across both sources
+    r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
+    assert needed_groups(r) == [
+        "Media Production",
+        "Michael Whitfield Family",
+        "Whitfield Family & Friends",
+    ]
+
+
+def test_needed_groups_ignores_non_per_user_and_user_only_grants():
+    tree = {
+        "host": "h1",
+        "rclone.remote": "r1:/",
+        "subdirs": {
+            "shared": {
+                "samba": {"subpath": ""},
+                "access.group": "not-per-user-group",
+                "subdirs": {"leaf": {"host": "h2", "access.user": "jd"}},
+            }
+        },
+    }
+    r = resolve(tree, "h1", ["h1", "h2"])
+    assert needed_groups(r) == []
 
 
 def test_group_members_from_getent_parses_csv_member_field():
@@ -389,6 +504,45 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
     root_slug = by_local_path[""]["slug"]
     assert by_local_path[".cache/storage-node-bravo"]["requires_slug"] == root_slug
     assert by_local_path["home/mike/mw-fam"]["requires_slug"] == root_slug
+
+
+def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
+    # gadget owns nothing (docs/config-schema.md worked example) -- every
+    # piece of `home` it must still serve via Samba (spec.md "Samba
+    # sharing is universal") comes from a real mount now, sourced
+    # directly (mesh) from whichever host actually owns that piece, not
+    # funneled through root_host.
+    r = resolve(EXAMPLE_TREE, "some-storage-gadget", EXAMPLE_HOSTS)
+    group_members = {"Michael Whitfield Family": ["mike"]}
+    plan = plan_mounts(r, group_members)
+    by_local_path = {e["local_path"]: e for e in plan}
+
+    # alpha-owned, per-user, no rclone.remote of its own -- still a real
+    # peer mount (sourced live from alpha's own filesystem at that exact
+    # path), since it's a leaf with real per-user content, not a
+    # structural container
+    assert "home/jd/sys-configs" in by_local_path
+    sys_configs = by_local_path["home/jd/sys-configs"]
+    assert sys_configs["remote"] == "peer-storage-node-alpha-home-jd-sys-configs"
+
+    # bravo-owned, per-user, sourced directly from bravo -- not relayed
+    # through alpha (root_host), preserving the mesh
+    assert "home/mike/mw-fam" not in {
+        p for p, e in by_local_path.items() if e["remote"] and "alpha" in e["remote"]
+    }
+    whitfield = by_local_path["home/mike/whitfield-media"]
+    assert whitfield["remote"] == "peer-storage-node-bravo-home-mike-whitfield-media"
+
+    # the samba node itself ("home") is a pure container -- delegates
+    # entirely to its own children above, gets no mount/peer of its own
+    assert "home" not in by_local_path
+
+    # every peer-sourced entry nests directly under gadget's own root
+    # client mount (also peer-sourced, from alpha) -- not under "home",
+    # which was never a mount to nest under in the first place
+    root_slug = by_local_path[""]["slug"]
+    assert sys_configs["requires_slug"] == root_slug
+    assert whitfield["requires_slug"] == root_slug
 
 
 def test_plan_mounts_nested_nonuser_paths_require_their_parent():

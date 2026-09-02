@@ -20,26 +20,15 @@
     cache_valid_time: 3600
   tags: [acl]
 
-- name: Look up membership for every group referenced in per-user access grants
-  ansible.builtin.getent:
-    database: group
-    key: "{{ item }}"
-  loop: >-
-    {{ stortree.server_subtrees
-       | selectattr('per_user')
-       | map(attribute='access')
-       | sum(start=[])
-       | selectattr('group', 'defined')
-       | map(attribute='group')
-       | unique
-       | list }}
-  tags: [acl]
-
 - name: Compute this host's flat mount plan (path + access, per user where applicable)
+  # stortree_group_members (resolved by stortree_secrets, which always
+  # runs before this role -- site.yml §8) covers every group referenced
+  # in a per-user access grant, whether this host owns the node
+  # (server_subtrees) or peer-sources it (peer_dependencies) -- both get
+  # %U-expanded here, so a peer-sourced per-user directory gets the same
+  # ACLs applied locally as one this host owns outright.
   ansible.builtin.set_fact:
-    stortree_acl_plan: >-
-      {{ stortree
-         | stortree_plan_mounts(ansible_facts.getent_group | default({}) | stortree_group_members) }}
+    stortree_acl_plan: "{{ stortree | stortree_plan_mounts(stortree_group_members) }}"
   tags: [acl]
 
 - name: Flatten access grants to one (path, grant) pair per task

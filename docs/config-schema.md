@@ -255,11 +255,15 @@ SSSD (backed by the configured LDAP server — see `ldap.yml` below).
 `clients:` is only ever for a per-host override, never a prerequisite for
 being a client. Every host in the Ansible inventory
 (`inventory/hosts.yml`, spec.md "Config layout") that isn't itself some
-node's resolved `host` gets a client mount of the root `rclone.remote`,
-whether or not it has a `clients:` entry and whether or not it's named
-anywhere in `config.yml` at all. With an entry, `clients.<hostname>.rclone.args`
+node's resolved `host` gets a client mount of the tree root, whether or
+not it has a `clients:` entry and whether or not it's named anywhere in
+`config.yml` at all. With an entry, `clients.<hostname>.rclone.args`
 merges over `client-defaults`; without one, it just gets `client-defaults`
-verbatim.
+verbatim. That mount is **not** a direct mount of the root
+`rclone.remote` — it's a peer-sftp mount of the resolved owner's
+(`host:`'s) own `/srv/stortree`, provisioned by `stortree_peer_trust` the
+same way as any other peer dependency (spec.md §1/§7); a client never
+holds credentials for the root remote itself.
 
 The same goes for "Samba sharing is universal" below and for cross-host
 peer dependencies (spec.md §1/§7): both apply to every inventory host

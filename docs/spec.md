@@ -103,14 +103,30 @@ filter directly:
   `access` rules. A node with no `rclone.remote` of its own resolves with
   no remote at all — it's a plain directory that has to exist, not a
   separate rclone mount; §2 covers what that means for mount planning.
-- **Client mounts** — a direct rclone mount of the root remote for local
-  use, for every host in `all_hosts` that isn't itself a server subtree's
-  resolved `host`. If the host has an entry under the root `clients:`
-  map, `clients.<hostname>.rclone.args` merges over `client-defaults`;
-  otherwise it gets `client-defaults` verbatim — a `clients:` entry is
-  only ever a per-host override, never a prerequisite for being a client
-  (see "Every inventory host participates", config-schema.md). This alone
-  implies no peer-trust or Samba behavior.
+- **Client mounts** — a peer-sftp mount of the tree root, sourced from
+  the host that actually owns it (`host:`'s resolved value, "root_host"
+  below) rather than the root's own third-party `rclone.remote` — for
+  every host in `all_hosts` that isn't itself a server subtree's resolved
+  `host`. This is the same peer-sourcing rule §1 already applies to any
+  samba descendant a host doesn't own, just for the one root-level piece
+  that isn't a node in the tree at all (root is the inheritance anchor,
+  not a mountable node of its own — see "Node inheritance",
+  config-schema.md): a client never holds direct credentials to the root
+  remote itself, only an SFTP hop into root_host's own already-mounted
+  `/srv/stortree` (provisioned by `stortree_peer_trust`, §7, exactly like
+  any other peer dependency). If the host has an entry under the root
+  `clients:` map, `clients.<hostname>.rclone.args` merges over
+  `client-defaults`; otherwise it gets `client-defaults` verbatim — a
+  `clients:` entry is only ever a per-host override, never a prerequisite
+  for being a client (see "Every inventory host participates",
+  config-schema.md). A root with no `rclone.remote` of its own has
+  nothing to peer for — the client still gets its local root directory
+  created, just no mount and no peer dependency for it. Unlike a samba
+  peer dependency, this one implies no Samba behavior of its own — it
+  exists purely so a client's local tree has real content — but it does
+  mean every non-root host now needs `stortree_peer_trust` (§7) to reach
+  root_host, which the role already handles the same way as any other
+  peer dependency.
 - **Samba shares** — every node anywhere in the tree that carries a
   `samba:` block, resolved for *every* host in `all_hosts`, not just the
   node's own resolved `host` or hosts named anywhere in `config.yml`. A
@@ -159,7 +175,16 @@ a client-only host with no server subtrees of its own still ends up
 peer-dependent on every host that owns a piece of a samba-configured node,
 exactly like a host that owns part of it and needs the rest. This falls
 out of the `host:`/`rclone.remote` fields already in the tree, independent
-of `clients:` — no separate field is needed to express it. Because
+of `clients:` — no separate field is needed to express it. The
+samba-marked node itself is the one descendant this never applies to when
+it carries no `rclone.remote` of its own and has children (the common
+shape — see §2): a pure structural container like that delegates its real
+content entirely to its own, more specific descendants, so peer-sourcing
+it too would be redundant at best; a remote-less descendant with no
+children of its own (a genuine leaf, just backed by nothing but the
+owning host's own local disk) still becomes a peer dependency like any
+other, since a live peer connection to that host is the only way to
+source it at all. Because
 `resolve()` is pure and total over the whole tree, computing H's peer
 dependencies just means calling `resolve(tree, B, all_hosts)` for every
 owning host B too — the filter plugin does this internally, so peer
@@ -207,12 +232,12 @@ rather than tree inheritance:
 ### 2. Mount management (rclone)
 
 The `stortree_mounts` role flattens `stortree_facts`' resolved server
-subtrees and client mounts into one plan (`stortree_plan_mounts`) and,
-for every entry that actually has a `remote` (§1 — a server-subtree node
-with no `rclone.remote` of its own resolves with none, since `rclone`
-never inherits), templates one systemd
-unit per mount (`templates/rclone-mount@.service.j2`: `rclone mount
-<remote> <path> <merged args...>`, `Restart=on-failure`,
+subtrees, client mount, and peer dependencies into one plan
+(`stortree_plan_mounts`) and, for every entry that actually has a
+`remote` (§1 — a server-subtree node with no `rclone.remote` of its own
+resolves with none, since `rclone` never inherits), templates one
+systemd unit per mount (`templates/rclone-mount@.service.j2`: `rclone
+mount <remote> <path> <merged args...>`, `Restart=on-failure`,
 `After=network-online.target`, `RequiresMountsFor=` where one mount nests
 under another — skipping over any remote-less ancestor in between, since
 those have no unit of their own to require), using the `template` module
@@ -222,6 +247,33 @@ directory created (`ansible.builtin.file`) — a remote-less entry is a
 plain directory that has to exist (nested inside a mounted ancestor, or
 as real local storage on its own resolved host if not), it just gets no
 rclone unit.
+
+Every peer dependency (§1) becomes one of these mount entries too, not
+just the root client mount — a samba descendant this host doesn't own is
+real data its own local tree still has to contain, sourced directly from
+whichever host actually owns it (mesh, one peer relationship per distinct
+owning host, never funneled through root_host). The one exception is the
+samba node marking a subtree for export itself when it carries no
+`rclone.remote` of its own and has children: that's a pure structural
+container (the common case — `home` in the worked example above), and
+peer-mounting it too would be both redundant with its own children's more
+specific entries and actively wrong (an unrelated ancestor a same-path
+child this host owns outright would then have to require a peer
+connection it never needed) — `stortree_plan_mounts` skips it, the same
+way it skips any remote-less node with children. A remote-less *leaf*
+descendant (no `rclone.remote` of its own, and no children — e.g.
+`sys-configs` above) still gets peer-mounted despite having no
+third-party backend: from a non-owning host's perspective, its real
+content only exists on the owning host's own local disk, so a live
+peer-sftp view of that exact path is the only way to source it at all —
+unlike a server_subtrees entry with no remote (§1 "Node inheritance"),
+where the owning host already has the data locally and needs no mount to
+reach it.
+
+A per-user peer dependency's %U template is expanded here the same way a
+per-user server_subtrees node's is — one mount per user actually granted
+access, using `stortree_group_members` (see §6 for where that fact comes
+from).
 
 Ansible's own idempotence covers what a hand-rolled reconciler would
 otherwise have to implement: `template` only rewrites a unit file when its
@@ -259,7 +311,20 @@ host's `stortree` SSH endpoint (keys provisioned by `stortree_peer_trust`,
 §7) and the local path already resolved for that subtree there — into the
 filtered `rclone.conf` rendered for the serving host. The serving host's
 mount unit (§2) then mounts that synthesized remote at the correct nested
-path, same as any other resolved mount.
+path, same as any other resolved mount. The root-level peer dependency
+behind every client mount (§1) synthesizes the same way, just with an
+empty local path — the section's `path` is root_host's own
+`/srv/stortree`, and the client's mount unit references the synthesized
+section's bare name (mounting that remote's own root, same convention as
+a bare `rclone.remote` section name) instead of the tree's third-party
+`rclone.remote` value. A per-user peer dependency's %U gets expanded into
+one section per actual user here too, exactly the way `stortree_mounts`
+(§2) independently expands the same entry into one mount per user — both
+have to agree on the expanded (not templated) path to name the section
+the same way, so `stortree_secrets` is the one role that resolves
+`stortree_group_members` (§6) fresh via `getent`, first in `site.yml`'s
+order among the roles that need it; `stortree_mounts`/`stortree_acl`
+reuse that same fact rather than each re-deriving their own.
 
 ### 4. Samba layer
 
@@ -348,12 +413,30 @@ regardless of what that session is allowed to do afterward.
 or the dotted shorthand `access.group` / `access.user`) resolve against
 the SSSD-provided groups/users, then `stortree_acl` applies them with
 `ansible.posix.acl` (both default and effective ACLs, recursive) directly
-on the physical path, on whichever host actually serves that subtree.
-Because this is POSIX-level, it governs access uniformly whether the path
-is reached via Samba, SSH, or a local process. ACLs are naturally
-idempotent to reapply with the same spec, so the role always recomputes
-and reapplies from the resolved facts rather than diffing against
-previous runs.
+on the physical path — on whichever host actually serves that subtree, or
+peer-sources it (§1/§2), same as any other resolved mount. Because this
+is POSIX-level, it governs access uniformly whether the path is reached
+via Samba, SSH, or a local process. ACLs are naturally idempotent to
+reapply with the same spec, so the role always recomputes and reapplies
+from the resolved facts rather than diffing against previous runs.
+
+A per-user grant's %U has to be expanded to real usernames before any of
+this — `access_grant_usernames()` resolves a group grant against real
+group membership (interpretation call #2), which needs `getent group`
+run against every group referenced anywhere in a per-user access grant
+first. `stortree_needed_groups()` computes that set once (covering both
+`server_subtrees`' own per-user nodes and `peer_dependencies`' — a
+peer-sourced per-user descendant expands the exact same way, §2/§3); the
+`stortree_secrets` role — first among the roles that need it in
+`site.yml`'s order (§8) — runs the `getent` lookup and sets the
+`stortree_group_members` fact from it, which `stortree_mounts` and this
+role both then reuse rather than each deriving their own (and risking one
+missing a scope the others cover, which is exactly what happened before
+this was consolidated: `stortree_mounts` and `stortree_acl` each ran
+their own `getent` loop, scoped to `server_subtrees` only, so a
+client-only host with no server_subtrees of its own — like
+`some-storage-gadget` in the worked example — never resolved the groups
+its peer-sourced per-user shares actually needed).
 
 The optional `sshd_config` fragment (`stortree_sshd`, only runs when
 `stortree/sshd_config` is present in the repo) is templated to
@@ -393,9 +476,13 @@ tree:
    (recommended — pair with `internal-sftp`/`ForceCommand` via the
    `sshd_config` fragment, §6).
 
-Because Samba sharing is universal (§1), the set of hosts needing this
-provisioned can include ones with no server subtrees of their own, and
-even ones with no mention in `config.yml` at all (present only in
+Every non-root host is the *serving* side of at least one peer dependency
+unconditionally now — its own root client mount (§1) — so this
+provisions on every `ansible-playbook` run for the whole fleet, not only
+where a `samba:` block is in play. Because Samba sharing is universal
+(§1) on top of that, the set of hosts needing this provisioned can extend
+further still to ones with no server subtrees of their own, and even ones
+with no mention in `config.yml` at all (present only in
 `all_hosts`/the inventory) — a client-only or entirely-unnamed host
 peer-dependent on every owner of a `samba:`-configured node's descendants
 ends up as the *serving* side here too, and a subtree-owning host can

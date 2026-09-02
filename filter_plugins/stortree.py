@@ -10,9 +10,11 @@ the spec leaves something implicit.
 Two Jinja filters are exposed to plays via FilterModule at the bottom:
 
 - stortree_resolve(tree, hostname, all_hosts) -- everything a given host
-  must do: server subtrees it owns, its client mount (if any), every
-  Samba share in the tree (Samba sharing is universal), and its peer
-  dependencies/peer_served_by for cross-host sourcing.
+  must do: server subtrees it owns, its client mount of the tree root
+  (if any -- peer-sourced from the resolved root host, not the root's
+  own third-party remote), every Samba share in the tree (Samba sharing
+  is universal), and its peer dependencies/peer_served_by for cross-host
+  sourcing.
 - stortree_filter_rclone_conf(rclone_conf_text, resolved, hostvars) --
   the master rclone.conf INI filtered down to only the sections a host's
   resolved facts actually reference, plus synthesized sftp sections for
@@ -160,6 +162,28 @@ def _descendants_of(samba_node, nodes):
     return [samba_node] + [n for n in nodes if n["path"].startswith(prefix)]
 
 
+def _has_own_content(node, nodes):
+    """Whether `node` is something a peer actually needs its own mount
+    for, rather than a pure structural container. A node with its own
+    `remote` always does (that's the authoritative source for that exact
+    path regardless of what's nested under it -- same as any other
+    mounted node). A remote-less node only does if it's a leaf: a
+    remote-less node *with children* -- the samba node itself
+    (`_descendants_of`'s own first element) is the common case, but any
+    plain intermediate container works the same way -- delegates its real
+    content entirely to those children, which are their own, more
+    specific entries; peer-mounting the container too would be redundant
+    at best (whatever's really there is already covered by its children)
+    and actively wrong at worst (a peer mount at the container's path
+    would become an unrelated ancestor of a same-path child this host
+    owns outright, e.g. via server_subtrees -- forcing that child's own
+    mount to require a peer connection it never needed)."""
+    if node["remote"]:
+        return True
+    prefix = node["path"] + "/"
+    return not any(n["path"].startswith(prefix) for n in nodes)
+
+
 def _dedupe(items, key):
     seen = set()
     result = []
@@ -182,16 +206,21 @@ def resolve(tree, hostname, all_hosts):
 
     server_subtrees = [n for n in nodes if n["host"] == hostname]
 
-    client_mounts = []
-    if hostname != root_host:
-        defaults = ((tree.get("client-defaults") or {}).get("rclone") or {}).get(
-            "args"
-        ) or {}
-        override = (
-            ((tree.get("clients") or {}).get(hostname) or {}).get("rclone") or {}
-        ).get("args") or {}
-        merged_args = _deep_merge(dict(defaults), dict(override))
-        client_mounts.append({"remote": root_remote, "path": "", "args": merged_args})
+    # Every peer mount this host ends up with -- root-level or a samba
+    # descendant alike -- uses this host's own client-style args (never the
+    # owning host's own rclone.args, which were tuned for its direct
+    # connection to the real backend, not this peer-sftp hop): the base
+    # `client-defaults`, with this host's own `clients.<hostname>.rclone.args`
+    # entry (if any) merged over it. Computed once, up front, so both the
+    # samba-descendant loop below and the root client mount can attach it
+    # to their own peer_dependencies entries without recomputing it.
+    defaults = ((tree.get("client-defaults") or {}).get("rclone") or {}).get(
+        "args"
+    ) or {}
+    override = (
+        ((tree.get("clients") or {}).get(hostname) or {}).get("rclone") or {}
+    ).get("args") or {}
+    peer_mount_args = _deep_merge(dict(defaults), dict(override))
 
     samba_nodes = _samba_nodes(nodes)
     samba_shares = []
@@ -227,7 +256,7 @@ def resolve(tree, hostname, all_hosts):
         )
 
         for d in descendants:
-            if d["host"] != hostname:
+            if d["host"] != hostname and _has_own_content(d, nodes):
                 peer_dependencies.append(
                     {
                         "owning_host": d["host"],
@@ -235,8 +264,40 @@ def resolve(tree, hostname, all_hosts):
                         "remote_path": d["path"],
                         "samba_node": s["path"],
                         "per_user": d["per_user"],
+                        "access": d["access"],
+                        "args": peer_mount_args,
                     }
                 )
+
+    # Client mount of the tree root: a non-root host reaches root's data by
+    # peer-sftp'ing the host that actually owns it (root_host) rather than
+    # holding direct credentials to root_remote itself -- the same
+    # peer-sourcing rule already applied above to every samba descendant a
+    # host doesn't own, just for the one root-level piece that isn't a node
+    # in `nodes` at all (root is the inheritance anchor, not a mountable
+    # node of its own -- see _walk_tree()). A root with no rclone.remote of
+    # its own has nothing to peer for -- the client still gets its local
+    # root directory created by stortree_mounts, just no mount at all, same
+    # as before this peer-sourcing existed.
+    client_mounts = []
+    if hostname != root_host:
+        client_remote = None
+        if root_remote:
+            peer_dependencies.append(
+                {
+                    "owning_host": root_host,
+                    "local_path": "",
+                    "remote_path": "",
+                    "samba_node": None,
+                    "per_user": False,
+                    "access": [],
+                    "args": peer_mount_args,
+                }
+            )
+            client_remote = _peer_section_name(root_host, "")
+        client_mounts.append(
+            {"remote": client_remote, "path": "", "args": peer_mount_args}
+        )
 
     peer_dependencies = _dedupe(
         peer_dependencies, lambda p: (p["owning_host"], p["local_path"])
@@ -246,9 +307,18 @@ def resolve(tree, hostname, all_hosts):
     for other in all_hosts:
         if other == hostname:
             continue
+        if hostname == root_host and root_remote:
+            peer_served_by.append(
+                {
+                    "serving_host": other,
+                    "local_path": "",
+                    "samba_node": None,
+                    "per_user": False,
+                }
+            )
         for s in samba_nodes:
             for d in _descendants_of(s, nodes):
-                if d["host"] == hostname:
+                if d["host"] == hostname and _has_own_content(d, nodes):
                     peer_served_by.append(
                         {
                             "serving_host": other,
@@ -277,19 +347,30 @@ def _remote_section(remote_spec):
 
 
 def _peer_section_name(owning_host, local_path):
-    slug = local_path.replace("/", "-").replace("%", "pct")
+    # Empty local_path is the tree root's own reserved slug (matches
+    # _slug()'s "root" convention below) -- the one peer dependency that
+    # isn't a nodes() descendant, synthesized for client_mounts instead.
+    slug = local_path.replace("/", "-").replace("%", "pct") or "root"
     return f"peer-{owning_host}-{slug}"
 
 
-def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None):
+def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None, group_members=None):
     """Filter the master rclone.conf INI down to only the sections
     `resolved` (this host's stortree_resolve() output) actually needs,
     plus one synthesized sftp section per peer dependency (spec.md §3).
     `hostvars` (Ansible's own magic var, or any {hostname: {ansible_host:
     ...}} mapping) supplies the address to reach each peer's owning host
     at; falls back to the owning hostname itself if not given.
+    `group_members` (e.g. `ansible_facts.getent_group |
+    stortree_group_members`) resolves a per-user peer dependency's %U
+    template into one section per actual user, exactly the way
+    `plan_mounts()` independently expands the same entry into one mount
+    per user -- both have to agree on `_peer_section_name()`'s input (the
+    expanded, not templated, path) since that's what ties a mount's
+    `remote` back to the section actually holding its credentials.
     """
     hostvars = hostvars or {}
+    group_members = group_members or {}
 
     master = configparser.ConfigParser()
     master.read_string(rclone_conf_text)
@@ -310,18 +391,31 @@ def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None):
             out[section] = dict(master[section])
 
     for peer in resolved.get("peer_dependencies", []):
-        section_name = _peer_section_name(peer["owning_host"], peer["local_path"])
+        if peer.get("per_user"):
+            users = access_grant_usernames(peer.get("access", []), group_members)
+            expanded = [
+                (
+                    peer["local_path"].replace(PER_USER_PLACEHOLDER, u),
+                    peer["remote_path"].replace(PER_USER_PLACEHOLDER, u),
+                )
+                for u in users
+            ]
+        else:
+            expanded = [(peer["local_path"], peer["remote_path"])]
+
         address = (hostvars.get(peer["owning_host"]) or {}).get(
             "ansible_host", peer["owning_host"]
         )
-        out[section_name] = {
-            "type": "sftp",
-            "host": address,
-            "user": "stortree",
-            "key_file": PEER_SSH_KEY_PATH,
-            "shell_type": "unix",
-            "path": f"/srv/stortree/{peer['remote_path']}",
-        }
+        for local_path, remote_path in expanded:
+            section_name = _peer_section_name(peer["owning_host"], local_path)
+            out[section_name] = {
+                "type": "sftp",
+                "host": address,
+                "user": "stortree",
+                "key_file": PEER_SSH_KEY_PATH,
+                "shell_type": "unix",
+                "path": f"/srv/stortree/{remote_path}" if remote_path else "/srv/stortree",
+            }
 
     buf = io.StringIO()
     out.write(buf)
@@ -385,12 +479,41 @@ def access_grant_usernames(access, group_members=None):
     return sorted(users)
 
 
+def needed_groups(resolved):
+    """Every group name this host's resolved facts reference in a
+    per-user access grant -- the set `getent group` needs to be run
+    against before `group_members_from_getent()`'s result can feed
+    `plan_mounts()`/`filter_rclone_conf()`'s own %U expansion (interpretation
+    call #2). Covers both `server_subtrees` (this host's own per-user
+    nodes) and `peer_dependencies` (a per-user samba descendant sourced
+    from a peer, or the root client mount -- which never carries `access`,
+    so contributes nothing here) -- the two are computed once, together,
+    by `stortree_facts` so every later role (`stortree_mounts`,
+    `stortree_acl`, `stortree_secrets`) shares one lookup and one
+    consistent group_members map, rather than each recomputing its own
+    scope of it (and risking one missing a scope the others cover)."""
+    groups = set()
+    for n in resolved.get("server_subtrees", []):
+        if not n.get("per_user"):
+            continue
+        for grant in n.get("access") or []:
+            if "group" in grant:
+                groups.add(grant["group"])
+    for p in resolved.get("peer_dependencies", []):
+        if not p.get("per_user"):
+            continue
+        for grant in p.get("access") or []:
+            if "group" in grant:
+                groups.add(grant["group"])
+    return sorted(groups)
+
+
 def plan_mounts(resolved, group_members=None):
-    """Flatten this host's resolved server_subtrees/client_mounts into
-    one flat plan of every local path that has to exist (spec.md §2),
-    expanding a user-subdirs entry's %U-templated path into one entry per
-    user actually granted access to it (interpretation call #2) using
-    `group_members` (e.g. `ansible_facts.getent_group |
+    """Flatten this host's resolved server_subtrees/client_mounts/
+    peer_dependencies into one flat plan of every local path that has to
+    exist (spec.md §2), expanding a user-subdirs entry's %U-templated path
+    into one entry per user actually granted access to it (interpretation
+    call #2) using `group_members` (e.g. `ansible_facts.getent_group |
     stortree_group_members`).
 
     Not every entry is an rclone mount: a server_subtrees entry with
@@ -400,6 +523,17 @@ def plan_mounts(resolved, group_members=None):
     callers should render an rclone unit only for entries with a
     truthy `remote`, e.g. `stortree_mounts_plan | selectattr('remote')`.
     A client_mounts entry always has a remote (the root `rclone.remote`).
+
+    Every peer_dependencies entry becomes a mount too -- a samba
+    descendant this host doesn't own is data this host's local tree still
+    has to contain (spec.md §1 "Samba sharing is universal"), sourced
+    directly from its actual owning host exactly like the root client
+    mount is (mesh, not funneled through root_host -- each peer_dependency
+    already names its own real owning host). The root-level entry
+    (`local_path == ""`) is skipped here since it's already the
+    client_mounts entry above; every other entry gets its own mount,
+    per-user-expanded the same way as a per-user server_subtrees entry,
+    using its own `access`/`args` (never the owning host's).
 
     Each returned entry: {local_path, remote, args, slug, requires_slug}.
     `requires_slug` names the nearest ancestor entry that's an actual
@@ -435,6 +569,30 @@ def plan_mounts(resolved, group_members=None):
                     "remote": n["remote"],
                     "args": n["args"],
                     "access": n["access"],
+                }
+            )
+
+    for p in resolved.get("peer_dependencies", []):
+        if p["local_path"] == "":
+            continue  # already the client_mounts entry above
+        if not p.get("per_user"):
+            entries.append(
+                {
+                    "local_path": p["local_path"],
+                    "remote": _peer_section_name(p["owning_host"], p["local_path"]),
+                    "args": p["args"],
+                    "access": p.get("access", []),
+                }
+            )
+            continue
+        for user in access_grant_usernames(p.get("access", []), group_members):
+            local_path = p["local_path"].replace(PER_USER_PLACEHOLDER, user)
+            entries.append(
+                {
+                    "local_path": local_path,
+                    "remote": _peer_section_name(p["owning_host"], local_path),
+                    "args": p["args"],
+                    "access": p.get("access", []),
                 }
             )
 
@@ -483,6 +641,7 @@ class FilterModule(object):
             "stortree_filter_rclone_conf": filter_rclone_conf,
             "stortree_group_members": group_members_from_getent,
             "stortree_access_users": access_grant_usernames,
+            "stortree_needed_groups": needed_groups,
             "stortree_plan_mounts": plan_mounts,
             "stortree_mount_unit_names": mount_unit_names,
         }

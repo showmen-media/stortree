@@ -1,11 +1,12 @@
 ---
-# Declarative cross-host SSH trust for peer-sourced Samba data (spec.md
-# §7). Runs against every host in the same play, so by the time this
-# task file runs for host H, stortree_facts has already resolved every
-# other host too (linear strategy processes stortree_facts for the
-# whole batch before stortree_peer_trust starts) -- no separate
-# bootstrap/join step needed, and re-running keeps trust current as
-# peer dependencies change.
+# Declarative cross-host SSH trust for peer-sourced data -- every
+# non-root host's own root client mount (spec.md §1) as well as
+# peer-sourced Samba data (spec.md §7). Runs against every host in the
+# same play, so by the time this task file runs for host H,
+# stortree_facts has already resolved every other host too (linear
+# strategy processes stortree_facts for the whole batch before
+# stortree_peer_trust starts) -- no separate bootstrap/join step needed,
+# and re-running keeps trust current as peer dependencies change.
 #
 # Terminology matches spec.md §7: the "serving" side is the host that
 # needs another host's data (stortree.peer_dependencies here); the

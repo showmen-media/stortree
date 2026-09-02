@@ -1,7 +1,9 @@
 ---
-# One rclone-mount@<slug>.service per resolved mount (server subtree or
-# client mount), expanding user-subdirs entries into one mount per
-# authorized user (spec.md §2, docs/plan.md interpretation call #2).
+# One rclone-mount@<slug>.service per resolved mount (server subtree,
+# client mount, or peer-sourced samba descendant this host doesn't own --
+# mesh-sourced directly from whichever host actually owns it, spec.md
+# §1/§2), expanding user-subdirs entries into one mount per authorized
+# user (spec.md §2, docs/plan.md interpretation call #2).
 # Ansible's own idempotence (template only rewrites on change,
 # systemd_service only touches state that's out of sync) covers what a
 # hand-rolled reconciler would otherwise need to implement; only the
@@ -36,26 +38,14 @@
     create: true
   tags: [mounts]
 
-- name: Look up membership for every group referenced in per-user access grants
-  ansible.builtin.getent:
-    database: group
-    key: "{{ item }}"
-  loop: >-
-    {{ stortree.server_subtrees
-       | selectattr('per_user')
-       | map(attribute='access')
-       | sum(start=[])
-       | selectattr('group', 'defined')
-       | map(attribute='group')
-       | unique
-       | list }}
-  tags: [mounts]
-
 - name: Compute this host's flat mount plan
+  # stortree_group_members (resolved by stortree_secrets, which always
+  # runs before this role -- site.yml §8) covers every group referenced
+  # in a per-user access grant, whether this host owns the node
+  # (server_subtrees) or peer-sources it (peer_dependencies) -- both get
+  # %U-expanded here into one mount per actual user.
   ansible.builtin.set_fact:
-    stortree_mounts_plan: >-
-      {{ stortree
-         | stortree_plan_mounts(ansible_facts.getent_group | default({}) | stortree_group_members) }}
+    stortree_mounts_plan: "{{ stortree | stortree_plan_mounts(stortree_group_members) }}"
   tags: [mounts]
 
 - name: Ensure every resolved path exists (mount points and plain directories alike)
