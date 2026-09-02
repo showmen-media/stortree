@@ -16,9 +16,19 @@
     name: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
     system: true
+    home: "{{ stortree_home }}"
     create_home: false
     shell: /usr/sbin/nologin
     state: present
+  tags: [common]
+
+- name: Ensure the stortree service account has a home directory (peer_trust's authorized_keys lives under {{ stortree_home }}/.ssh)
+  ansible.builtin.file:
+    path: "{{ stortree_home }}"
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0750"
   tags: [common]
 
 - name: Ensure the fixed mount root exists
