@@ -294,7 +294,7 @@ def resolve(tree, hostname, all_hosts):
                     "args": peer_mount_args,
                 }
             )
-            client_remote = _peer_section_name(root_host, "")
+            client_remote = _peer_section_name(root_host, "") + ":"
         client_mounts.append(
             {"remote": client_remote, "path": "", "args": peer_mount_args}
         )
@@ -579,7 +579,7 @@ def plan_mounts(resolved, group_members=None):
             entries.append(
                 {
                     "local_path": p["local_path"],
-                    "remote": _peer_section_name(p["owning_host"], p["local_path"]),
+                    "remote": _peer_section_name(p["owning_host"], p["local_path"]) + ":",
                     "args": p["args"],
                     "access": p.get("access", []),
                 }
@@ -590,7 +590,7 @@ def plan_mounts(resolved, group_members=None):
             entries.append(
                 {
                     "local_path": local_path,
-                    "remote": _peer_section_name(p["owning_host"], local_path),
+                    "remote": _peer_section_name(p["owning_host"], local_path) + ":",
                     "args": p["args"],
                     "access": p.get("access", []),
                 }
