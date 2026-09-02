@@ -18,6 +18,17 @@
     cache_valid_time: 3600
   tags: [mounts]
 
+- name: Allow non-root FUSE mounts to be shared with other users
+  # Every rendered unit passes --allow-other (spec.md §2); rclone refuses
+  # that flag unless fuse.conf opts in, which the fuse package ships
+  # commented out by default.
+  ansible.builtin.lineinfile:
+    path: /etc/fuse.conf
+    regexp: '^#?\s*user_allow_other'
+    line: user_allow_other
+    create: true
+  tags: [mounts]
+
 - name: Look up membership for every group referenced in per-user access grants
   ansible.builtin.getent:
     database: group
