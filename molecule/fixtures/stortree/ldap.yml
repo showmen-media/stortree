@@ -14,3 +14,11 @@ server:
 posix:
   uid_attr: uidNumber
   gid_attr: gidNumber
+
+extra:
+  sssd:
+    services: "nss, pam, ssh"
+  domain:
+    ldap_tls_reqcert: demand
+  ssh:
+    ssh_hash_known_hosts: "false"

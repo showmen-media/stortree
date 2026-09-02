@@ -289,7 +289,41 @@ server:
 posix:
   uid_attr: uidNumber
   gid_attr: gidNumber
+
+# Optional escape hatch for SSSD directives stortree doesn't model
+# itself (TLS cert validation, a separate group search base, sudo
+# provider, adding a service like ssh, etc). Keyed by the sssd.conf
+# section it targets. "sssd" and "domain" are special-cased -- merged
+# over stortree's own defaults for [sssd] and [domain/stortree]
+# respectively, so a key here overrides the built-in value of the
+# same name instead of producing a duplicate line. Any other key
+# becomes a brand-new "[section]" block, appended verbatim with no
+# stortree defaults to merge over. Omit entirely, or any part of it,
+# if not needed.
+extra:
+  sssd:
+    services: "nss, pam, ssh"
+  domain:
+    ldap_tls_reqcert: demand
+  ssh:
+    ssh_hash_known_hosts: "false"
 ```
+
+`extra` is the one part of this file not otherwise validated or
+interpreted by stortree. `sssd` and `domain` pairs are merged over that
+section's built-in defaults (`services`/`domains` for `sssd`;
+`id_provider`, `cache_credentials`, `enumerate`, etc for `domain`) before
+rendering, so a key already set by stortree is replaced, and any other
+key is added, one line each, in map order. Every other top-level key
+under `extra` (`ssh` above) is rendered as its own new section, in the
+order given, at the end of the file -- there's no bound on what section
+names are accepted, since stortree has no notion of which ones SSSD
+recognizes.
+
+Every value under `extra` is rendered as-is, so quote anything that
+looks like a boolean (`"false"`, not `false`) -- unquoted, YAML parses it
+as a boolean and Jinja renders it capitalized (`True`/`False`), which
+SSSD's ini parser rejects.
 
 ## rclone.conf
 

@@ -14,3 +14,26 @@ server:
 posix:
   uid_attr: uidNumber
   gid_attr: gidNumber
+
+# Optional escape hatch: arbitrary "key = value" pairs merged into the
+# rendered sssd.conf, for directives stortree doesn't model itself. Keyed
+# by section -- "sssd" and "domain" are special-cased, merging over
+# stortree's own defaults for [sssd] and [domain/stortree] respectively,
+# so a key here overrides the built-in value of the same name (e.g.
+# services below replaces the default "nss, pam" rather than duplicating
+# it). Any other key is a brand-new section name, appended verbatim as
+# its own "[section]" block with no stortree defaults to merge over --
+# e.g. adding ssh to services usually wants a standalone [ssh] section
+# alongside it. Omit entirely, or any of it, if not needed.
+#
+# Quote any true/false-looking value below (e.g. "false", not false) --
+# unquoted, YAML parses it as a boolean and it renders capitalized
+# (True/False), which SSSD's ini parser rejects.
+# extra:
+#   sssd:
+#     services: "nss, pam, ssh"
+#   domain:
+#     ldap_tls_reqcert: demand
+#     ldap_group_search_base: "ou=groups,dc=example,dc=internal"
+#   ssh:
+#     ssh_hash_known_hosts: "false"
