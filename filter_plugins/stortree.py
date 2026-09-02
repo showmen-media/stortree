@@ -294,7 +294,7 @@ def resolve(tree, hostname, all_hosts):
                     "args": peer_mount_args,
                 }
             )
-            client_remote = _peer_section_name(root_host, "") + ":"
+            client_remote = _peer_remote_ref(root_host, "", "")
         client_mounts.append(
             {"remote": client_remote, "path": "", "args": peer_mount_args}
         )
@@ -352,6 +352,19 @@ def _peer_section_name(owning_host, local_path):
     # isn't a nodes() descendant, synthesized for client_mounts instead.
     slug = local_path.replace("/", "-").replace("%", "pct") or "root"
     return f"peer-{owning_host}-{slug}"
+
+
+def _peer_remote_ref(owning_host, local_path, remote_path):
+    """The full `remote:path` rclone reference for a peer-sftp mount.
+    rclone's sftp backend has no working way to bake a root path into
+    the remote's own .conf section -- a `path` key there is silently
+    ignored and the session lands in the login user's home directory
+    instead (rclone issue #4307) -- so the absolute path has to be
+    appended to the remote reference itself, matching the same `path`
+    filter_rclone_conf() writes into that section for documentation."""
+    section = _peer_section_name(owning_host, local_path)
+    path = f"/srv/stortree/{remote_path}" if remote_path else "/srv/stortree"
+    return f"{section}:{path}"
 
 
 def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None, group_members=None):
@@ -579,7 +592,9 @@ def plan_mounts(resolved, group_members=None):
             entries.append(
                 {
                     "local_path": p["local_path"],
-                    "remote": _peer_section_name(p["owning_host"], p["local_path"]) + ":",
+                    "remote": _peer_remote_ref(
+                        p["owning_host"], p["local_path"], p["remote_path"]
+                    ),
                     "args": p["args"],
                     "access": p.get("access", []),
                 }
@@ -587,10 +602,11 @@ def plan_mounts(resolved, group_members=None):
             continue
         for user in access_grant_usernames(p.get("access", []), group_members):
             local_path = p["local_path"].replace(PER_USER_PLACEHOLDER, user)
+            remote_path = p["remote_path"].replace(PER_USER_PLACEHOLDER, user)
             entries.append(
                 {
                     "local_path": local_path,
-                    "remote": _peer_section_name(p["owning_host"], local_path) + ":",
+                    "remote": _peer_remote_ref(p["owning_host"], local_path, remote_path),
                     "args": p["args"],
                     "access": p.get("access", []),
                 }

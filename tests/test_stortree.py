@@ -73,7 +73,7 @@ def test_bravo_owns_three_subtrees_with_a_different_remote():
     # the root client mount is peer-sourced from alpha (root_host), not a
     # direct mount of the tree's own rclone.remote -- see the matching
     # peer_dependencies entry below
-    assert mount["remote"] == "peer-storage-node-alpha-root:"
+    assert mount["remote"] == "peer-storage-node-alpha-root:/srv/stortree"
     # client-defaults merged with clients.storage-node-bravo overrides
     assert mount["args"]["vfs-cache-mode"] == "full"  # from client-defaults
     assert mount["args"]["vfs-cache-max-size"] == "5G"  # bravo's own override
@@ -130,7 +130,7 @@ def test_every_non_root_host_peer_sources_its_client_mount_from_root_host():
             if p["owning_host"] == "storage-node-alpha" and p["local_path"] == ""
         ]
         assert len(root_peers) == 1
-        assert r["client_mounts"][0]["remote"] == "peer-storage-node-alpha-root:"
+        assert r["client_mounts"][0]["remote"] == "peer-storage-node-alpha-root:/srv/stortree"
 
     # root_host itself never peer-sources its own client mount -- it has
     # none (test_alpha_owns_everything_not_overridden already asserts
@@ -523,7 +523,7 @@ def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
     # structural container
     assert "home/jd/sys-configs" in by_local_path
     sys_configs = by_local_path["home/jd/sys-configs"]
-    assert sys_configs["remote"] == "peer-storage-node-alpha-home-jd-sys-configs:"
+    assert sys_configs["remote"] == "peer-storage-node-alpha-home-jd-sys-configs:/srv/stortree/home/jd/sys-configs"
 
     # bravo-owned, per-user, sourced directly from bravo -- not relayed
     # through alpha (root_host), preserving the mesh
@@ -531,7 +531,7 @@ def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
         p for p, e in by_local_path.items() if e["remote"] and "alpha" in e["remote"]
     }
     whitfield = by_local_path["home/mike/whitfield-media"]
-    assert whitfield["remote"] == "peer-storage-node-bravo-home-mike-whitfield-media:"
+    assert whitfield["remote"] == "peer-storage-node-bravo-home-mike-whitfield-media:/srv/stortree/home/mike/whitfield-media"
 
     # the samba node itself ("home") is a pure container -- delegates
     # entirely to its own children above, gets no mount/peer of its own
