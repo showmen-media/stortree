@@ -37,19 +37,27 @@
 # folder (`symlink_target` set) -- neither has an rclone unit of its own;
 # only entries with a `remote` get one below.
 #
-# Every resolved path -- mount point, plain directory, or per-user
-# symlink alike -- gets its Unix owner/group/mode set from its own
-# `access` grant (spec.md §6, stortree_access_owner/_group/_mode): with
-# neither `owner` nor `group` granted, that's the plain default (owner
-# stortree, full control; group stortree, read+traverse; other none)
-# every path had before `access` existed. A symlink entry carries no
-# `access` of its own (it's enforced once, at the real mount its target
-# points to) and skips ownership/mode entirely -- a symlink's own mode
-# bits are meaningless on Linux (always reported as 0777, kernel-ignored
-# when following it), and touching them risks an Ansible `file` chmod
-# following the link through to the real mount's target instead, which
-# would silently clobber the real enforcement this whole file exists to
-# set up. A remote-backed node's mount additionally omits --allow-other
+# Every plain directory (no `remote`) gets its Unix owner/group/mode set
+# from its own `access` grant (spec.md §6, stortree_access_owner/_group/
+# _mode): with neither `owner` nor `group` granted, that's the plain
+# default (owner stortree, full control; group stortree, read+traverse;
+# other none) every path had before `access` existed. A remote-backed
+# node's own mountpoint directory does NOT follow `access` this way --
+# it stays stortree:stortree 0750 no matter what's granted, since the
+# grant is enforced by the mount that covers it instead (see below), and
+# the account that actually performs that mount is unconditionally
+# `stortree` (User= in the unit template), never the grant's own
+# `owner`; chowning the pre-mount directory to a granted `owner` leaves
+# `stortree` with no bits on it at all, and `fusermount` refuses to
+# mount there ("Permission denied") before the grant it was chasing ever
+# becomes visible. A symlink entry carries no `access` of its own (it's
+# enforced once, at the real mount its target points to) and skips
+# ownership/mode entirely -- a symlink's own mode bits are meaningless
+# on Linux (always reported as 0777, kernel-ignored when following it),
+# and touching them risks an Ansible `file` chmod following the link
+# through to the real mount's target instead, which would silently
+# clobber the real enforcement this whole file exists to set up. A
+# remote-backed node's mount additionally omits --allow-other
 # unless `access` grants an owner and/or group (rendered unconditionally
 # below, from the same three filters, so the two always agree): without
 # it, FUSE restricts a mount to the mounting user (stortree) and root --
@@ -133,16 +141,27 @@
 
 - name: Ensure every resolved mount point or plain directory exists
   # Ownership/mode come from the path's own `access` grant, not a fixed
-  # default -- see this file's header comment. Harmless to set on a
-  # remote-backed entry's mountpoint too: once mounted, the mount's own
-  # reported permissions (rendered into the unit below, from the same
-  # three filters) are all that's actually visible there.
+  # default -- see this file's header comment -- *except* for a
+  # remote-backed entry's own mountpoint, which stays stortree:stortree
+  # 0750 regardless of its `access` grant. That pre-mount directory is
+  # never what an `access` grant is actually describing (the unit below
+  # already renders the same grant into rclone's --uid/--gid/--dir-perms/
+  # --file-perms, which is what's actually visible once mounted) -- it
+  # only has to be usable by whichever account performs the mount, which
+  # is unconditionally `stortree` (User= in the unit template, never the
+  # grant's own `owner`). An `owner`-granted mount chowns this directory
+  # to the granted user with mode 0700 if it follows `access` like a
+  # plain directory would: stortree then has no bits on it at all (not
+  # the owner, and the granted owner's directory carries no stortree
+  # group/other access), so `fusermount` refuses with "Permission
+  # denied" before rclone ever gets to establish the mount that would've
+  # made the grant visible in the first place.
   ansible.builtin.file:
     path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
     state: directory
-    owner: "{{ item.access | stortree_access_owner(stortree_user) }}"
-    group: "{{ item.access | stortree_access_group(stortree_group) }}"
-    mode: "{{ item.access | stortree_access_mode }}"
+    owner: "{{ stortree_user if item.remote else (item.access | stortree_access_owner(stortree_user)) }}"
+    group: "{{ stortree_group if item.remote else (item.access | stortree_access_group(stortree_group)) }}"
+    mode: "{{ '0750' if item.remote else (item.access | stortree_access_mode) }}"
   loop: "{{ stortree_mounts_plan | rejectattr('symlink_target') | list }}"
   loop_control:
     label: "{{ item.local_path or '(root)' }}"
