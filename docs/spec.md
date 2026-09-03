@@ -480,8 +480,11 @@ this fleet runs ("Ignoring --allow-root. Support has been removed
 upstream", logged on every mount attempt) — there is no flag that gets
 root into an ungranted mount, full stop, so `stortree_common` and
 `stortree_mounts` both treat that as permanent: neither ever tries to
-manage a path once `ansible_facts.mounts` shows it's already live,
-rather than assume root access it structurally cannot have.
+manage a path once a direct probe shows root can't reach it (a `stat`,
+not `ansible_facts.mounts` — Ansible's own mount-fact gathering silently
+drops any mount whose device string doesn't happen to contain "/",
+which some of this fleet's own rclone mounts hit in practice), rather
+than assume root access it structurally cannot have.
 `--allow-other` (the granted-mount case just below) additionally
 requires `user_allow_other` in `/etc/fuse.conf` (`stortree_mounts`
 ensures it's set before rendering or restarting any unit) — libfuse

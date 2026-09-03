@@ -71,10 +71,14 @@
 # --allow-root. Support has been removed upstream", rclone logs this on
 # every mount attempt) -- there is no flag this file can render that
 # gets root into an ungranted mount, ever, and every task below that
-# touches an already-resolved path has to assume that going in: check
-# `ansible_facts.mounts` before touching a remote-backed entry's own
-# mountpoint (below) rather than let a live one's own EEXIST/permission
-# errors surface as a task failure the way they used to. With a grant,
+# touches an already-resolved path has to assume that going in: probe
+# whether root can actually reach a remote-backed entry's own
+# mountpoint before touching it (below -- a direct `stat`, not
+# `ansible_facts.mounts`, which silently drops some of this fleet's own
+# mounts from its list regardless of how reachable they are, see the
+# probe task's own comment) rather than let a live one's own
+# EEXIST/permission errors surface as a task failure the way they used
+# to. With a grant,
 # the template instead uid/gid-owns the mount directly (--uid/--gid,
 # --dir-perms, --file-perms from the same mode) and adds --allow-other
 # back -- real kernel-enforced access, checked against whoever's
@@ -175,20 +179,50 @@
   ansible.builtin.meta: flush_handlers
   tags: [mounts]
 
-- name: Note which resolved paths are already active mounts
-  # Gathered once (facts don't change mid-play) and reused by both
-  # directory-management tasks below -- neither one may touch a path
-  # that's already an active mount, whether that's this exact entry's
-  # own already-running mountpoint (rclone's own reported state is all
-  # that's visible there once mounted, see the mount-point task's own
-  # comment) or an ancestor a *different*, already-mounted entry sits at
-  # (a masked root client mount is the concrete case this fleet hit,
-  # this file's header comment) -- either way Ansible can no longer even
-  # confirm the path's current state, let alone correct it, and trying
-  # anyway is exactly what used to surface as a raw EEXIST/permission
-  # error instead of a clean no-op skip.
+- name: Probe whether each remote-backed entry's own mountpoint is reachable
+  # `ansible_facts.mounts` can't be trusted for this -- Ansible's own
+  # mount-fact gathering silently drops any mount whose reported device
+  # string doesn't start with "/" and doesn't contain ":/"
+  # (module_utils/facts/hardware/linux.py get_mount_facts(), a filter
+  # meant to skip pseudo-filesystems like proc/tmpfs that report
+  # non-path "device" names). rclone's own FUSE mounts report a bare
+  # "remote:path" device string, and whether that string happens to
+  # contain ":/" depends entirely on whether the remote path itself
+  # starts with a "/" -- `t21-synology:/.fips-stortree-cache` mounts
+  # with the reported device `t21-synology:.fips-stortree-cache` (no
+  # "/" survives after the colon), which this fleet hit in production:
+  # a live, healthy, currently-running mount, silently absent from
+  # `ansible_facts.mounts` regardless, making any check built on that
+  # fact unreliable for at least this remote and any other whose device
+  # string happens to land the same way.
+  #
+  # A direct `stat` answers the actual question instead -- can Ansible
+  # manage this path right now -- without caring how the mount reports
+  # its own device string: it fails (`ignore_errors` below is what lets
+  # that become a signal instead of aborting the run) exactly when a
+  # mount sits there that this host's root can't reach (an ungranted
+  # mount, this file's header comment; `ansible.builtin.stat`'s own
+  # source only treats ENOENT specially -- anything else, permission
+  # denied included, surfaces as the task failing outright), while
+  # succeeding cleanly (`stat.exists: false`) for a path nothing's ever
+  # mounted at yet, so a first-time mount still gets its directory
+  # created normally below.
+  ansible.builtin.stat:
+    path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
+  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
+  loop_control:
+    label: "{{ item.local_path or '(root)' }}"
+  register: stortree_mount_point_probe
+  ignore_errors: true
+  tags: [mounts]
+
+- name: Note which resolved mount points are already active but unreachable
   ansible.builtin.set_fact:
-    stortree_active_mount_paths: "{{ ansible_facts.mounts | map(attribute='mount') | list }}"
+    stortree_masked_mount_paths: >-
+      {{ stortree_mount_point_probe.results
+         | selectattr('failed')
+         | map(attribute='item.local_path')
+         | list }}
   tags: [mounts]
 
 - name: Ensure every mount point's parent directory exists
@@ -223,7 +257,7 @@
     label: "{{ item.local_path }}"
   when:
     - (item.local_path | dirname) != ''
-    - (stortree_root ~ '/' ~ (item.local_path | dirname)) not in stortree_active_mount_paths
+    - (item.local_path | dirname) not in stortree_masked_mount_paths
   tags: [mounts]
 
 - name: Ensure every resolved mount point or plain directory exists
@@ -245,17 +279,15 @@
   # made the grant visible in the first place.
   #
   # A remote-backed entry (`item.remote` truthy) additionally skips
-  # outright once its own resolved path already shows up in
-  # `stortree_active_mount_paths` -- an already-successfully-running
-  # mount, whether granted or not (an ungranted one is unreachable to
-  # root either way, this file's header comment; a granted one's real
-  # ownership/mode is already enforced by the mount itself, --uid/--gid/
-  # --dir-perms/--file-perms below) has nothing left for this task to
-  # verify or correct, and on an ungranted mount attempting it anyway is
-  # exactly what used to fail outright instead of cleanly doing nothing.
-  # A plain directory (no `remote`) never skips this way -- it's real,
-  # persistent local content, never itself a mount, so there's nothing
-  # here for `ansible_facts.mounts` to ever mask it from.
+  # outright once the probe above couldn't reach its own resolved path
+  # (`stortree_masked_mount_paths`) -- an already-running, unreachable
+  # mount has nothing left for this task to verify or correct (an
+  # ungranted mount is unreachable to root permanently, this file's
+  # header comment), and attempting it anyway is exactly what used to
+  # fail outright instead of cleanly doing nothing. A plain directory
+  # (no `remote`) never skips this way -- it's real, persistent local
+  # content, never itself a mount, so it was never in scope for the
+  # probe above at all.
   ansible.builtin.file:
     path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
     state: directory
@@ -265,9 +297,7 @@
   loop: "{{ stortree_mounts_plan | rejectattr('symlink_target') | list }}"
   loop_control:
     label: "{{ item.local_path or '(root)' }}"
-  when: >-
-    not item.remote
-    or ((stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root) not in stortree_active_mount_paths
+  when: not item.remote or item.local_path not in stortree_masked_mount_paths
   tags: [mounts]
 
 - name: Ensure every per-user symlink's parent directory exists
