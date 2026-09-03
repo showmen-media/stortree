@@ -139,6 +139,39 @@
   ansible.builtin.meta: flush_handlers
   tags: [mounts]
 
+- name: Ensure every mount point's parent directory exists
+  # A `group`-only grant's real, shared mount resolves its %U-templated
+  # path through SHARED_MOUNT_SEGMENT (".mounts", per_user_mount_path())
+  # -- a path segment with no tree node of its own, unlike every real
+  # ancestor (e.g. "home"), which gets its own explicit entry in
+  # stortree_mounts_plan and is handled by the plain-directory/mount-
+  # point task below in the very same loop. Nothing else in this file
+  # ever creates ".mounts" explicitly, so it's left to Ansible's own
+  # implicit parent creation when the mount task below creates the
+  # deeper leaf path -- which, unlike the leaf itself, does NOT get the
+  # `owner`/`group`/`mode` given to that task; it inherits root's umask
+  # instead. Restrictive enough on some hosts to lock `stortree` (the
+  # account that actually performs the mount, see the mount-point task's
+  # own comment) out of a directory it needs to enter just to reach the
+  # leaf beneath it -- the same "fusermount: bad mount point ...
+  # Permission denied" failure as an over-restrictive leaf, just one
+  # level up. Explicit and ahead of the mount-point task below so this is
+  # never left to implicit creation; harmless where the parent's really
+  # an ordinary ancestor node too, since that node's own explicit entry
+  # (processed in the very same apply) corrects anything this leaves too
+  # permissive, exactly as it already did before this task existed.
+  ansible.builtin.file:
+    path: "{{ stortree_root ~ '/' ~ (item.local_path | dirname) }}"
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0750"
+  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
+  loop_control:
+    label: "{{ item.local_path }}"
+  when: item.local_path | dirname
+  tags: [mounts]
+
 - name: Ensure every resolved mount point or plain directory exists
   # Ownership/mode come from the path's own `access` grant, not a fixed
   # default -- see this file's header comment -- *except* for a
