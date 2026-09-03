@@ -60,8 +60,16 @@
   # had winbind removed by an earlier apply, and self-heals against any
   # future drift in these files -- idempotent from the system's
   # perspective either way, since it always regenerates the same correct
-  # output from whichever profiles are currently installed.
+  # output from whichever profiles are currently installed. `--force`
+  # only means "reinstall even if it looks unchanged" -- it does not by
+  # itself suppress pam-auth-update's interactive whiptail/dialog
+  # frontend, which can hang indefinitely waiting for input that will
+  # never arrive over Ansible's non-tty command execution.
+  # DEBIAN_FRONTEND=noninteractive is what actually forces it to run
+  # unattended.
   ansible.builtin.command: pam-auth-update --force
+  environment:
+    DEBIAN_FRONTEND: noninteractive
   changed_when: true
   tags: [samba]
 
