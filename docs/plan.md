@@ -33,7 +33,7 @@ during implementation, each also marked with a comment at its point of
 implementation:
 
 1. **Dotted `access` shorthand with no `permissions:`** (e.g.
-   `access.group: Media Production`, `access.user: jd` — every shorthand
+   `access.group: Media Production`, `access.owner: jd` — every shorthand
    example in config-schema.md omits it, and no default is stated).
    Resolved to: default `rwx` (full control) when `permissions` is absent
    on a shorthand grant — every example use is a user/group getting their
@@ -41,19 +41,23 @@ implementation:
    Exposed as `DEFAULT_ACCESS_PERMISSIONS` in `filter_plugins/stortree.py`
    so it's a one-line change if wrong.
 2. **`user-subdirs` per-user folder existence.** config-schema.md says a
-   descendant with an `access` restriction (`sys-configs`, `access.user:
+   descendant with an `access` restriction (`sys-configs`, `access.owner:
    jd`) "only shows up inside jd's own per-user folder, not everyone
-   else's" — read literally, that's existence-gating, not just an ACL on
-   an always-created folder. Resolved to: `resolve()` stays pure (no LDAP
-   I/O, per §1) and returns each `user-subdirs` descendant tagged with its
-   resolved `access` grants; `stortree_acl`, delegated to the resolved
-   host, expands `access.group`/`access.user` into concrete usernames via
-   `getent group`/`getent passwd` at apply time (group membership is
-   host-local via SSSD, not visible to a pure function) and only
-   creates/ACLs each descendant under the per-user folders of users
-   actually granted access to it. The `user-subdirs` node itself still
-   gets a default ACL so a per-user folder created by some other path
-   isn't left unowned.
+   else's" — read literally, that's existence-gating, not just ownership
+   on an always-created folder. Resolved to: `resolve()` stays pure (no
+   LDAP I/O, per §1) and returns each `user-subdirs` descendant tagged
+   with its resolved `access` grant; `stortree_mounts`, delegated to the
+   resolved host, expands an `access.group` grant into concrete usernames
+   via `getent group` at apply time (group membership is host-local via
+   SSSD, not visible to a pure function) and only creates each descendant
+   under the per-user folders of users actually granted access to it. An
+   `access.owner` grant (with or without `group` alongside it) instead
+   pins a single folder to that one user directly, no `getent` needed for
+   the expansion itself (§6 "Access enforcement" covers both cases, plus
+   why `access` is always a single object rather than a list of grants —
+   a later revision of this same interpretation call, once it became
+   clear a remote-backed node can never carry more than one principal's
+   worth of real enforcement anyway).
 3. **Molecule shared `full-tree` scenario location.** Not specified in
    spec.md. Resolved to: `molecule/full-tree/` at repo root (the
    conventional layout for a cross-role scenario, vs. each role's own
@@ -76,8 +80,12 @@ implementation:
 4. `stortree_identity` (§5). POSIX attribute exposure is a requirement of
    the LDAP server, not something this phase can verify on its own — see
    §5's own caveat. — **done**
-5. `stortree_acl` (§6) wired to resolved `access` blocks + SSSD groups.
-   — **done**
+5. `stortree_mounts` extended (§6) to set ownership/mode from resolved
+   `access` blocks + SSSD groups/users — no separate ACL role; a
+   dedicated `stortree_acl` role existed for a while but was removed once
+   `access` became a single object and ownership/mode could just be set
+   at directory-creation time, uniformly for local paths and remote
+   mounts alike. — **done**
 6. `stortree_pam_smbpass` (§5), plus `stortree_sshd` (§6, only runs when
    the optional file is present). — **done**
 7. `stortree_secrets` (§3): filtered per-host `rclone.conf` rendering.

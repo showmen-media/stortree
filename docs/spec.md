@@ -8,7 +8,7 @@ declarative tree (`config.yml` + `ldap.yml` + `rclone.conf`) into:
 
 - rclone mounts (as a host's own client, and/or as the server backing a
   Samba share),
-- Samba shares with POSIX-consistent ACLs,
+- Samba shares access-controlled by real Unix ownership and mode,
 - Unix identity resolved from an existing LDAP directory.
 
 Ansible itself replaces the custom fan-out/push mechanism a bespoke
@@ -25,7 +25,7 @@ inventory/
   hosts.yml          # storage hosts + connection vars, ordinary Ansible inventory
                      # — every host here participates (§1), named in config.yml or not
 stortree/
-  config.yml         # the directory tree: hosts, clients, subdirs, ACLs (non-secret)
+  config.yml         # the directory tree: hosts, clients, subdirs, access grants (non-secret)
   ldap.yml           # LDAP server connection + group/POSIX mapping (vaulted)
   rclone.conf        # rclone's own config file — named remotes config.yml references (vaulted)
   sshd_config        # optional: freeform sshd config fragment, pushed + included on every host (see §6)
@@ -37,8 +37,7 @@ roles/
   stortree_identity/       # SSSD against ldap.yml (§5)
   stortree_peer_trust/     # cross-host keypairs + authorized_keys for peer deps (§1, §7)
   stortree_secrets/        # filtered per-host rclone.conf rendering (§3)
-  stortree_mounts/         # rclone mount systemd units (§2)
-  stortree_acl/            # setfacl from resolved access rules (§6)
+  stortree_mounts/         # rclone mount systemd units + ownership/mode from access (§2, §6)
   stortree_samba/          # smb.conf + testparm + reload (§4)
   stortree_pam_smbpass/    # PAM stacking (§5)
   stortree_sshd/           # optional sshd_config.d fragment (§6)
@@ -322,9 +321,10 @@ one section per actual user here too, exactly the way `stortree_mounts`
 (§2) independently expands the same entry into one mount per user — both
 have to agree on the expanded (not templated) path to name the section
 the same way, so `stortree_secrets` is the one role that resolves
-`stortree_group_members` (§6) fresh via `getent`, first in `site.yml`'s
-order among the roles that need it; `stortree_mounts`/`stortree_acl`
-reuse that same fact rather than each re-deriving their own.
+`stortree_group_members`/`stortree_group_gids`/`stortree_user_uids` (§6)
+fresh via `getent`, first in `site.yml`'s order among the roles that need
+them; `stortree_mounts` reuses those same facts rather than re-deriving
+its own.
 
 ### 4. Samba layer
 
@@ -334,13 +334,17 @@ since Samba sharing is universal, means every host gets a stanza for
 every such node in the tree, not only the ones whose subtrees it happens
 to own: path, subpath templates (`%U` for the `home` per-user pattern),
 and `valid users`/`write list` derived from the resolved `access` rules
-once those are mapped to real POSIX groups (§5). A host assembles the
-node's local path the same way whether it's the resolved owner or
-sourcing peer data (§1/§3) — Samba itself never needs to know which.
-Sets `nt acl support = yes`, `map acl inherit = yes`,
-`inherit permissions = yes` so Samba reads and respects the same POSIX
-ACLs applied in §6, rather than maintaining a second, parallel ACL system
-that can drift from the first.
+once those are mapped to real POSIX groups/users (§5, §6). A host
+assembles the node's local path the same way whether it's the resolved
+owner or sourcing peer data (§1/§3) — Samba itself never needs to know
+which. Sets `nt acl support = yes` (still lets a Windows client view the
+plain Unix owner/group/mode `stortree_mounts` sets, §6, as a simplified
+NT ACL) and `inherit permissions = yes` so a newly created file inherits
+its parent directory's ownership/mode rather than the connecting user's
+own umask-computed default — `smbd` still runs as the real authenticated
+user throughout (nothing here changes that), so this is what makes a new
+file land with the *directory's* access, not just whatever that one
+session happened to create it with.
 
 The role validates every rendered `smb.conf` with `testparm` (as a
 `command`/`validate` argument on the `template` task, so a bad render
@@ -407,56 +411,112 @@ something narrower than a full shell, the optional `sshd_config` fragment
 PAM auth still fires before any forced command runs, so the sync happens
 regardless of what that session is allowed to do afterward.
 
-### 6. ACL enforcement & SSH access
+### 6. Access enforcement & SSH access
 
-`access` blocks in `config.yml` (list form: `- group: ... permissions: ...`,
-or the dotted shorthand `access.group` / `access.user`) resolve against
-the SSSD-provided groups/users, then `stortree_acl` applies them with
-`ansible.posix.acl` (both default and effective ACLs, recursive) directly
-on the physical path — on whichever host actually serves that subtree, or
-peer-sources it (§1/§2), same as any other resolved mount, but **only for
-an entry with no `remote`** (a plain local directory). rclone's FUSE mount
-never implements `setxattr`, so `setfacl` always fails on a remote-backed
-entry with "Operation not supported" — `stortree_acl` filters those out
-(`rejectattr('remote')`) rather than attempting and failing.
+`access` in `config.yml` is always a single object (never a list) —
+`{group?, owner?, permissions?}`, all optional, either written out or via
+the dotted shorthand (`access.group: X`, `access.owner: Y`). This isn't
+just a syntax restriction: a remote-backed node (directly, or
+peer-sourced from whichever host owns it, §1/§2) is always an rclone FUSE
+mount, and rclone's FUSE mount never implements `setxattr` — it can't
+carry a POSIX ACL at all, on any host, ever. What it *can* carry is plain
+Unix ownership and mode: one owner, one group, one shared permissions
+level applied to both. That's exactly what one `access` object expresses
+and no more, so the schema doesn't let you write anything a remote-backed
+node couldn't actually enforce (`_normalize_access()` raises if it's
+ever given a list). A plain local node (no `rclone.remote` of its own)
+gets the same treatment for a simpler reason: consistency, not
+necessity — it could carry a real POSIX ACL, but there's no reason for
+its enforcement to work differently from a remote-backed sibling's.
 
-For that remaining, larger class of paths, access control drops to two
-separate mechanisms instead of one uniform POSIX layer: `stortree_mounts`
-renders every rclone unit without `--allow-other`, so FUSE itself refuses
-any process but the mounting user (`stortree`) and root — no SSH session
-or local process reaches it, for any user, full stop; `stortree_samba`
-sets `force user`/`force group` (both `stortree`) in `[global]`, so `smbd`
-always performs the actual file I/O as that same account regardless of
-which LDAP user authenticated, letting Samba back in through the same
-door. `valid users`/`write list` (rendered from the same `access` grants,
-§4) remain the real authorization check for that Samba access — POSIX
-permissions on a remote-backed path are irrelevant to it either way now.
-Net effect: a remote-backed subtree's `access` grant is enforced for
-Samba, and is unreachable by any other means, on every host, always. Only
-a plain local directory gets real, differentiated POSIX ACLs, and stays
-reachable via SSH/local process as well as Samba.
+`stortree_mounts` applies `access` directly, for every resolved path —
+mount point or plain directory alike — via three pure filters
+(`access_owner`/`access_group`/`access_mode`, all in
+`filter_plugins/stortree.py`, all unit-tested independent of Ansible):
 
-ACLs are naturally idempotent to reapply with the same spec, so the role
-always recomputes and reapplies from the resolved facts rather than
-diffing against previous runs.
+- **Neither `owner` nor `group` granted**: the plain default every path
+  had before `access` existed — owner `stortree` with full control,
+  group `stortree` with read+traverse, other none (`0750`).
+- **`owner` only**: that user owns the path outright, at the granted
+  `permissions` level; group is `stortree` with *no* access — deliberately
+  private, since it was scoped to one specific person.
+- **`group` only**: `stortree` still owns the path (so it can always be
+  administered regardless of who else can reach it) with full control;
+  the granted group gets `permissions`.
+- **Both**: the path is pinned to that one `owner` (no group-driven
+  expansion — see below), who and whose group both get `permissions`.
+
+For a plain local directory, that's `ansible.builtin.file`'s
+`owner`/`group`/`mode` — real, standard Unix ownership, no `acl` package
+needed at all. For a remote-backed node, `stortree_mounts` renders the
+same three values into the rclone unit instead: with neither `owner` nor
+`group` granted, the unit omits `--allow-other`, so FUSE restricts the
+mount to the mounting user (`stortree`) and root — no SSH session or
+local process reaches it, for any user, full stop, and nothing overrides
+that for Samba either (`smbd` still runs as the real authenticated user,
+unchanged from stock behavior). With `owner` and/or `group` granted, the
+unit instead adds `--allow-other` back and uid/gid-owns the mount
+directly (`--uid`/`--gid`, resolved from the same `getent passwd`/`getent
+group` lookups `stortree_secrets` already runs for %U-expansion below —
+`stortree_user_uids`/`stortree_group_gids` read the numeric id out of the
+same `ansible_facts.getent_passwd`/`getent_group` data instead of the
+name/member list) and `--dir-perms`/`--file-perms` (both set to the same
+mode `access_mode()` computed). Real, kernel-enforced access, checked
+against whoever is actually connecting — Samba included, since Samba
+still operates as that real user throughout. `mp-fam` in the running
+example (`access.group`) is exactly this case.
+
+A %U-templated samba share's own `valid users`/`write list` (§4,
+`stortree_samba_access_tokens()`) always include `%U` itself in addition
+to the union of its descendants' `access` grants — every user reaches
+their own subtree regardless of whether they hold any specific
+descendant's grant, matching ordinary Unix home-directory semantics; only
+a non-%U share (no "self" concept) stays gated purely by `access`. A
+descendant's own grant doesn't strictly need to appear in that union at
+all once its own mount enforces it directly (`mp-fam` again) — it's
+included anyway since it's harmless there and still load-bearing for a
+plain local descendant with no mount of its own to enforce anything. A
+single grant with both `owner` and `group` set contributes two tokens to
+that list, one for each — both principals get in, since a real Unix
+directory works the same way (either the owner or a group member can
+open it).
+
+Net effect: every remote-backed node with any `access` at all gets real,
+symmetric enforcement over both Samba and SSH; a plain local node gets
+real POSIX ownership/mode, also symmetric. Nothing is left in the
+`stortree`-only-unreachable state a multi-principal grant used to fall
+into before the schema stopped allowing it.
+
+Ownership/mode are naturally idempotent to reapply with the same spec, so
+`stortree_mounts` always recomputes and reapplies from the resolved facts
+rather than diffing against previous runs.
 
 A per-user grant's %U has to be expanded to real usernames before any of
-this — `access_grant_usernames()` resolves a group grant against real
-group membership (interpretation call #2), which needs `getent group`
-run against every group referenced anywhere in a per-user access grant
-first. `stortree_needed_groups()` computes that set once (covering both
-`server_subtrees`' own per-user nodes and `peer_dependencies`' — a
-peer-sourced per-user descendant expands the exact same way, §2/§3); the
-`stortree_secrets` role — first among the roles that need it in
-`site.yml`'s order (§8) — runs the `getent` lookup and sets the
-`stortree_group_members` fact from it, which `stortree_mounts` and this
-role both then reuse rather than each deriving their own (and risking one
-missing a scope the others cover, which is exactly what happened before
-this was consolidated: `stortree_mounts` and `stortree_acl` each ran
-their own `getent` loop, scoped to `server_subtrees` only, so a
-client-only host with no server_subtrees of its own — like
-`some-storage-gadget` in the worked example — never resolved the groups
-its peer-sourced per-user shares actually needed).
+this — `access_grant_usernames()` resolves an `access` object to the set
+of usernames a `user-subdirs` node should get a folder for: an `owner`
+grant (with or without `group` alongside it) always pins a single
+folder to that one user; only a `group`-only grant expands into one
+folder per member, against real group membership (interpretation call
+#2), which needs `getent group` run against every group referenced
+anywhere in an access grant first — same lookup `stortree_group_gids`
+needs for the gid-owned-mount case above, just reading the member list
+instead of the numeric id. `stortree_needed_groups()`/`needed_users()`
+compute that set once each (covering both `server_subtrees`' own nodes
+and `peer_dependencies`' — a peer-sourced descendant's grant expands the
+exact same way, §2/§3, and unlike the old per-user-only scoping, both now
+cover every node with a grant, not just per-user ones, since a plain
+shared node's own `access.group`/`access.owner` still needs its
+id resolved to own its mount); the `stortree_secrets` role — first among
+the roles that need it in `site.yml`'s order (§8) — runs the `getent`
+lookups and sets the `stortree_group_members`/`stortree_group_gids`/
+`stortree_user_uids` facts from them, which `stortree_mounts` then
+reuses rather than deriving its own (and risking missing a scope, which
+is exactly what happened before this was consolidated: `stortree_mounts`
+and the old, now-removed `stortree_acl` each ran their own `getent` loop,
+scoped to `server_subtrees` only, so a client-only host with no
+server_subtrees of its own — like `some-storage-gadget` in the worked
+example — never resolved the groups its peer-sourced per-user shares
+actually needed).
 
 The optional `sshd_config` fragment (`stortree_sshd`, only runs when
 `stortree/sshd_config` is present in the repo) is templated to
@@ -522,7 +582,7 @@ the roles above, in order, against every host in `inventory/hosts.yml`:
 
 ```
 stortree_facts → stortree_common → stortree_identity → stortree_peer_trust
-→ stortree_secrets → stortree_mounts → stortree_acl → stortree_samba
+→ stortree_secrets → stortree_mounts → stortree_samba
 → stortree_pam_smbpass → stortree_sshd
 ```
 
@@ -545,8 +605,8 @@ invocations — there is no separate CLI to install or learn:
   run, bringing a new host in is exactly this one command — no separate
   bootstrap step.
 - **Apply just one concern** (e.g. after only editing `access` rules):
-  `ansible-playbook playbooks/site.yml --tags acl`. Every role is tagged
-  with its own name for this.
+  `ansible-playbook playbooks/site.yml --tags mounts`. Every role is
+  tagged with its own name for this.
 - **Check without changing anything**: `ansible-playbook playbooks/site.yml
   --check --diff`.
 - **Status**: `ansible-playbook playbooks/status.yml` — a read-only play
@@ -564,21 +624,22 @@ failure handling instead of bespoke retry logic.
 **Dependencies**, gathered here from the roles above for reference:
 
 - **Control node**: `ansible`, plus the `ansible.posix` collection
-  (`ansible.posix.acl` in §6, `ansible.posix.authorized_key` in §7) and the
-  `community.crypto` collection (`community.crypto.openssh_keypair` in
-  §7).
-- **Every managed host**: `rclone` (§2), `samba` (§4), `sssd` (§5), `acl`
-  (§6), and `samba-common-bin`/`libpam-modules` (`smbpasswd` and
-  `pam_exec.so`, §5) — existing, well-known Linux storage/identity
-  tooling the roles configure rather than reinvent.
+  (`ansible.posix.authorized_key` in §7) and the `community.crypto`
+  collection (`community.crypto.openssh_keypair` in §7).
+- **Every managed host**: `rclone` (§2), `samba` (§4), `sssd` (§5), and
+  `samba-common-bin`/`libpam-modules` (`smbpasswd` and `pam_exec.so`,
+  §5) — existing, well-known Linux storage/identity tooling the roles
+  configure rather than reinvent. Ownership/mode (§6) is plain
+  `ansible.builtin.file`/rclone mount flags — no separate `acl` package
+  needed anywhere.
 - **Test harness only** (not needed in production): Molecule, Docker, and
   the mocked-dependency containers below.
 
 A [Molecule](https://ansible.readthedocs.io/projects/molecule/) scenario
 per role for fast, isolated role tests, plus one multi-host `full-tree`
 scenario that exercises the whole flow — config resolution, mounts,
-Samba, ACLs, SSSD/LDAP, and the peer-dependency mechanism (§1, §7) —
-without real hardware or the real LDAP/storage backends.
+ownership/mode, Samba, SSSD/LDAP, and the peer-dependency mechanism (§1,
+§7) — without real hardware or the real LDAP/storage backends.
 
 **Topology**: one Docker container per simulated host — at least two
 hosts, matching the two-host shape used in the example config in
@@ -613,8 +674,8 @@ real hosts, using the same roles and `converge.yml` mapped 1:1 onto
 `verify.yml` plus the filter plugin's own `pytest` unit tests, which need
 no containers at all), rclone mount reconciliation, Samba share behavior
 (via `smbclient` from a plain client container), SSSD+LDAP identity
-resolution, the `pam_smbpass` sync flow, ACL enforcement, and peer trust
-provisioning across the two host containers.
+resolution, the `pam_smbpass` sync flow, `access`-derived ownership/mode
+enforcement, and peer trust provisioning across the two host containers.
 
 **What it doesn't**: systemd-in-Docker isn't identical to bare-metal
 systemd (cgroup quirks, no real reboot/persistence story), there's no

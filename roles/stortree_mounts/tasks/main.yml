@@ -17,17 +17,28 @@
 # local storage on its resolved host) but has no rclone unit of its own;
 # only entries with a `remote` get one below.
 #
-# Rendered units deliberately omit --allow-other (spec.md §6): without
-# it, FUSE restricts every mount to the mounting user (stortree) and
-# root -- no other local process, including an SSH session from an
-# LDAP-authenticated user, can reach it at all. stortree_samba's `force
-# user`/`force group` is what lets smbd through anyway (it always
-# performs file I/O as stortree, regardless of which user authenticated
-# over SMB), so Samba access keeps working while direct SSH/local-process
-# access to a remote-backed subtree stays blocked -- POSIX ACLs can't
-# fill that role themselves, since rclone's FUSE mount never implements
-# setxattr (see stortree_acl, which skips remote-backed entries for the
-# same reason).
+# Every resolved path -- mount point or plain directory alike -- gets its
+# Unix owner/group/mode set from its own `access` grant (spec.md §6,
+# stortree_access_owner/_group/_mode): with neither `owner` nor `group`
+# granted, that's the plain default (owner stortree, full control; group
+# stortree, read+traverse; other none) every path had before `access`
+# existed. A remote-backed node's mount additionally omits --allow-other
+# unless `access` grants an owner and/or group (rendered unconditionally
+# below, from the same three filters, so the two always agree): without
+# it, FUSE restricts a mount to the mounting user (stortree) and root --
+# no other local process, including an SSH session from an
+# LDAP-authenticated user, can reach it at all, matching what a fresh
+# mount with no grant should do. With a grant, the template instead
+# uid/gid-owns the mount directly (--uid/--gid, --dir-perms, --file-perms
+# from the same mode) and adds --allow-other back -- real kernel-enforced
+# access, checked against whoever's actually connecting (smbd included,
+# which runs as the real authenticated user, not a fixed service
+# account, so this is enforced for Samba the same way it is for direct
+# SSH). This is exactly what `access` can express and no more -- one
+# owner, one group, one shared permissions level -- because that's all a
+# remote-backed node can ever actually carry (rclone's FUSE mount has no
+# POSIX ACL support at all), and the schema doesn't let you write
+# anything broader than that (_normalize_access() rejects a list).
 
 - name: Install rclone and fuse
   ansible.builtin.apt:
@@ -50,12 +61,17 @@
   tags: [mounts]
 
 - name: Ensure every resolved path exists (mount points and plain directories alike)
+  # Ownership/mode come from the path's own `access` grant, not a fixed
+  # default -- see this file's header comment. Harmless to set on a
+  # remote-backed entry's mountpoint too: once mounted, the mount's own
+  # reported permissions (rendered into the unit below, from the same
+  # three filters) are all that's actually visible there.
   ansible.builtin.file:
     path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
     state: directory
-    owner: "{{ stortree_user }}"
-    group: "{{ stortree_group }}"
-    mode: "0750"
+    owner: "{{ item.access | stortree_access_owner(stortree_user) }}"
+    group: "{{ item.access | stortree_access_group(stortree_group) }}"
+    mode: "{{ item.access | stortree_access_mode }}"
   loop: "{{ stortree_mounts_plan }}"
   loop_control:
     label: "{{ item.local_path or '(root)' }}"

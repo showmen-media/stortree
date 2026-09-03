@@ -1,9 +1,9 @@
 ---
 # Multi-host scenario exercising the whole flow -- config resolution,
-# mounts, Samba, ACLs, SSSD/LDAP, and peer-dependency provisioning
-# (spec.md §9) -- against a genuine two-owner peer dependency, plus a
-# third host with no mention in stortree/config.yml at all. Not run as
-# part of this build (docs/plan.md "What's verified").
+# mounts, ownership/mode, Samba, SSSD/LDAP, and peer-dependency
+# provisioning (spec.md §9) -- against a genuine two-owner peer
+# dependency, plus a third host with no mention in stortree/config.yml at
+# all. Not run as part of this build (docs/plan.md "What's verified").
 dependency:
   name: galaxy
   options:

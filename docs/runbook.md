@@ -50,11 +50,11 @@ re-derived from the current tree on every run.
 Every role is tagged with its own short name:
 
 ```
-ansible-playbook playbooks/site.yml --ask-vault-pass --tags acl
+ansible-playbook playbooks/site.yml --ask-vault-pass --tags mounts
 ```
 
 Available tags: `facts`, `common`, `identity`, `peer_trust`, `secrets`,
-`mounts`, `acl`, `samba`, `pam_smbpass`, `sshd`.
+`mounts`, `samba`, `pam_smbpass`, `sshd`.
 
 ## Dry run
 
@@ -84,10 +84,10 @@ pattern) before their first SMB connection to that host.
 ## Editing `access` rules or the tree shape
 
 Edit `stortree/config.yml`, then re-run `site.yml` (optionally
-`--tags acl` if you only changed `access:` blocks, or the full run if
+`--tags mounts` if you only changed `access:` blocks, or the full run if
 you changed tree shape/hosts/remotes). Nothing needs manual cleanup --
-`stortree_mounts` removes stale units and `stortree_acl` always
-recomputes from the current resolved facts.
+`stortree_mounts` removes stale units and always recomputes every path's
+ownership/mode from the current resolved facts.
 
 ## Recovering the control node
 

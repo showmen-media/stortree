@@ -18,6 +18,5 @@
     - stortree_peer_trust
     - stortree_secrets
     - stortree_mounts
-    - stortree_acl
     - stortree_samba
     - stortree_pam_smbpass

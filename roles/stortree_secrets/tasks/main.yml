@@ -4,24 +4,54 @@
 # per peer dependency (spec.md §3). The master rclone.conf never leaves
 # the control node.
 
-- name: Look up membership for every group referenced in a per-user access grant
+- name: Look up membership for every group referenced in an access grant
   # A per-user peer dependency's %U has to be expanded to the real
   # username actually granted access before its synthesized sftp section
   # can point at the right path (spec.md §3) -- the same group_members
-  # map stortree_mounts/stortree_acl need for their own %U expansion
-  # (spec.md §2/§6), resolved once here since this is the first role in
-  # site.yml's order that needs it (runs after stortree_identity, so SSSD
-  # is already configured); stortree_mounts/stortree_acl reuse this same
-  # `stortree_group_members` fact rather than re-deriving their own.
+  # map stortree_mounts needs for its own %U expansion (spec.md §2),
+  # resolved once here since this is the first role in site.yml's order
+  # that needs it (runs after stortree_identity, so SSSD is already
+  # configured); stortree_mounts reuses this same `stortree_group_members`
+  # fact rather than re-deriving its own. Covers every node with a group
+  # grant, not just per-user ones -- a plain shared node's `access.group`
+  # still needs its GID resolved to gid-own its mount (spec.md §6), even
+  # though it has no %U-expansion to do.
   ansible.builtin.getent:
     database: group
     key: "{{ item }}"
   loop: "{{ stortree | stortree_needed_groups }}"
   tags: [secrets]
 
+- name: Look up the UID for every user referenced in an access.owner grant
+  # Mirrors the group lookup above -- stortree_mounts needs the numeric
+  # UID (not just the name) to uid-own a remote-backed node's mount
+  # (spec.md §6); a plain local node just hands ansible.builtin.file the
+  # name directly and needs no lookup at all.
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ item }}"
+  loop: "{{ stortree | stortree_needed_users }}"
+  tags: [secrets]
+
 - name: Compute this host's resolved group membership
   ansible.builtin.set_fact:  # noqa: var-naming[no-role-prefix]
     stortree_group_members: "{{ ansible_facts.getent_group | default({}) | stortree_group_members }}"
+  tags: [secrets]
+
+- name: Compute this host's resolved group GIDs
+  # Same getent_group data as above, just the numeric GID instead of
+  # membership -- stortree_mounts needs it to gid-own a remote-backed
+  # node's rclone mount when `access` grants a group (spec.md §6), so the
+  # kernel can enforce that grant for real.
+  ansible.builtin.set_fact:  # noqa: var-naming[no-role-prefix]
+    stortree_group_gids: "{{ ansible_facts.getent_group | default({}) | stortree_group_gids }}"
+  tags: [secrets]
+
+- name: Compute this host's resolved user UIDs
+  # Same idea as stortree_group_gids, for access.owner instead of
+  # access.group.
+  ansible.builtin.set_fact:  # noqa: var-naming[no-role-prefix]
+    stortree_user_uids: "{{ ansible_facts.getent_passwd | default({}) | stortree_user_uids }}"
   tags: [secrets]
 
 - name: Render this host's filtered rclone.conf

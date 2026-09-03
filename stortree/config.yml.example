@@ -37,14 +37,12 @@ subdirs:
     user-subdirs:
       whitfield-media:
         access:
-          - group: "Whitfield Family & Friends"
-            permissions: rx
-          - group: "Michael Whitfield Family"
-            permissions: rwx
+          group: "Whitfield Family & Friends"
+          permissions: rx
         host: storage-node-bravo
         rclone.remote: some-remote:/media
       sys-configs:
-        access.user: jd
+        access.owner: jd
       mw-fam:
         access.group: "Michael Whitfield Family"
         host: storage-node-bravo

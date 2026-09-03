@@ -28,7 +28,7 @@ import io
 import re
 
 # Interpretation call #1 (docs/plan.md): the dotted access shorthand
-# (`access.group: X`, `access.user: X`) never specifies `permissions` in
+# (`access.group: X`, `access.owner: X`) never specifies `permissions` in
 # any example in docs/config-schema.md, and no default is stated. Every
 # example use is a user/group being granted their own private subtree, so
 # default to full control. One-line change here if that's wrong.
@@ -86,18 +86,75 @@ def _expand_dotted(obj):
 
 
 def _normalize_access(raw):
-    """Normalize either access form into a list of
-    {group|user: name, permissions: str} grants."""
+    """Normalize `access` into a single {group?, owner?, permissions}
+    dict -- never a list (docs/config-schema.md "Access"). A remote-backed
+    node can only ever carry real, kernel-enforced access as plain Unix
+    ownership + mode (rclone's FUSE mount has no POSIX ACL support, spec.md
+    §6) -- which is exactly what one owner + one group + one shared
+    permissions level can express, and no more, so the schema doesn't let
+    you write anything that can't actually be enforced. `raw` with
+    neither `group` nor `owner` (including None) normalizes to `{}`."""
     if raw is None:
-        return []
-    if isinstance(raw, dict):
-        raw = [raw]
-    result = []
-    for item in raw:
-        entry = dict(item)
-        entry.setdefault("permissions", DEFAULT_ACCESS_PERMISSIONS)
-        result.append(entry)
-    return result
+        raw = {}
+    if isinstance(raw, list):
+        raise ValueError(
+            "access must be a single object ({group?, owner?, permissions?}), "
+            "not a list -- see docs/config-schema.md \"Access\""
+        )
+    entry = dict(raw)
+    if not (entry.get("group") or entry.get("owner")):
+        return {}
+    entry.setdefault("permissions", DEFAULT_ACCESS_PERMISSIONS)
+    return entry
+
+
+def _permission_bits(permissions):
+    """'rwx'-style string -> the numeric 0-7 mode bits it represents."""
+    bits = 0
+    if "r" in permissions:
+        bits |= 4
+    if "w" in permissions:
+        bits |= 2
+    if "x" in permissions:
+        bits |= 1
+    return bits
+
+
+def access_owner(access, default_owner):
+    """The Unix owner a node's `access` implies -- the granted `owner` if
+    one's set, else `default_owner` (stortree_user), which also keeps
+    full control (see access_mode()) so it can always administer the
+    path regardless of who else is granted access to it."""
+    return (access or {}).get("owner") or default_owner
+
+
+def access_group(access, default_group):
+    """The Unix group a node's `access` implies -- the granted `group` if
+    one's set, else `default_group` (stortree_group)."""
+    return (access or {}).get("group") or default_group
+
+
+def access_mode(access):
+    """The Unix mode a node's `access` implies, as a "0NNN" string ready
+    for ansible.builtin.file/rclone's --dir-perms/--file-perms alike.
+    `other` is always 0 -- nothing here is ever meant to be world-
+    readable. With neither `owner` nor `group` granted, this is the
+    plain default (owner: stortree, full control; group: stortree,
+    read+traverse) every path had before `access` existed. Granting just
+    one of the two still gives the *other* slot its own sensible default
+    rather than leaving it at 0: an explicit `owner` grant still lets
+    stortree itself administer the path (owner bits stay full even
+    though the path's actual Unix owner is the granted user, not
+    stortree); an explicit `group` grant makes the path private to that
+    group with no separate stortree-group carve-out, since it was
+    deliberately scoped to someone else."""
+    access = access or {}
+    if not (access.get("owner") or access.get("group")):
+        return "0750"
+    bits = _permission_bits(access.get("permissions", DEFAULT_ACCESS_PERMISSIONS))
+    owner_bits = bits if access.get("owner") else 7
+    group_bits = bits if access.get("group") else 0
+    return f"0{owner_bits}{group_bits}0"
 
 
 def _walk_tree(tree):
@@ -229,11 +286,15 @@ def resolve(tree, hostname, all_hosts):
     for s in samba_nodes:
         descendants = _descendants_of(s, nodes)
 
+        # Each descendant carries at most one access grant now (never a
+        # list, see _normalize_access()) -- the union across descendants
+        # is still a list, just of (at most) one grant per descendant
+        # rather than several from any single one.
         access_union = []
         for d in descendants:
-            for a in d["access"]:
-                if a not in access_union:
-                    access_union.append(a)
+            a = d.get("access")
+            if a and a not in access_union:
+                access_union.append(a)
 
         samba_shares.append(
             {
@@ -405,7 +466,7 @@ def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None, group_members=
 
     for peer in resolved.get("peer_dependencies", []):
         if peer.get("per_user"):
-            users = access_grant_usernames(peer.get("access", []), group_members)
+            users = access_grant_usernames(peer.get("access"), group_members)
             expanded = [
                 (
                     peer["local_path"].replace(PER_USER_PLACEHOLDER, u),
@@ -476,49 +537,99 @@ def group_members_from_getent(getent_group):
     return result
 
 
+def group_gids_from_getent(getent_group):
+    """Convert the same `ansible_facts.getent_group` data into a plain
+    {group_name: gid} map (`getent_group` entries are [password, gid,
+    members] -- see group_members_from_getent() above, which reuses the
+    same lookup for membership). Used by stortree_mounts to gid-own a
+    remote-backed node's rclone mount when its `access` grants a group
+    (spec.md §6) -- the kernel can enforce that directly (real
+    supplementary-group membership), even though the mount itself can
+    never carry POSIX ACLs."""
+    result = {}
+    for name, fields in (getent_group or {}).items():
+        if len(fields) > 1 and fields[1] is not None:
+            result[name] = int(fields[1])
+    return result
+
+
+def user_uids_from_getent(getent_passwd):
+    """Convert Ansible's `ansible_facts.getent_passwd` (looping
+    `ansible.builtin.getent` over every username referenced in an
+    `access.owner`) into a plain {username: uid} map. `getent_passwd`
+    entries are [password, uid, gid, gecos, home, shell] -- mirrors
+    group_gids_from_getent() above, just for the owner side of `access`
+    instead of the group side."""
+    result = {}
+    for name, fields in (getent_passwd or {}).items():
+        if len(fields) > 1 and fields[1] is not None:
+            result[name] = int(fields[1])
+    return result
+
+
 def access_grant_usernames(access, group_members=None):
-    """Resolve a list of access grants ({user: name} or {group: name,
-    ...}) to the deduped, sorted set of usernames it grants -- group
-    grants expand via `group_members` (docs/plan.md interpretation call
-    #2: group membership is host-local via SSSD, not something this pure
-    function can look up itself)."""
-    group_members = group_members or {}
-    users = set()
-    for grant in access or []:
-        if "user" in grant:
-            users.add(grant["user"])
-        elif "group" in grant:
-            users.update(group_members.get(grant["group"], []))
-    return sorted(users)
+    """Resolve one `access` dict ({group?, owner?, permissions?}) to the
+    sorted set of usernames a user-subdirs node should expand a per-user
+    folder for. An explicit `owner` always pins a single folder to that
+    one user -- `group` alongside it is still real (mount/ACL-level
+    shared access to that same folder, access_mode()/access_group()),
+    just not a second axis of *expansion*: one node still means one
+    folder. Only a `group` grant with no `owner` expands into one folder
+    per member (interpretation call #2: group membership is host-local
+    via SSSD, not something this pure function can look up itself, hence
+    `group_members`)."""
+    access = access or {}
+    if access.get("owner"):
+        return [access["owner"]]
+    if access.get("group"):
+        return sorted((group_members or {}).get(access["group"], []))
+    return []
 
 
 def needed_groups(resolved):
-    """Every group name this host's resolved facts reference in a
-    per-user access grant -- the set `getent group` needs to be run
-    against before `group_members_from_getent()`'s result can feed
-    `plan_mounts()`/`filter_rclone_conf()`'s own %U expansion (interpretation
-    call #2). Covers both `server_subtrees` (this host's own per-user
-    nodes) and `peer_dependencies` (a per-user samba descendant sourced
-    from a peer, or the root client mount -- which never carries `access`,
-    so contributes nothing here) -- the two are computed once, together,
-    by `stortree_facts` so every later role (`stortree_mounts`,
-    `stortree_acl`, `stortree_secrets`) shares one lookup and one
-    consistent group_members map, rather than each recomputing its own
-    scope of it (and risking one missing a scope the others cover)."""
+    """Every group name this host's resolved facts reference in an
+    `access` grant -- the set `getent group` needs to be run against
+    before `group_members_from_getent()`'s result can feed
+    `plan_mounts()`/`filter_rclone_conf()`'s own %U expansion, and before
+    `group_gids_from_getent()`'s result can gid-own a remote-backed
+    node's mount (spec.md §6) -- covers every node, not just per-user
+    ones, since a plain shared (non-%U) node can be gid-owned by its
+    `access.group` too, same as a per-user one. Covers both
+    `server_subtrees` (this host's own nodes) and `peer_dependencies` (a
+    samba descendant sourced from a peer, or the root client mount --
+    which never carries `access`, so contributes nothing here) -- the two
+    are computed once, together, by `stortree_facts` so every later role
+    (`stortree_mounts`, `stortree_secrets`) shares one lookup and one
+    consistent group_members/group_gids map, rather than each
+    recomputing its own scope of it (and risking one missing a scope the
+    others cover)."""
     groups = set()
     for n in resolved.get("server_subtrees", []):
-        if not n.get("per_user"):
-            continue
-        for grant in n.get("access") or []:
-            if "group" in grant:
-                groups.add(grant["group"])
+        g = (n.get("access") or {}).get("group")
+        if g:
+            groups.add(g)
     for p in resolved.get("peer_dependencies", []):
-        if not p.get("per_user"):
-            continue
-        for grant in p.get("access") or []:
-            if "group" in grant:
-                groups.add(grant["group"])
+        g = (p.get("access") or {}).get("group")
+        if g:
+            groups.add(g)
     return sorted(groups)
+
+
+def needed_users(resolved):
+    """Every username this host's resolved facts reference in an
+    `access.owner` grant -- mirrors needed_groups() above, for the
+    `getent passwd` lookup user_uids_from_getent() needs to uid-own a
+    remote-backed node's mount (spec.md §6)."""
+    users = set()
+    for n in resolved.get("server_subtrees", []):
+        u = (n.get("access") or {}).get("owner")
+        if u:
+            users.add(u)
+    for p in resolved.get("peer_dependencies", []):
+        u = (p.get("access") or {}).get("owner")
+        if u:
+            users.add(u)
+    return sorted(users)
 
 
 def plan_mounts(resolved, group_members=None):
@@ -561,7 +672,7 @@ def plan_mounts(resolved, group_members=None):
 
     for m in resolved.get("client_mounts", []):
         entries.append(
-            {"local_path": "", "remote": m["remote"], "args": m["args"], "access": []}
+            {"local_path": "", "remote": m["remote"], "args": m["args"], "access": {}}
         )
 
     for n in resolved.get("server_subtrees", []):
@@ -596,11 +707,11 @@ def plan_mounts(resolved, group_members=None):
                         p["owning_host"], p["local_path"], p["remote_path"]
                     ),
                     "args": p["args"],
-                    "access": p.get("access", []),
+                    "access": p.get("access") or {},
                 }
             )
             continue
-        for user in access_grant_usernames(p.get("access", []), group_members):
+        for user in access_grant_usernames(p.get("access"), group_members):
             local_path = p["local_path"].replace(PER_USER_PLACEHOLDER, user)
             remote_path = p["remote_path"].replace(PER_USER_PLACEHOLDER, user)
             entries.append(
@@ -608,7 +719,7 @@ def plan_mounts(resolved, group_members=None):
                     "local_path": local_path,
                     "remote": _peer_remote_ref(p["owning_host"], local_path, remote_path),
                     "args": p["args"],
-                    "access": p.get("access", []),
+                    "access": p.get("access") or {},
                 }
             )
 
@@ -641,6 +752,28 @@ def plan_mounts(resolved, group_members=None):
     return entries
 
 
+def samba_access_tokens(access_list, include_self=False):
+    """Render a list of `access` grants ({group?, owner?, permissions?} --
+    resolve()'s per-share access_union, at most one per descendant) into
+    smb.conf's `valid users`/`write list` token list: one quoted token per
+    granted principal. A single grant with both `owner` and `group` set
+    contributes two tokens, one each -- both get in, not just one.
+    Quoted because a principal name can contain a space (smb.conf(5)
+    "lists" are otherwise whitespace-delimited, e.g. config-schema.md's
+    "Michael Whitfield Family") -- see smb.conf.j2. `include_self`
+    prepends `%U` itself (spec.md §6): a %U-templated share's own path
+    already confines each connecting user to their own subtree, so their
+    baseline access there shouldn't depend on any particular descendant's
+    `access` grant existing at all."""
+    tokens = ['"%U"'] if include_self else []
+    for a in access_list:
+        if a.get("group"):
+            tokens.append(f'"@{a["group"]}"')
+        if a.get("owner"):
+            tokens.append(f'"{a["owner"]}"')
+    return tokens
+
+
 def mount_unit_names(mount_plan):
     """The full `stortree-mount@<slug>.service` unit filename for every
     actual rclone mount in a stortree_plan_mounts() result (entries with
@@ -656,8 +789,15 @@ class FilterModule(object):
             "stortree_resolve": resolve,
             "stortree_filter_rclone_conf": filter_rclone_conf,
             "stortree_group_members": group_members_from_getent,
+            "stortree_group_gids": group_gids_from_getent,
+            "stortree_user_uids": user_uids_from_getent,
             "stortree_access_users": access_grant_usernames,
+            "stortree_access_owner": access_owner,
+            "stortree_access_group": access_group,
+            "stortree_access_mode": access_mode,
             "stortree_needed_groups": needed_groups,
+            "stortree_needed_users": needed_users,
             "stortree_plan_mounts": plan_mounts,
             "stortree_mount_unit_names": mount_unit_names,
+            "stortree_samba_access_tokens": samba_access_tokens,
         }

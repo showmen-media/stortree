@@ -7,7 +7,7 @@ Describes the shape of the three source-of-truth files. See
 
 Throughout these files, a dotted key is shorthand for a nested mapping.
 `rclone.remote: storagebox` means `rclone: {remote: storagebox}`;
-`access.user: jd` means `access: {user: jd}`. Both forms are
+`access.owner: jd` means `access: {owner: jd}`. Both forms are
 equivalent and may be mixed — use whichever is more readable for a given
 node (a single override reads better dotted; several together read better
 nested, as `media-prod` does for `rclone`).
@@ -34,7 +34,9 @@ subdirs:
     rclone.remote: <remote-spec>  # optional; never inherits — see "Node inheritance" below
                                # for what a node with no rclone.remote of its own resolves to
     rclone.args: {...}        # optional; used as-is for this node only, does not inherit
-    access: [...] | access.group | access.user   # see Access below
+    access: {group: <name>, owner: <name>, permissions: <rwx-string>}  # see Access below
+                               # — a single object, all three optional; dotted shorthand
+                               # (access.group:/access.owner:/access.permissions:) works too
     samba:
       subpath: "<template>"   # e.g. "%U" for per-connecting-user substitution
                                # — every participating host exposes this node
@@ -90,14 +92,12 @@ subdirs:
     user-subdirs:
       whitfield-media:
         access:
-          - group: "Whitfield Family & Friends"
-            permissions: rx
-          - group: "Michael Whitfield Family"
-            permissions: rwx
+          group: "Whitfield Family & Friends"
+          permissions: rx
         host: storage-node-bravo
         rclone.remote: some-remote:/media
       sys-configs:
-        access.user: jd
+        access.owner: jd
       mw-fam:
         access.group: "Michael Whitfield Family"
         host: storage-node-bravo
@@ -177,15 +177,15 @@ depends on whether it also changes `host`:
 - **Same `host` (inherited, not overridden)**: the node is just a plain
   subdirectory that has to exist inside the tree its inherited `host`
   already serves. `backups: {}`, `.cache`, `.cache/some-gcs-bucket`, and
-  `sys-configs` (`access.user: jd`) in the example above are all exactly
+  `sys-configs` (`access.owner: jd`) in the example above are all exactly
   this — none of them set their own `rclone` or a different `host`, so
   each resolves to an ordinary, empty directory under
   `storage-node-alpha`'s own local tree (`/srv/stortree/backups`,
   `/srv/stortree/.cache`, `/srv/stortree/.cache/some-gcs-bucket`,
   `/srv/stortree/home/<user>/sys-configs`) — nothing is mounted at any of
   those paths. `resolve()`/`stortree_plan_mounts` still track the node
-  (for ACLs, Samba export, per-user expansion), just without an rclone
-  unit backing it.
+  (for ownership/mode, Samba export, per-user expansion), just without an
+  rclone unit backing it.
 - **Different `host`, still no `rclone` of its own**: that `host` has to
   keep the directory's data locally — there's no remote configured for it
   to mount from, so whatever ends up there is real local storage on that
@@ -214,7 +214,7 @@ inherits (above), that's the only way for a node to have one at all.
 Same map-of-`name -> node` shape, but they resolve differently:
 
 - `subdirs` entries are literal, single, shared directories — one
-  instance on disk, ACL'd once (`.cache`, `frigate`, `backups`).
+  instance on disk, owned/moded once (`.cache`, `frigate`, `backups`).
 - `user-subdirs` entries are per-user: the immediate children of a
   `user-subdirs` node are per-user folders, and the nodes listed
   (`whitfield-media`, `sys-configs`, `mw-fam`, `media-prod`) describe the
@@ -226,37 +226,64 @@ Same map-of-`name -> node` shape, but they resolve differently:
   irrelevant here; if `user-subdirs` is used without `samba.subpath`, the
   per-user folders still have to be the immediate children of that node.
   `access` on each descendant still applies per the usual rules, so
-  `sys-configs` (`access.user: jd`) only shows up inside `jd`'s own
-  per-user folder, not everyone else's — though *how* it's enforced
-  differs for a descendant with its own `rclone.remote` (`media-prod`
-  here) versus one without (`sys-configs`); see "Access" below.
+  `sys-configs` (`access.owner: jd`) only shows up inside `jd`'s own
+  per-user folder, not everyone else's — an `owner` grant always pins
+  a single folder like this, whether or not the node also carries a
+  `group`; only a `group`-only grant (`mw-fam`, `media-prod`) expands
+  into one folder per member. See "Access" below for how that grant then
+  gets enforced, which differs for a descendant with its own
+  `rclone.remote` (`media-prod`) versus one without (`sys-configs`).
 
 ### Access
 
-Two equivalent forms:
+`access` is always a single object — `group`, `owner`, and `permissions`
+all optional, either written out or via dotted shorthand:
 
 ```yaml
-# list form — multiple group grants at once
+# written out
 access:
-  - group: "Whitfield Family & Friends"
-    permissions: rx
-  - group: "Michael Whitfield Family"
-    permissions: rwx
+  group: "Michael Whitfield Family"
+  owner: jd
+  permissions: rwx
 
-# dotted shorthand — single grant
+# dotted shorthand
 access.group: "Michael Whitfield Family"
-access.user: jd
+access.owner: jd
 ```
 
-`group`/`user` names are resolved against POSIX identities provided by
+Both `group` and `owner` can be set at once — the node is then pinned to
+that one `owner`'s folder (see "`subdirs` vs `user-subdirs`" above), with
+`group` granting *shared* access to that same folder at the same
+`permissions` level, not a second, differently-permissioned tier. There's
+no way to express two different principals at two different permission
+levels on one node — see why below.
+
+`group`/`owner` names are resolved against POSIX identities provided by
 SSSD (backed by the configured LDAP server — see `ldap.yml` below).
-`permissions` is a `rwx`-style string applied via `setfacl` — but only
-for a node with no `rclone.remote` of its own. A remote-backed node
-(directly, or peer-sourced from whichever host owns it) is a rclone FUSE
-mount, which can't carry POSIX ACLs at all; `access` there is enforced
-through Samba only (`valid users`/`write list`, spec.md §4/§6), and SSH
-or any other local-process access to it is blocked outright, for every
-user, on every host — see spec.md §6 for the mechanism.
+`permissions` is a `rwx`-style string, applied as plain Unix ownership +
+mode (spec.md §6) — not a POSIX ACL, and there's no way to write one:
+`access` was deliberately restricted to a single object, one owner + one
+group + one shared permissions level, exactly what a remote-backed node
+can ever actually carry. A remote-backed node (directly, or peer-sourced
+from whichever host owns it) is always an rclone FUSE mount, and rclone's
+FUSE mount never implements `setxattr` — it can't carry a POSIX ACL on
+any host, full stop, so the old list-of-grants form (letting a node like
+`whitfield-media` grant two different groups two different permission
+levels) could describe configurations that were never actually
+enforceable for such a node; the schema no longer lets you write one. A
+plain local node (`sys-configs` here) gets the same treatment for
+consistency, not necessity — it could carry a real POSIX ACL, but there's
+no reason for its enforcement to work differently from a remote-backed
+sibling's.
+
+With neither `group` nor `owner` granted, a node gets the plain default:
+owned by the `stortree` service account with full control, group
+`stortree` with read+traverse, no access for anyone else. Granting an
+`owner` makes it private to that one user instead (no group fallback);
+granting only a `group` leaves `stortree` itself with full control and
+gives the group `permissions`. See spec.md §6 for exactly how this
+becomes real, symmetric enforcement over both Samba and SSH alike, for
+every node with any `access` at all.
 
 ### Every inventory host participates
 

@@ -8,27 +8,31 @@ workgroup = WORKGROUP
 security = user
 map to guest = never
 nt acl support = yes
-map acl inherit = yes
 inherit permissions = yes
 passdb backend = tdbsam
-
-# Every share's actual file I/O runs as the stortree service account,
-# whichever LDAP user authenticated the SMB session -- `valid users`/
-# `write list` below (rendered from each node's `access` grants) remain
-# the real authorization gate; this just stops that gate from also
-# depending on OS-level permissions, which a remote-backed (rclone
-# FUSE-mounted) subtree can't carry at all (no ACL support, and no
-# --allow-other -- see stortree_mounts/stortree_acl).
-force user = {{ stortree_user }}
-force group = {{ stortree_group }}
 
 {% for share in stortree.samba_shares %}
 [{{ share.node_path | regex_replace('[^A-Za-z0-9_-]', '_') }}]
    path = {{ stortree_root }}/{{ share.node_path }}{{ '/' ~ share.subpath if share.subpath else '' }}
    read only = no
-   valid users = {% for a in share.access %}{{ '@' if 'group' in a else '' }}{{ a.group | default(a.user) }}{{ ' ' if not loop.last else '' }}{% endfor %}
+   {# stortree_samba_access_tokens (filter_plugins/stortree.py) quotes
+      each principal -- smb.conf(5) "lists" are otherwise
+      whitespace-delimited, and a name can contain a space (e.g. "Michael
+      Whitfield Family", config-schema.md's worked example) -- and, for a
+      %U-templated share, adds %U itself as a standing entry (spec.md
+      §6): the share's own path already confines each connecting user to
+      their own subtree, so their baseline access there shouldn't depend
+      on any particular descendant's `access` grant existing at all. A
+      descendant with its own remote (e.g. mp-fam) doesn't strictly need
+      its grant repeated here either way -- stortree_mounts already
+      enforces it for real, at the mount itself (uid/gid-owned, kernel
+      level) -- but leaving it in this union is harmless (%U already
+      subsumes it for reaching one's own tree) and still correct for a
+      plain local descendant with no mount of its own to enforce it. #}
+   {% set include_self = share.subpath and '%U' in share.subpath %}
+   valid users = {{ share.access | stortree_samba_access_tokens(include_self) | join(' ') }}
 
-   write list = {% for a in share.access if 'w' in a.permissions %}{{ '@' if 'group' in a else '' }}{{ a.group | default(a.user) }}{{ ' ' if not loop.last else '' }}{% endfor %}
+   write list = {{ share.access | selectattr('permissions', 'search', 'w') | list | stortree_samba_access_tokens(include_self) | join(' ') }}
 
 
 {% endfor %}

@@ -127,7 +127,7 @@ Semaphore doesn't need.
 - Same as apply, with CLI args `--check --diff`
 
 For occasional `--limit`/`--tags` runs (tags: `facts`, `common`,
-`identity`, `peer_trust`, `secrets`, `mounts`, `acl`, `samba`,
+`identity`, `peer_trust`, `secrets`, `mounts`, `samba`,
 `pam_smbpass`, `sshd` — see [runbook.md](runbook.md#apply-just-one-concern)),
 either add dedicated templates per common case, or enable "Allow CLI args
 override" if your Semaphore version supports it.

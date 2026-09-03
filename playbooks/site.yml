@@ -6,7 +6,7 @@
 # Usage:
 #   ansible-playbook playbooks/site.yml                          # whole tree
 #   ansible-playbook playbooks/site.yml --limit storage-node-x    # one host
-#   ansible-playbook playbooks/site.yml --tags acl                # one concern
+#   ansible-playbook playbooks/site.yml --tags mounts             # one concern
 #   ansible-playbook playbooks/site.yml --check --diff            # dry run
 #
 # See docs/runbook.md for the full operator command reference.
@@ -21,7 +21,6 @@
     - stortree_peer_trust
     - stortree_secrets
     - stortree_mounts
-    - stortree_acl
     - stortree_samba
     - stortree_pam_smbpass
     - stortree_sshd

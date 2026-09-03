@@ -3,11 +3,12 @@
 Declarative storage-tree management for a small fleet of Linux hosts:
 one config describes a directory tree, and an Ansible playbook turns it
 into [rclone](https://rclone.org/) mounts, [Samba](https://www.samba.org/)
-shares with POSIX-consistent ACLs, and Unix identity resolved from your
-existing LDAP directory — kept in sync across every host that
-participates. There's no daemon and no custom CLI: a control node (an
-operator's machine or CI) runs `ansible-playbook` against the fleet over
-plain SSH, the same way you'd run any other Ansible project.
+shares access-controlled by real Unix ownership and mode, and Unix
+identity resolved from your existing LDAP directory — kept in sync
+across every host that participates. There's no daemon and no custom
+CLI: a control node (an operator's machine or CI) runs `ansible-playbook`
+against the fleet over plain SSH, the same way you'd run any other
+Ansible project.
 
 > 🚧 **Implemented, not yet run against real hosts.** All roles and both
 > playbooks exist; the Docker-based test harness is scaffolded but hasn't
@@ -30,9 +31,10 @@ needs.
   [docs/config-schema.md](docs/config-schema.md).
 - **rclone mounts**, generated as systemd units, either as a host's own
   client mount or as the local storage backing a Samba share.
-- **Samba shares** with `nt acl support`, reading the same POSIX ACLs the
-  playbook applies via `setfacl` — one ACL system, not two that can drift
-  apart.
+- **Samba shares** access-controlled by the same Unix ownership/mode the
+  playbook sets on the underlying path or rclone mount — one enforcement
+  mechanism, reachable identically over Samba or SSH, not a separate ACL
+  system that can drift from either.
 - **LDAP-backed identity** via SSSD, so a group resolves to the same
   Unix GID on every host, plus `pam_smbpass` to keep Samba's NT-hash
   password store in sync with your directory.
@@ -104,9 +106,9 @@ models "act on every host from one place." Re-running it converges to the
 same end state rather than accumulating drift, the same guarantee a
 hand-rolled `apply`/`reconcile` split would otherwise exist to provide.
 
-Full details — config resolution, secrets scoping, the Samba/ACL layer,
-SSSD/LDAP identity, `pam_smbpass`, peer trust provisioning, the role/
-playbook layout, and the Molecule test harness — are in
+Full details — config resolution, secrets scoping, the Samba/access
+layer, SSSD/LDAP identity, `pam_smbpass`, peer trust provisioning, the
+role/playbook layout, and the Molecule test harness — are in
 [docs/spec.md](docs/spec.md).
 
 ## Requirements
@@ -115,7 +117,7 @@ On the control node: `ansible` plus the `ansible.posix` and
 `community.crypto` collections (see `requirements.txt`/`requirements.yml`).
 On every managed host: existing, well-known Linux storage/identity
 tooling that the roles configure rather than reinvent — `rclone`, `samba`,
-`sssd`, `acl`, and `samba-common-bin`/`libpam-modules`. See
+`sssd`, and `samba-common-bin`/`libpam-modules`. See
 [docs/spec.md §9](docs/spec.md) for the full dependency list and
 test-harness design.
 

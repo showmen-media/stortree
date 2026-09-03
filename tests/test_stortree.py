@@ -7,12 +7,19 @@ from filter_plugins.stortree import (
     DEFAULT_ACCESS_PERMISSIONS,
     PER_USER_PLACEHOLDER,
     access_grant_usernames,
+    access_group,
+    access_mode,
+    access_owner,
     filter_rclone_conf,
+    group_gids_from_getent,
     group_members_from_getent,
     mount_unit_names,
     needed_groups,
+    needed_users,
     plan_mounts,
     resolve,
+    samba_access_tokens,
+    user_uids_from_getent,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -32,6 +39,23 @@ def paths(entries):
 
 def by_path(entries, path):
     return next(e for e in entries if e["path"] == path)
+
+
+def test_access_as_a_list_is_rejected():
+    # the old list-of-grants form can't express anything that's actually
+    # enforceable anymore (spec.md §6) -- fail loudly at resolve() rather
+    # than silently doing something wrong with it.
+    tree = {
+        "host": "h1",
+        "rclone.remote": "r1:/",
+        "subdirs": {
+            "leaf": {
+                "access": [{"group": "a", "permissions": "rx"}, {"group": "b"}],
+            }
+        },
+    }
+    with pytest.raises(ValueError, match="access must be a single object"):
+        resolve(tree, "h1", ["h1"])
 
 
 # -- config-schema.md worked example, end to end -----------------------
@@ -163,9 +187,7 @@ def test_sys_configs_access_defaults_permissions_and_is_per_user():
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     sys_configs = by_path(r["server_subtrees"], "home/%U/sys-configs")
     assert sys_configs["per_user"] is True
-    assert sys_configs["access"] == [
-        {"user": "jd", "permissions": DEFAULT_ACCESS_PERMISSIONS}
-    ]
+    assert sys_configs["access"] == {"owner": "jd", "permissions": DEFAULT_ACCESS_PERMISSIONS}
 
 
 def test_rclone_remote_does_not_inherit():
@@ -309,13 +331,13 @@ def test_dotted_and_nested_forms_are_equivalent():
     dotted = {
         "host": "h1",
         "rclone.remote": "r1:/",
-        "subdirs": {"a": {"rclone.remote": "r2:/x", "access.user": "jd"}},
+        "subdirs": {"a": {"rclone.remote": "r2:/x", "access.owner": "jd"}},
     }
     nested = {
         "host": "h1",
         "rclone": {"remote": "r1:/"},
         "subdirs": {
-            "a": {"rclone": {"remote": "r2:/x"}, "access": {"user": "jd"}}
+            "a": {"rclone": {"remote": "r2:/x"}, "access": {"owner": "jd"}}
         },
     }
     assert resolve(dotted, "h1", ["h1"]) == resolve(nested, "h1", ["h1"])
@@ -402,7 +424,7 @@ def test_filter_rclone_conf_expands_per_user_peer_sections():
                 "remote_path": "home/%U/sys-configs",
                 "samba_node": "home",
                 "per_user": True,
-                "access": [{"user": "jd", "permissions": "rwx"}],
+                "access": {"owner": "jd", "permissions": "rwx"},
             }
         ],
     }
@@ -442,7 +464,12 @@ def test_needed_groups_covers_server_subtrees_and_peer_dependencies():
     ]
 
 
-def test_needed_groups_ignores_non_per_user_and_user_only_grants():
+def test_needed_groups_covers_non_per_user_grants_too():
+    # a non-per-user node's own `access.group` still needs its GID
+    # resolved (spec.md §6, gid-owning its mount) even though it has no
+    # %U-expansion to do -- needed_groups() covers both for exactly that
+    # reason, unlike group_members (%U-expansion) which only matters for
+    # a per-user node. An owner-only grant contributes no group either way.
     tree = {
         "host": "h1",
         "rclone.remote": "r1:/",
@@ -450,12 +477,12 @@ def test_needed_groups_ignores_non_per_user_and_user_only_grants():
             "shared": {
                 "samba": {"subpath": ""},
                 "access.group": "not-per-user-group",
-                "subdirs": {"leaf": {"host": "h2", "access.user": "jd"}},
+                "subdirs": {"leaf": {"host": "h2", "access.owner": "jd"}},
             }
         },
     }
     r = resolve(tree, "h1", ["h1", "h2"])
-    assert needed_groups(r) == []
+    assert needed_groups(r) == ["not-per-user-group"]
 
 
 def test_group_members_from_getent_parses_csv_member_field():
@@ -467,13 +494,111 @@ def test_group_members_from_getent_parses_csv_member_field():
     assert members == {"Michael Whitfield Family": ["mike", "dana"], "empty-group": []}
 
 
-def test_access_grant_usernames_combines_users_and_group_members():
-    access = [
-        {"user": "jd", "permissions": "rwx"},
-        {"group": "Michael Whitfield Family", "permissions": "rwx"},
-    ]
+def test_group_gids_from_getent_parses_numeric_gid():
+    # stortree_mounts needs the actual GID (not just membership) to
+    # gid-own a remote-backed node's mount for a single-group `access`
+    # grant (spec.md §6) -- same ansible_facts.getent_group data
+    # group_members_from_getent() reads, just the other field.
+    getent_group = {
+        "Michael Whitfield Family": ["x", "2001", "mike,dana"],
+    }
+    assert group_gids_from_getent(getent_group) == {"Michael Whitfield Family": 2001}
+
+
+def test_user_uids_from_getent_parses_numeric_uid():
+    # mirrors group_gids_from_getent() above, for access.owner instead of
+    # access.group -- stortree_mounts needs this to uid-own a remote-backed
+    # node's mount (spec.md §6).
+    getent_passwd = {"jd": ["x", "2101", "2101", "", "/home/jd", "/bin/bash"]}
+    assert user_uids_from_getent(getent_passwd) == {"jd": 2101}
+
+
+def test_needed_users_covers_server_subtrees_and_peer_dependencies():
+    r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
+    assert needed_users(r) == ["jd"]
+
+
+def test_access_owner_defaults_to_stortree_when_unset():
+    assert access_owner({}, "stortree") == "stortree"
+    assert access_owner(None, "stortree") == "stortree"
+    assert access_owner({"group": "g"}, "stortree") == "stortree"
+
+
+def test_access_owner_uses_the_granted_owner():
+    assert access_owner({"owner": "jd"}, "stortree") == "jd"
+
+
+def test_access_group_defaults_to_stortree_when_unset():
+    assert access_group({}, "stortree") == "stortree"
+    assert access_group({"owner": "jd"}, "stortree") == "stortree"
+
+
+def test_access_group_uses_the_granted_group():
+    assert access_group({"group": "Media Production"}, "stortree") == "Media Production"
+
+
+def test_access_mode_with_no_grant_is_the_plain_default():
+    # owner: stortree (full control), group: stortree (read+traverse),
+    # other: none -- what every path had before `access` existed.
+    assert access_mode({}) == "0750"
+    assert access_mode(None) == "0750"
+
+
+def test_access_mode_group_only_leaves_owner_full_and_sets_group_bits():
+    assert access_mode({"group": "g", "permissions": "rx"}) == "0750"
+    assert access_mode({"group": "g", "permissions": "rwx"}) == "0770"
+
+
+def test_access_mode_owner_only_is_private_to_that_owner():
+    # deliberately no stortree-group carve-out -- an owner-only grant was
+    # scoped to one specific person, not shared with anyone else by default
+    assert access_mode({"owner": "jd", "permissions": "rwx"}) == "0700"
+    assert access_mode({"owner": "jd", "permissions": "rx"}) == "0500"
+
+
+def test_access_mode_owner_and_group_share_the_same_permissions_level():
+    assert access_mode({"owner": "jd", "group": "g", "permissions": "rwx"}) == "0770"
+
+
+def test_samba_access_tokens_quotes_names_with_spaces():
+    access = [{"group": "Michael Whitfield Family", "permissions": "rwx"}]
+    assert samba_access_tokens(access) == ['"@Michael Whitfield Family"']
+
+
+def test_samba_access_tokens_one_grant_with_both_owner_and_group_yields_two_tokens():
+    access = [{"owner": "jd", "group": "IT Admins", "permissions": "rwx"}]
+    assert samba_access_tokens(access) == ['"@IT Admins"', '"jd"']
+
+
+def test_samba_access_tokens_include_self_prepends_percent_u():
+    assert samba_access_tokens([], include_self=True) == ['"%U"']
+    access = [{"group": "g", "permissions": "rwx"}]
+    assert samba_access_tokens(access, include_self=True) == ['"%U"', '"@g"']
+
+
+def test_access_grant_usernames_owner_only_pins_a_single_user():
+    access = {"owner": "jd", "permissions": "rwx"}
+    assert access_grant_usernames(access, {}) == ["jd"]
+
+
+def test_access_grant_usernames_group_only_expands_to_every_member():
+    access = {"group": "Michael Whitfield Family", "permissions": "rwx"}
     group_members = {"Michael Whitfield Family": ["mike", "dana", "jd"]}
     assert access_grant_usernames(access, group_members) == ["dana", "jd", "mike"]
+
+
+def test_access_grant_usernames_owner_and_group_still_pins_a_single_user():
+    # owner determines the one folder that gets created -- group alongside
+    # it is real (shared mount/mode-level access to that same folder,
+    # access_mode()/access_group()), just not a second axis of expansion.
+    access = {"owner": "jd", "group": "Michael Whitfield Family", "permissions": "rwx"}
+    group_members = {"Michael Whitfield Family": ["mike", "dana"]}
+    assert access_grant_usernames(access, group_members) == ["jd"]
+
+
+def test_access_grant_usernames_empty_access_expands_to_nobody():
+    assert access_grant_usernames({}, {"g": ["mike"]}) == []
+    assert access_grant_usernames(None, {"g": ["mike"]}) == []
 
 
 # -- plan_mounts -----------------------------------------------------------
@@ -481,7 +606,10 @@ def test_access_grant_usernames_combines_users_and_group_members():
 
 def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
     r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
-    group_members = {"Michael Whitfield Family": ["mike"]}
+    group_members = {
+        "Michael Whitfield Family": ["mike"],
+        "Whitfield Family & Friends": ["mike", "dana"],
+    }
 
     plan = plan_mounts(r, group_members)
     by_local_path = {e["local_path"]: e for e in plan}
@@ -491,12 +619,15 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
     assert "home/mike/mw-fam" in by_local_path
     assert "home/%U/mw-fam" not in by_local_path
 
-    # whitfield-media also grants "Michael Whitfield Family" (among
-    # others), so mike gets a mount there too via that grant
+    # whitfield-media (access.group: Whitfield Family & Friends) is its
+    # own, separate node -- mike gets a mount there too, via his own
+    # membership in that group, not via mw-fam's
     assert "home/mike/whitfield-media" in by_local_path
+    assert "home/dana/whitfield-media" in by_local_path
     # but nobody unresolvable (no group_members entry) gets one
     assert not any(
-        p.startswith("home/") and p.endswith("/whitfield-media") and p != "home/mike/whitfield-media"
+        p.startswith("home/") and p.endswith("/whitfield-media")
+        and p not in ("home/mike/whitfield-media", "home/dana/whitfield-media")
         for p in by_local_path
     )
 
@@ -506,29 +637,28 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
     assert by_local_path["home/mike/mw-fam"]["requires_slug"] == root_slug
 
 
-def test_acl_plan_excludes_remote_backed_entries():
-    # roles/stortree_acl/tasks/main.yml flattens ACL targets with
-    # `stortree_acl_plan | rejectattr('remote') | list | subelements(...)`
-    # -- rclone's FUSE mount never implements setxattr, so setfacl always
-    # fails "Operation not supported" on a remote-backed entry (spec.md
-    # §6). Mirrors that exact Jinja expression against alpha's own plan,
-    # which has one of each right next to each other under `home`: a
-    # plain per-user leaf (sys-configs, no rclone.remote) and a
-    # remote-backed one (media-prod, rclone.remote: some-gcs-bucket:).
-    from jinja2 import Environment
-
+def test_plan_mounts_entries_carry_access_for_ownership_and_mode():
+    # stortree_mounts now sets owner/group/mode from `access` on every
+    # resolved entry directly (ansible.builtin.file for a plain
+    # directory, --uid/--gid/--dir-perms/--file-perms for a remote-backed
+    # one, spec.md §6) -- no separate ACL role, and no filtering by
+    # `remote` first; both a plain local leaf (sys-configs) and a
+    # remote-backed one (media-prod) carry their own `access` straight
+    # through into the plan.
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     group_members = {"Media Production": ["alex"]}
     plan = plan_mounts(r, group_members)
+    by_local_path = {e["local_path"]: e for e in plan}
 
-    template = Environment().from_string(
-        "{% for e in plan | rejectattr('remote') | list %}{{ e.local_path }}\n{% endfor %}"
-    )
-    kept = set(template.render(plan=plan).split())
-
-    assert "home/jd/sys-configs" in kept
-    assert "backups" in kept
-    assert not any(p.endswith("/media-prod") for p in kept)
+    assert by_local_path["home/jd/sys-configs"]["access"] == {
+        "owner": "jd",
+        "permissions": DEFAULT_ACCESS_PERMISSIONS,
+    }
+    assert by_local_path["home/alex/media-prod"]["access"] == {
+        "group": "Media Production",
+        "permissions": DEFAULT_ACCESS_PERMISSIONS,
+    }
+    assert by_local_path["backups"]["access"] == {}
 
 
 def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
@@ -538,7 +668,10 @@ def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
     # directly (mesh) from whichever host actually owns that piece, not
     # funneled through root_host.
     r = resolve(EXAMPLE_TREE, "some-storage-gadget", EXAMPLE_HOSTS)
-    group_members = {"Michael Whitfield Family": ["mike"]}
+    group_members = {
+        "Michael Whitfield Family": ["mike"],
+        "Whitfield Family & Friends": ["mike"],
+    }
     plan = plan_mounts(r, group_members)
     by_local_path = {e["local_path"]: e for e in plan}
 
