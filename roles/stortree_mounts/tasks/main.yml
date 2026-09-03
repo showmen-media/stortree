@@ -28,6 +28,27 @@
 # and unmounted first, or turning that still-busy mountpoint directory
 # into a symlink fails outright ("Device or resource busy").
 #
+# Every directory/symlink-creation task below is `ignore_errors: true`
+# for exactly this reason too, not just to route around a masked
+# ancestor: a path nested under a mount whose *own* config just changed
+# (a corrected `rclone.remote`, say) can't be created until that mount
+# is actually re-rendered and restarted with the fix -- which happens
+# further down this same file. Ansible aborts the whole play for a host
+# on a task's first unhandled failure, so a real, non-masked failure
+# here (not just a skip) would permanently block this file from ever
+# reaching the render/restart step that would fix the *actual* problem
+# -- a stale mount stopping its own fix from ever being applied, forever
+# repeating the identical failure on every subsequent run regardless of
+# how many times the underlying config gets corrected (production hit
+# exactly this: a top-level subtree's `rclone.remote` got fixed twice in
+# a row, and the live unit never picked up either fix, because a nested
+# entry's directory creation kept failing first and aborting the play
+# before render/restart ever ran). Letting these fail non-fatally costs
+# nothing more than one extra apply -- the same "two-run" pattern this
+# design already has for a brand-new nested entry generally (its own
+# parent mount has to exist and be reachable before anything can be
+# created inside it, same as always).
+#
 # `rclone` never inherits down the tree (docs/config-schema.md "Node
 # inheritance"), so not every entry in the flat mount plan is an actual
 # rclone mount -- an entry with no `remote` is either a plain directory
@@ -317,6 +338,7 @@
     - (item.local_path | dirname) != ''
     - not ((item.local_path | dirname) | stortree_path_masked(stortree_masked_mount_paths))
     - item.local_path not in stortree_mounts_already_mounted_paths
+  ignore_errors: true
   tags: [mounts]
 
 - name: Ensure every resolved mount point or plain directory exists
@@ -362,6 +384,7 @@
   loop_control:
     label: "{{ item.local_path or '(root)' }}"
   when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
+  ignore_errors: true
   tags: [mounts]
 
 - name: Ensure every per-user symlink's parent directory exists
@@ -390,6 +413,7 @@
   loop_control:
     label: "{{ item.local_path | dirname }}"
   when: not ((item.local_path | dirname) | stortree_path_masked(stortree_masked_mount_paths))
+  ignore_errors: true
   tags: [mounts]
 
 - name: Ensure every per-user symlink exists
@@ -412,6 +436,7 @@
   loop_control:
     label: "{{ item.local_path }}"
   when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
+  ignore_errors: true
   tags: [mounts]
 
 - name: Render systemd units for every resolved mount
