@@ -26,3 +26,17 @@
   notify: stortree sssd.conf changed
   no_log: true
   tags: [identity]
+
+- name: Ensure sssd is enabled and running
+  # The handler above only restarts sssd when this task's render is
+  # `changed` -- a host whose config already matched (e.g. sssd never got
+  # started after a fresh install, or the service died/was stopped some
+  # other way) would otherwise stay down indefinitely, since systemd
+  # doesn't retry a service on its own and nothing else in this role ever
+  # asks it to start. This runs unconditionally every apply so it
+  # self-heals regardless of why the service is down.
+  ansible.builtin.systemd_service:
+    name: sssd
+    enabled: true
+    state: started
+  tags: [identity]

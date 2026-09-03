@@ -22,12 +22,22 @@
 # community.general, not ansible-core, so that's what's actually used
 # here) rather than hand-patching /etc/pam.d/common-auth.
 #
-# `control` below (`[success=1 default=ignore]`) is Debian/Ubuntu's
-# pam-auth-update default for pam_sss.so's auth line. Verify it against
-# the target host's actual /etc/pam.d/common-auth before relying on
-# this in production -- pamd's `state: after` matches on
+# The auth-chain tasks below first remove any existing copy of the sync
+# script and force pam_unix/pam_winbind/pam_sss's `success=N` skip-counts
+# to the correct absolute values for this stack's shape, *then* insert the
+# sync script anchored on pam_sss's now-corrected control string
+# (`[success=2 default=ignore]`). This makes the whole sequence
+# self-healing: it converges to the same correct end state on a host
+# that's never been touched, one that's mid-way through the old broken
+# (pre-fix) config, and one that's already been fixed by a previous run.
+# See the comment on the jump-count task below for why the renumbering
+# matters at all -- pamd's `state: after`/`before` match on
 # (type, control, module_path) together, so a mismatched control value
-# means no insertion happens rather than a loud failure.
+# means no insertion happens rather than a loud failure, which is also
+# why the password-chain task below (still anchored on the *original*
+# `[success=1 user_unknown=ignore default=ignore]`) carries the exact
+# same latent bug as the auth chain did and needs the same fix once the
+# target host's actual /etc/pam.d/common-password is confirmed.
 #
 # `optional` (rather than pam_smbpass's old `sufficient`) is
 # deliberate: this module is a side effect, not a source of truth for
@@ -55,11 +65,50 @@
     mode: "0700"
   tags: [pam_smbpass]
 
+- name: Remove any previously-stacked sync script from the auth chain
+  # Idempotency safety net: makes the insertion below a clean re-add every
+  # run instead of relying on pamd's own duplicate detection, which is what
+  # let this line get inserted repeatedly (4x observed in the wild) across
+  # past applies.
+  community.general.pamd:
+    name: common-auth
+    type: auth
+    control: optional
+    module_path: pam_exec.so expose_authtok seteuid /usr/local/sbin/stortree-pam-smbpass-sync
+    state: absent
+  tags: [pam_smbpass]
+
+- name: Fix the pam_unix/pam_winbind/pam_sss jump counts so a success can't fall through into the sync script and pam_deny.so
+  # pamd's `after` (below) inserts a new line but never renumbers the
+  # `success=N` skip-counts on the lines before it. With the sync script
+  # sitting between pam_sss and pam_deny, the *original* pam-auth-update
+  # counts (3/2/1) fall one module short and land straight on
+  # `pam_deny.so requisite`, which unconditionally fails -- so a correct
+  # password was still being rejected. These force the absolute counts for
+  # this stack's known shape (pam_unix -> pam_winbind -> pam_sss -> sync
+  # script -> pam_deny -> pam_permit), matching on module_path only so they
+  # self-heal regardless of a host's current (broken or already-fixed)
+  # state. Re-verify these numbers if this stack ever gains/loses a
+  # provider.
+  community.general.pamd:
+    name: common-auth
+    type: auth
+    module_path: "{{ item.module_path }}"
+    new_control: "[success={{ item.success }} default=ignore]"
+    state: updated
+  loop:
+    - { module_path: "pam_unix.so nullok", success: 4 }
+    - { module_path: "pam_winbind.so krb5_auth krb5_ccache_type=FILE cached_login try_first_pass", success: 3 }
+    - { module_path: "pam_sss.so use_first_pass", success: 2 }
+  loop_control:
+    label: "{{ item.module_path }}"
+  tags: [pam_smbpass]
+
 - name: Stack the sync script into the auth chain, after pam_sss
   community.general.pamd:
     name: common-auth
     type: auth
-    control: "[success=1 default=ignore]"
+    control: "[success=2 default=ignore]"
     module_path: pam_sss.so
     new_type: auth
     new_control: optional
