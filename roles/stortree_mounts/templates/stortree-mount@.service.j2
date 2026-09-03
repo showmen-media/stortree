@@ -13,20 +13,25 @@ User={{ stortree_user }}
 Group={{ stortree_group }}
 {% set access = entry.access | default({}) %}
 {% set granted = access.owner is defined or access.group is defined %}
+{% set has_nested_children = entry.slug in stortree_mounts_parent_slugs %}
 {% set mount_path = (stortree_root ~ '/' ~ entry.local_path) if entry.local_path else stortree_root %}
 ExecStart=/usr/bin/rclone mount {{ entry.remote }} {{ mount_path }} \
 {% for k, v in entry.args.items() %}
   --{{ k }}{{ ' ' ~ (v | string) if (v is not sameas true) else '' }} \
 {% endfor %}
-{% if granted %}
+{% if granted or has_nested_children %}
   --allow-other \
   --dir-perms {{ access | stortree_access_mode }} \
   --file-perms {{ access | stortree_access_mode }} \
 {% if access.owner is defined %}
   --uid {{ stortree_user_uids[access.owner] }} \
+{% elif has_nested_children %}
+  --uid {{ stortree_uid }} \
 {% endif %}
 {% if access.group is defined %}
   --gid {{ stortree_group_gids[access.group] }} \
+{% elif has_nested_children %}
+  --gid {{ stortree_gid }} \
 {% endif %}
 {% endif %}
   --config {{ stortree_etc }}/rclone.conf

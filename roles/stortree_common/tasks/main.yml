@@ -58,6 +58,7 @@
     name: "{{ stortree_group }}"
     system: true
     state: present
+  register: stortree_group_created
   tags: [common]
 
 - name: Create the stortree service account
@@ -69,6 +70,19 @@
     create_home: false
     shell: /usr/sbin/nologin
     state: present
+  register: stortree_user_created
+  tags: [common]
+
+- name: Record the stortree account's own numeric uid/gid
+  # Needed by stortree_mounts to force consistent stortree:stortree
+  # ownership on a mount that other mounts nest inside (see that role's
+  # own comment on why) -- pulled straight from the create-account tasks'
+  # own registered result rather than a separate getent lookup, since
+  # they already resolve it as a side effect of ensuring the account
+  # exists.
+  ansible.builtin.set_fact:
+    stortree_uid: "{{ stortree_user_created.uid }}"
+    stortree_gid: "{{ stortree_group_created.gid }}"
   tags: [common]
 
 - name: Ensure the stortree service account has a home directory (peer_trust's authorized_keys lives under {{ stortree_home }}/.ssh)

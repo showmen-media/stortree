@@ -137,6 +137,32 @@
     stortree_mounts_plan: "{{ stortree | stortree_plan_mounts(stortree_group_members) }}"
   tags: [mounts]
 
+- name: Note which mounts have another mount nested inside them
+  # A mount that something else nests inside (`requires_slug` pointing
+  # back at it) needs consistent, predictable stortree:stortree ownership
+  # regardless of its own `access` grant -- every nested mount always
+  # runs as User=stortree (the unit template, unconditionally), so
+  # fusermount's own same-owner check for a *new* mount only ever
+  # succeeds against a parent path it can see itself owning. An
+  # *ungranted* parent has no such guarantee: its reported ownership,
+  # once actually mounted, is whatever its own remote backend happens to
+  # report (a third-party storage box's own arbitrary account, or -- for
+  # a peer-sftp mount -- the numeric uid the owning host's `stortree`
+  # account happens to have been allocated, never guaranteed to match
+  # this host's own) -- neither is reliably `stortree` from this host's
+  # point of view, and fusermount refuses ("bad mount point ...
+  # Permission denied") the moment it isn't. The template forces
+  # --uid/--gid/--allow-other for exactly the mounts in this set, on top
+  # of (never instead of) whatever their own `access` grant already adds.
+  ansible.builtin.set_fact:
+    stortree_mounts_parent_slugs: >-
+      {{ stortree_mounts_plan
+         | selectattr('requires_slug')
+         | map(attribute='requires_slug')
+         | unique
+         | list }}
+  tags: [mounts]
+
 - name: Find currently installed stortree mount units
   # Run before any path is touched below (see this file's header comment)
   # -- a path that's switching roles between runs (real per-user mount ->
