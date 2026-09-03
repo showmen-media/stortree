@@ -33,6 +33,38 @@
     autoremove: true
   tags: [samba]
 
+- name: Regenerate PAM profiles now that winbind is gone
+  # Removing libpam-winbind above does *not* retroactively clean up the
+  # pam_winbind.so lines it registered into common-{auth,account,password,
+  # session} via pam-auth-update on install -- those files are owned by
+  # libpam-runtime, not libpam-winbind, and nothing here observed forced
+  # its postrm to re-run pam-auth-update. A stale pam_winbind.so
+  # reference is at best noisy (PAM logs "unable to dlopen" and treats it
+  # as a faulty module); at worst -- as seen in common-account, whose
+  # `pam_unix.so` "Primary block" falls through into an unconditional
+  # `pam_deny.so requisite` for any LDAP-only user before ever reaching
+  # the real pam_sss.so check further down -- the file's structure is
+  # broken enough that hand-patching individual lines with pamd risks
+  # missing something. pam-auth-update itself knows how to correctly
+  # fold whichever profiles are actually installed (unix + sss, now that
+  # winbind's profile file is gone with the package) into all four
+  # common-* files, so let it do that instead of us reverse-engineering
+  # the correct shape for account/session by hand. `--force` is the
+  # documented non-interactive form (the same one package postinst/
+  # postrm scripts use), safe for unattended runs. This wipes any custom
+  # line stortree_pam_smbpass previously stacked into common-auth/
+  # common-password -- that role runs immediately after this one in
+  # site.yml's role order and re-inserts it idempotently every apply, so
+  # that's expected and harmless. Runs unconditionally (not gated on the
+  # removal task's changed-ness) so it also converges a host that already
+  # had winbind removed by an earlier apply, and self-heals against any
+  # future drift in these files -- idempotent from the system's
+  # perspective either way, since it always regenerates the same correct
+  # output from whichever profiles are currently installed.
+  ansible.builtin.command: pam-auth-update --force
+  changed_when: true
+  tags: [samba]
+
 - name: Render smb.conf (validated with testparm before it's written)
   ansible.builtin.template:
     src: smb.conf.j2
