@@ -132,6 +132,13 @@ For occasional `--limit`/`--tags` runs (tags: `facts`, `common`,
 either add dedicated templates per common case, or enable "Allow CLI args
 override" if your Semaphore version supports it.
 
+For the opt-in `mount-recover` tag (a masked root mount, see
+[runbook.md](runbook.md#recovering-a-masked-root-mount)), either enable
+"Allow CLI args override" so `--tags mount-recover,common,mounts --limit
+<host>` can be passed at run time, or add a dedicated one-off Task
+Template for it — it's deliberately excluded from every other template's
+normal tags (`never`), so it never fires unless asked for by name.
+
 ## Gotchas
 
 - **`host_key_checking = True`** in [ansible.cfg](../ansible.cfg) means

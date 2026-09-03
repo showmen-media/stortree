@@ -469,11 +469,23 @@ For a plain local directory, that's `ansible.builtin.file`'s
 `owner`/`group`/`mode` — real, standard Unix ownership, no `acl` package
 needed at all. For a remote-backed node, `stortree_mounts` renders the
 same three values into the rclone unit instead: with neither `owner` nor
-`group` granted, the unit omits `--allow-other`, so FUSE restricts the
-mount to the mounting user (`stortree`) and root — no SSH session or
-local process reaches it, for any user, full stop, and nothing overrides
-that for Samba either (`smbd` still runs as the real authenticated user,
-unchanged from stock behavior). With `owner` and/or `group` granted, the
+`group` granted, the unit takes `--allow-root` instead of `--allow-other`,
+so FUSE restricts the mount to the mounting user (`stortree`) and root
+specifically — no SSH session or local process reaches it, for any other
+user, full stop, and nothing overrides that for Samba either (`smbd`
+still runs as the real authenticated user, unchanged from stock
+behavior). Root's own access isn't incidental here: `stortree_common`
+and `stortree_mounts` both manage paths nested under a mount like this
+(most notably a client host's own root client mount, §1, which always
+resolves with no `access` grant) as root, and without `--allow-root`
+that's simply not possible — libfuse's default, with neither flag, is
+mounting-user-only, root included (`--allow-root` is what actually
+widens that, contrary to what "and root" might otherwise suggest holds
+by default). Both `--allow-other` and `--allow-root` additionally
+require `user_allow_other` in `/etc/fuse.conf` (`stortree_mounts`
+ensures it's set before rendering or restarting any unit) — libfuse
+refuses either option outright from a non-root mounting process without
+it, root's own access included. With `owner` and/or `group` granted, the
 unit instead adds `--allow-other` back and uid/gid-owns the mount
 directly (`--uid`/`--gid`, resolved from the same `getent passwd`/`getent
 group` lookups `stortree_secrets` already runs for %U-expansion below —

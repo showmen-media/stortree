@@ -4,6 +4,55 @@
 # LDAP/SSSD -- it exists purely to own mount processes and any
 # peer-to-peer SSH relationship, independent of any human identity.
 
+- name: Detect whether the root mount is active but unreachable to root
+  # Opt-in recovery (tags: never -- only runs when a run is explicitly
+  # invoked with --tags mount-recover) for one specific stuck state: a
+  # whole-tree root client mount (local_path == "", spec.md §1) that's
+  # already active from a past apply, rendered before this host's
+  # stortree-mount@.service.j2 gained --allow-root, and therefore still
+  # reachable only to the mounting user (stortree) -- root included, on
+  # a host whose own root lacks CAP_SYS_ADMIN (unprivileged LXC, this
+  # codebase's own worked example of it). A plain apply can never fix
+  # this on its own even though the render step below would correctly
+  # notice the unit file changed and restart it: that restart -- and the
+  # `stortree_root not in ansible_facts.mounts` skip immediately below,
+  # which is what makes an already-*working* mount harmless to leave
+  # alone -- both live too late in the run to help, well after
+  # stortree_mounts' own path-creation tasks below have already tried
+  # (and failed outright, root unable to see anything under the stale
+  # mount, not just `stortree_root` itself) to reach paths nested inside
+  # it. `ansible.builtin.stat` raises rather than reporting `exists:
+  # false` on anything but ENOENT (see its own source), so a masked
+  # mount surfaces here as this task failing, not as a clean result --
+  # `ignore_errors` is what lets that failure become the very signal the
+  # next task acts on instead of aborting the run.
+  ansible.builtin.stat:
+    path: "{{ stortree_root }}"
+  register: stortree_root_stat
+  ignore_errors: true
+  when: stortree_root in (ansible_facts.mounts | map(attribute='mount') | list)
+  tags: [never, mount-recover]
+
+- name: Stop the root mount so it can be recreated with the correct access flags
+  # Unmounts (ExecStop in stortree-mount@.service.j2 runs as `stortree`,
+  # the mount's own owner, never as root -- so this succeeds even though
+  # root couldn't reach the mount's contents at all, detected above) so
+  # every task below sees a plain, empty, fully accessible
+  # `stortree_root` again: stortree_common's own root-directory task
+  # (skipped otherwise, once something's mounted there) and every
+  # nested path stortree_mounts creates under it both need that. The
+  # unit stays down only for the rest of this run's own path-creation
+  # tasks -- stortree_mounts' own render/restart-if-changed and final
+  # enable-and-start tasks bring it back up with --allow-root live,
+  # this time actually reachable.
+  ansible.builtin.systemd_service:
+    name: stortree-mount@root.service
+    state: stopped
+  when:
+    - stortree_root in (ansible_facts.mounts | map(attribute='mount') | list)
+    - stortree_root_stat is failed
+  tags: [never, mount-recover]
+
 - name: Create the stortree group
   ansible.builtin.group:
     name: "{{ stortree_group }}"
