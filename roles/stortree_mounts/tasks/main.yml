@@ -251,6 +251,33 @@
          | list }}
   tags: [mounts]
 
+- name: Note which resolved mount points are already active and reachable
+  # A live mount's own directory needs nothing further from this file --
+  # it already exists, correctly owned, or it couldn't have mounted in
+  # the first place. Its *parent* is exactly what the next task would
+  # otherwise re-touch on every single apply from here on, and doing
+  # that once something's actually mounted several levels beneath it
+  # (a nested remote-backed entry, e.g. a peer-sourced samba descendant
+  # under a top-level subtree) has turned out to be unsafe against at
+  # least one backend in production: an SMB share choked with a bare
+  # I/O error re-stat'ing a plain directory that had a live, unrelated
+  # FUSE mount sitting inside it -- a working config that had applied
+  # clean once broke on every subsequent run purely from touching that
+  # parent again, nothing about the resolved plan having changed at
+  # all. Skip ever revisiting an already-mounted entry's own parent
+  # (next task) -- it was necessarily created and correctly owned
+  # whenever the mount itself first came up; nothing about a `remote`
+  # entry's own parent ownership is meant to change afterward anyway
+  # (always stortree:stortree 0750, this file's header comment).
+  ansible.builtin.set_fact:
+    stortree_mounts_already_mounted_paths: >-
+      {{ stortree_mount_point_probe.results
+         | rejectattr('failed')
+         | selectattr('stat.exists')
+         | map(attribute='item.local_path')
+         | list }}
+  tags: [mounts]
+
 - name: Ensure every mount point's parent directory exists
   # A `group`-only grant's real, shared mount resolves its %U-templated
   # path through SHARED_MOUNT_SEGMENT (".mounts", per_user_mount_path())
@@ -272,6 +299,11 @@
   # an ordinary ancestor node too, since that node's own explicit entry
   # (processed in the very same apply) corrects anything this leaves too
   # permissive, exactly as it already did before this task existed.
+  #
+  # Skipped entirely once the entry itself is already actively mounted
+  # (`stortree_mounts_already_mounted_paths`, set above) -- see that
+  # task's own comment for why re-touching an already-mounted entry's
+  # parent, every single apply from here on, isn't safe to keep doing.
   ansible.builtin.file:
     path: "{{ stortree_root ~ '/' ~ (item.local_path | dirname) }}"
     state: directory
@@ -284,6 +316,7 @@
   when:
     - (item.local_path | dirname) != ''
     - not ((item.local_path | dirname) | stortree_path_masked(stortree_masked_mount_paths))
+    - item.local_path not in stortree_mounts_already_mounted_paths
   tags: [mounts]
 
 - name: Ensure every resolved mount point or plain directory exists

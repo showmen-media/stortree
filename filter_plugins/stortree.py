@@ -929,6 +929,18 @@ def plan_mounts(resolved, group_members=None):
                 best = other
         e["requires_slug"] = best["slug"] if best else None
 
+    # Shallowest paths first (stable sort -- ties keep their original
+    # relative order): stortree_mounts creates every path one directory
+    # level at a time, in this order, never relying on implicit
+    # multi-level recursive creation for a path whose own ancestors don't
+    # exist yet -- not every backend's mkdir handles that the way a local
+    # filesystem or SFTP does (an SMB share, in production, silently
+    # errored trying to create two missing levels -- `home` and the
+    # synthetic `.mounts` segment beneath it -- in one implicit step,
+    # while creating either one alone, from an already-existing parent,
+    # worked fine).
+    entries.sort(key=lambda e: e["local_path"].count("/"))
+
     return entries
 
 

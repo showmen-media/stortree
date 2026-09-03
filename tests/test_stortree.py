@@ -1057,3 +1057,15 @@ def test_plan_mounts_slug_distinguishes_hyphen_from_nesting():
     by_local_path = {e["local_path"]: e for e in plan}
 
     assert by_local_path["tree/media-prod"]["slug"] != by_local_path["tree/media/prod"]["slug"]
+
+
+def test_plan_mounts_orders_entries_shallowest_first():
+    # stortree_mounts creates every path one directory level at a time,
+    # in this order -- a deeper entry (more "/"-separated segments) must
+    # never appear before a shallower one, or a backend that can't create
+    # two missing levels in one implicit step (an SMB share, in
+    # production) fails outright creating the deeper one first.
+    r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
+    plan = plan_mounts(r, {"Michael Whitfield Family": ["mike"]})
+    depths = [e["local_path"].count("/") for e in plan]
+    assert depths == sorted(depths)
