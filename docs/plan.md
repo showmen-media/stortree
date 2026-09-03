@@ -57,7 +57,15 @@ implementation:
    why `access` is always a single object rather than a list of grants —
    a later revision of this same interpretation call, once it became
    clear a remote-backed node can never carry more than one principal's
-   worth of real enforcement anyway).
+   worth of real enforcement anyway). Revisited once more for a
+   remote-backed, `group`-only descendant specifically: every member's
+   enforcement is identical (one gid, one mode — never varies per
+   member), so mounting the same remote path once per member was pure
+   duplication (N redundant rclone procs/VFS caches of the same
+   content). `stortree_plan_mounts` now resolves that case to one real,
+   shared mount plus one symlink per member instead (spec.md §6,
+   `per_user_mount_path()` in `filter_plugins/stortree.py`) — an `owner`
+   grant is unaffected, since it was already exactly one real mount.
 3. **Molecule shared `full-tree` scenario location.** Not specified in
    spec.md. Resolved to: `molecule/full-tree/` at repo root (the
    conventional layout for a cross-role scenario, vs. each role's own

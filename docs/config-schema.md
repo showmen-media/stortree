@@ -233,6 +233,14 @@ Same map-of-`name -> node` shape, but they resolve differently:
   into one folder per member. See "Access" below for how that grant then
   gets enforced, which differs for a descendant with its own
   `rclone.remote` (`media-prod`) versus one without (`sys-configs`).
+  For a remote-backed, `group`-only descendant specifically (`mw-fam`,
+  `whitfield-media`, `media-prod`), every member's folder is a symlink
+  to one real, shared mount rather than a separate mount of its own —
+  every member gets the exact same enforcement either way (one gid, one
+  mode), so mounting the same remote path once per member would just be
+  N redundant copies of identical content; see spec.md §6 for the
+  mechanism. `sys-configs` (`owner`-only) has no such sharing to do — an
+  `owner` grant always was, and still is, one folder for one person.
 
 ### Access
 

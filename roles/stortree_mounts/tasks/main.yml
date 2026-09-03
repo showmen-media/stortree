@@ -2,27 +2,54 @@
 # One rclone-mount@<slug>.service per resolved mount (server subtree,
 # client mount, or peer-sourced samba descendant this host doesn't own --
 # mesh-sourced directly from whichever host actually owns it, spec.md
-# §1/§2), expanding user-subdirs entries into one mount per authorized
-# user (spec.md §2, docs/plan.md interpretation call #2).
+# §1/§2), resolving a user-subdirs entry's %U-templated path against its
+# own `access` grant (spec.md §2, docs/plan.md interpretation call #2):
+# an `owner` grant still gets one real mount at that one user's own path;
+# a `group`-only grant instead gets exactly one real, shared mount (at
+# `stortree_plan_mounts`' hidden `.mounts` path for that node) plus one
+# symlink per member fanning it back out to each member's own folder --
+# see `per_user_mount_path()` in filter_plugins/stortree.py for why one
+# mount now serves every member instead of one full duplicate each
+# (N members used to mean N redundant rclone procs/VFS caches of
+# identical content, with no cache coherency between them, even though
+# the access grant behind every one of those duplicates was always the
+# same single group).
 # Ansible's own idempotence (template only rewrites on change,
-# systemd_service only touches state that's out of sync) covers what a
-# hand-rolled reconciler would otherwise need to implement; only the
-# "stale unit no longer in the resolved set" case needs an explicit
-# cleanup step below.
+# systemd_service only touches state that's out of sync) covers most of
+# what a hand-rolled reconciler would otherwise need to implement -- but
+# not quite all of it: `systemd_service: state: started` is a no-op for
+# a unit that's already active, so a changed ExecStart alone never
+# reaches an already-running mount without an explicit restart (below);
+# and a "stale unit no longer in the resolved set" needs an explicit
+# cleanup step too -- run *before* path creation below, not after: a
+# node that used to be a real per-user mount (before this host had any
+# `.mounts`-collapsed group grant, or before a member left a group) and
+# is now a symlink's target has to have its old per-user unit stopped
+# and unmounted first, or turning that still-busy mountpoint directory
+# into a symlink fails outright ("Device or resource busy").
 #
 # `rclone` never inherits down the tree (docs/config-schema.md "Node
 # inheritance"), so not every entry in the flat mount plan is an actual
-# rclone mount -- an entry with no `remote` is a plain directory that has
-# to exist (either nested inside an ancestor's mount, or kept as real
-# local storage on its resolved host) but has no rclone unit of its own;
+# rclone mount -- an entry with no `remote` is either a plain directory
+# that has to exist (either nested inside an ancestor's mount, or kept as
+# real local storage on its resolved host) or a per-user symlink fanning
+# a `group`-only node's one shared mount back out to a member's own
+# folder (`symlink_target` set) -- neither has an rclone unit of its own;
 # only entries with a `remote` get one below.
 #
-# Every resolved path -- mount point or plain directory alike -- gets its
-# Unix owner/group/mode set from its own `access` grant (spec.md §6,
-# stortree_access_owner/_group/_mode): with neither `owner` nor `group`
-# granted, that's the plain default (owner stortree, full control; group
-# stortree, read+traverse; other none) every path had before `access`
-# existed. A remote-backed node's mount additionally omits --allow-other
+# Every resolved path -- mount point, plain directory, or per-user
+# symlink alike -- gets its Unix owner/group/mode set from its own
+# `access` grant (spec.md §6, stortree_access_owner/_group/_mode): with
+# neither `owner` nor `group` granted, that's the plain default (owner
+# stortree, full control; group stortree, read+traverse; other none)
+# every path had before `access` existed. A symlink entry carries no
+# `access` of its own (it's enforced once, at the real mount its target
+# points to) and skips ownership/mode entirely -- a symlink's own mode
+# bits are meaningless on Linux (always reported as 0777, kernel-ignored
+# when following it), and touching them risks an Ansible `file` chmod
+# following the link through to the real mount's target instead, which
+# would silently clobber the real enforcement this whole file exists to
+# set up. A remote-backed node's mount additionally omits --allow-other
 # unless `access` grants an owner and/or group (rendered unconditionally
 # below, from the same three filters, so the two always agree): without
 # it, FUSE restricts a mount to the mounting user (stortree) and root --
@@ -55,55 +82,19 @@
   # runs before this role -- site.yml §8) covers every group referenced
   # in a per-user access grant, whether this host owns the node
   # (server_subtrees) or peer-sources it (peer_dependencies) -- both get
-  # %U-expanded here into one mount per actual user.
+  # %U-resolved here into either one real mount per authorized user
+  # (an `owner` grant) or one shared mount plus one symlink per member
+  # (a `group`-only grant).
   ansible.builtin.set_fact:
     stortree_mounts_plan: "{{ stortree | stortree_plan_mounts(stortree_group_members) }}"
   tags: [mounts]
 
-- name: Ensure every resolved path exists (mount points and plain directories alike)
-  # Ownership/mode come from the path's own `access` grant, not a fixed
-  # default -- see this file's header comment. Harmless to set on a
-  # remote-backed entry's mountpoint too: once mounted, the mount's own
-  # reported permissions (rendered into the unit below, from the same
-  # three filters) are all that's actually visible there.
-  ansible.builtin.file:
-    path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
-    state: directory
-    owner: "{{ item.access | stortree_access_owner(stortree_user) }}"
-    group: "{{ item.access | stortree_access_group(stortree_group) }}"
-    mode: "{{ item.access | stortree_access_mode }}"
-  loop: "{{ stortree_mounts_plan }}"
-  loop_control:
-    label: "{{ item.local_path or '(root)' }}"
-  tags: [mounts]
-
-- name: Render systemd units for every resolved mount
-  ansible.builtin.template:
-    src: stortree-mount@.service.j2
-    dest: "/etc/systemd/system/stortree-mount@{{ entry.slug }}.service"
-    mode: "0644"
-  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
-  loop_control:
-    loop_var: entry
-    label: "{{ entry.local_path or '(root)' }}"
-  notify: stortree mounts changed
-  tags: [mounts]
-
-- name: Flush handlers so newly rendered units are known to systemd before enabling
-  ansible.builtin.meta: flush_handlers
-  tags: [mounts]
-
-- name: Enable and start every resolved mount
-  ansible.builtin.systemd_service:
-    name: "stortree-mount@{{ item.slug }}.service"
-    enabled: true
-    state: started
-  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
-  loop_control:
-    label: "{{ item.local_path or '(root)' }}"
-  tags: [mounts]
-
 - name: Find currently installed stortree mount units
+  # Run before any path is touched below (see this file's header comment)
+  # -- a path that's switching roles between runs (real per-user mount ->
+  # symlink, most notably) needs its old unit stopped and unmounted
+  # *before* stortree_mounts_plan's new shape is applied to disk, not
+  # after.
   ansible.builtin.find:
     paths: /etc/systemd/system
     patterns: "stortree-mount@*.service"
@@ -134,4 +125,93 @@
     state: absent
   loop: "{{ stortree_mounts_stale_units }}"
   notify: stortree mounts changed
+  tags: [mounts]
+
+- name: Flush handlers so stale-unit removal is known to systemd before path creation
+  ansible.builtin.meta: flush_handlers
+  tags: [mounts]
+
+- name: Ensure every resolved mount point or plain directory exists
+  # Ownership/mode come from the path's own `access` grant, not a fixed
+  # default -- see this file's header comment. Harmless to set on a
+  # remote-backed entry's mountpoint too: once mounted, the mount's own
+  # reported permissions (rendered into the unit below, from the same
+  # three filters) are all that's actually visible there.
+  ansible.builtin.file:
+    path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
+    state: directory
+    owner: "{{ item.access | stortree_access_owner(stortree_user) }}"
+    group: "{{ item.access | stortree_access_group(stortree_group) }}"
+    mode: "{{ item.access | stortree_access_mode }}"
+  loop: "{{ stortree_mounts_plan | rejectattr('symlink_target') | list }}"
+  loop_control:
+    label: "{{ item.local_path or '(root)' }}"
+  tags: [mounts]
+
+- name: Ensure every per-user symlink exists
+  # Fans a `group`-only node's one real, shared mount back out to each
+  # authorized member's own folder (stortree_plan_mounts' symlink_target,
+  # docs/config-schema.md "subdirs vs user-subdirs") -- `force: true`
+  # since the target of this exact path used to be a real per-user
+  # mountpoint directory before this feature existed (or before a member
+  # joined the group): the stale-unit cleanup above already stopped and
+  # unmounted it, but the now-empty directory it leaves behind still has
+  # to be replaced with a symlink, which plain `state: link` refuses to
+  # do on its own. No owner/group/mode set here -- see this file's header
+  # comment for why a symlink carries none of its own.
+  ansible.builtin.file:
+    path: "{{ stortree_root ~ '/' ~ item.local_path }}"
+    state: link
+    src: "{{ stortree_root ~ '/' ~ item.symlink_target }}"
+    force: true
+  loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
+  loop_control:
+    label: "{{ item.local_path }}"
+  tags: [mounts]
+
+- name: Render systemd units for every resolved mount
+  ansible.builtin.template:
+    src: stortree-mount@.service.j2
+    dest: "/etc/systemd/system/stortree-mount@{{ entry.slug }}.service"
+    mode: "0644"
+  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
+  loop_control:
+    loop_var: entry
+    label: "{{ entry.local_path or '(root)' }}"
+  register: stortree_mounts_units_rendered
+  notify: stortree mounts changed
+  tags: [mounts]
+
+- name: Flush handlers so newly rendered units are known to systemd before enabling
+  ansible.builtin.meta: flush_handlers
+  tags: [mounts]
+
+- name: Restart any mount whose unit file actually changed
+  # A changed ExecStart (new rclone args, or access-driven --allow-other/
+  # --uid/--gid/--dir-perms/--file-perms, spec.md §6) never takes effect
+  # on an already-running unit otherwise: systemd_service: state: started
+  # below is a no-op once a unit is already active, and daemon-reload
+  # (the "stortree mounts changed" handler above) only makes systemd
+  # aware the *file* changed, not the running process -- it keeps running
+  # with whatever args it originally started with, silently stale, until
+  # something restarts it. Scoped to just the units that actually
+  # re-rendered (register above), not every resolved mount, so an
+  # unrelated mount's open file handles aren't disrupted on every apply.
+  ansible.builtin.systemd_service:
+    name: "stortree-mount@{{ item.entry.slug }}.service"
+    state: restarted
+  loop: "{{ stortree_mounts_units_rendered.results }}"
+  loop_control:
+    label: "{{ item.entry.local_path or '(root)' }}"
+  when: item.changed
+  tags: [mounts]
+
+- name: Enable and start every resolved mount
+  ansible.builtin.systemd_service:
+    name: "stortree-mount@{{ item.slug }}.service"
+    enabled: true
+    state: started
+  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
+  loop_control:
+    label: "{{ item.local_path or '(root)' }}"
   tags: [mounts]

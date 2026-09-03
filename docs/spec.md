@@ -241,11 +241,13 @@ mount <remote> <path> <merged args...>`, `Restart=on-failure`,
 under another — skipping over any remote-less ancestor in between, since
 those have no unit of their own to require), using the `template` module
 plus `systemd_service` (`daemon_reload: true`, `enabled`/`state:
-started`). Every entry in the plan, mount or not, still gets its local
-directory created (`ansible.builtin.file`) — a remote-less entry is a
-plain directory that has to exist (nested inside a mounted ancestor, or
-as real local storage on its own resolved host if not), it just gets no
-rclone unit.
+started`). Every entry in the plan gets something created on disk: a
+remote-less entry is a plain directory that has to exist (nested inside a
+mounted ancestor, or as real local storage on its own resolved host if
+not), and gets no rclone unit; a per-user symlink entry (§6 — the
+per-member fan-out for a `group`-only grant) is neither a mount nor a
+plain directory, just a link back to the one real mount its node
+resolved to, and gets no unit either.
 
 Every peer dependency (§1) becomes one of these mount entries too, not
 just the root client mount — a samba descendant this host doesn't own is
@@ -269,10 +271,20 @@ unlike a server_subtrees entry with no remote (§1 "Node inheritance"),
 where the owning host already has the data locally and needs no mount to
 reach it.
 
-A per-user peer dependency's %U template is expanded here the same way a
-per-user server_subtrees node's is — one mount per user actually granted
-access, using `stortree_group_members` (see §6 for where that fact comes
-from).
+A per-user peer dependency's %U template is resolved here the same way a
+per-user server_subtrees node's is — see §6 for the full mechanism, using
+`stortree_group_members` (§6 for where that fact comes from): an `owner`
+grant still gets one real mount at that one user's own path; a
+`group`-only grant instead gets exactly one real, shared mount (at a
+hidden `.mounts` path standing in for `%U`) plus one symlink per member
+fanning it back out to each member's own folder, rather than one full
+duplicate mount per member. `stortree_mounts` computes this for both
+server_subtrees and peer_dependencies alike (`stortree_plan_mounts` in
+`filter_plugins/stortree.py`), so a peer sources the owning host's real,
+shared path directly — that's the only place real content for a
+`group`-only grant ever actually lives on the owning host's own disk, the
+same way its own per-member paths are symlinks rather than mounts there
+too.
 
 Ansible's own idempotence covers what a hand-rolled reconciler would
 otherwise have to implement: `template` only rewrites a unit file when its
@@ -281,9 +293,14 @@ enabled/running state when it's out of sync — so a stale mount that's no
 longer in the resolved tree still needs an explicit cleanup step (the role
 also lists `/etc/systemd/system/stortree-mount-*.service`, diffs it
 against the currently-resolved unit names, and removes/`daemon-reload`s
-any that are no longer wanted). systemd itself handles restart policy,
-resource limits, and logging (journald) for the `rclone mount` process
-once the unit is in place.
+any that are no longer wanted). This cleanup runs *before* any path on
+disk is touched, not after — a path that's switching from a real per-user
+mount to a symlink (a member's own folder, once a `group`-only grant
+collapses to a shared mount) needs its stale unit stopped and unmounted
+first, or turning that still-busy mountpoint into a symlink fails
+outright. systemd itself handles restart policy, resource limits, and
+logging (journald) for the `rclone mount` process once the unit is in
+place.
 
 ### 3. Secrets handling
 
@@ -316,11 +333,13 @@ empty local path — the section's `path` is root_host's own
 `/srv/stortree`, and the client's mount unit references the synthesized
 section's bare name (mounting that remote's own root, same convention as
 a bare `rclone.remote` section name) instead of the tree's third-party
-`rclone.remote` value. A per-user peer dependency's %U gets expanded into
-one section per actual user here too, exactly the way `stortree_mounts`
-(§2) independently expands the same entry into one mount per user — both
-have to agree on the expanded (not templated) path to name the section
-the same way, so `stortree_secrets` is the one role that resolves
+`rclone.remote` value. A per-user peer dependency's %U gets resolved to a
+single real path here too, exactly the way `stortree_mounts` (§2, §6)
+independently resolves the same entry to its own one real mount — an
+owner grant's own path, or a group-only grant's one shared `.mounts`
+path, never one section per member — both have to agree on that resolved
+(not templated) path to name the section the same way, so
+`stortree_secrets` is the one role that resolves
 `stortree_group_members`/`stortree_group_gids`/`stortree_user_uids` (§6)
 fresh via `getent`, first in `site.yml`'s order among the roles that need
 them; `stortree_mounts` reuses those same facts rather than re-deriving
@@ -517,6 +536,38 @@ scoped to `server_subtrees` only, so a client-only host with no
 server_subtrees of its own — like `some-storage-gadget` in the worked
 example — never resolved the groups its peer-sourced per-user shares
 actually needed).
+
+`access_grant_usernames()` says *who* gets a folder; `per_user_mount_path()`
+says *where the real content actually lives*, and the two only disagree
+for a `group`-only grant. An `owner` grant's one user is also where the
+one real mount goes — nothing to share, since it was only ever for that
+one person. A `group`-only grant's members, though, were always going to
+get identical enforcement (the same gid, the same mode — `access_mode()`/
+`access_group()` don't vary per member, only per node), so giving each of
+them a full, independent rclone mount of the same remote path was pure
+duplication: N members meant N separate FUSE processes and N separate VFS
+caches of the exact same bytes, with no cache coherency between them
+(one member's write wouldn't show up in another's cache until its own
+`dir-cache-time`/`vfs-cache-*` expired). `stortree_plan_mounts` instead
+resolves a `group`-only node's %U to one shared, hidden path
+(`SHARED_MOUNT_SEGMENT` — `.mounts`, matching this tree's existing
+dot-prefixed hidden-subtree convention, e.g. `.cache`) and mounts it
+exactly once there, gid-owned exactly as before; every actual member's
+own folder becomes a plain Unix symlink to that one real mount instead of
+a second mount. The symlink itself carries no `access` of its own and
+gets no ownership/mode applied (a symlink's mode bits are meaningless on
+Linux, and setting them risks an `ansible.builtin.file` chmod following
+the link through to the real mount instead) — enforcement lives entirely
+at the one real mount, same uid/gid/mode as always, and every member's
+symlink reaches it identically. Samba follows the symlink transparently:
+by default (`wide links = no`) Samba refuses a symlink that resolves
+*outside* the exporting share's own path, but `home/<user>/mw-fam` ->
+`home/.mounts/mw-fam` stays inside the same `home` share the whole way,
+so no `smb.conf` change is needed for this to work. A peer-sourced
+`group`-only descendant (§2/§3) resolves the exact same way on the
+*owning* host first, so a peer never has anything to source but that one
+real, shared path — there's nothing at a per-member path on the owning
+host's own disk for a `group`-only grant, symlink included.
 
 The optional `sshd_config` fragment (`stortree_sshd`, only runs when
 `stortree/sshd_config` is present in the repo) is templated to

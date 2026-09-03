@@ -16,6 +16,7 @@ from filter_plugins.stortree import (
     mount_unit_names,
     needed_groups,
     needed_users,
+    per_user_mount_path,
     plan_mounts,
     resolve,
     samba_access_tokens,
@@ -438,6 +439,39 @@ def test_filter_rclone_conf_expands_per_user_peer_sections():
     assert "peer-host-b-home-pctU-sys-configs" not in out
 
 
+def test_filter_rclone_conf_group_only_peer_section_collapses_to_one():
+    # a `group`-only per-user peer dependency gets exactly one synthesized
+    # sftp section, at the owning host's own shared mount path -- not one
+    # per member (plan_mounts()'s matching collapse; the owning host's
+    # disk genuinely has nothing at a per-member path for this grant, so a
+    # per-member section here would point sftp at a path that doesn't
+    # exist)
+    resolved = {
+        "server_subtrees": [],
+        "client_mounts": [],
+        "samba_shares": [],
+        "peer_dependencies": [
+            {
+                "owning_host": "host-b",
+                "local_path": "home/%U/mw-fam",
+                "remote_path": "home/%U/mw-fam",
+                "samba_node": "home",
+                "per_user": True,
+                "access": {"group": "Michael Whitfield Family", "permissions": "rwx"},
+            }
+        ],
+    }
+    hostvars = {"host-b": {"ansible_host": "10.0.0.2"}}
+    group_members = {"Michael Whitfield Family": ["mike", "dana", "jd"]}
+
+    out = filter_rclone_conf(MASTER_INI, resolved, hostvars, group_members)
+
+    assert "[peer-host-b-home-.mounts-mw-fam]" in out
+    assert "path = /srv/stortree/home/.mounts/mw-fam" in out
+    for user in ("mike", "dana", "jd"):
+        assert f"home-{user}-mw-fam" not in out
+
+
 # -- group_members_from_getent / access_grant_usernames / needed_groups ---
 
 
@@ -601,6 +635,28 @@ def test_access_grant_usernames_empty_access_expands_to_nobody():
     assert access_grant_usernames(None, {"g": ["mike"]}) == []
 
 
+def test_per_user_mount_path_owner_grant_resolves_to_that_owner():
+    access = {"owner": "jd", "permissions": "rwx"}
+    assert per_user_mount_path("home/%U/sys-configs", access) == "home/jd/sys-configs"
+
+
+def test_per_user_mount_path_owner_and_group_still_resolves_to_the_owner():
+    access = {"owner": "jd", "group": "g", "permissions": "rwx"}
+    assert per_user_mount_path("home/%U/sys-configs", access) == "home/jd/sys-configs"
+
+
+def test_per_user_mount_path_group_only_resolves_to_the_shared_segment():
+    access = {"group": "Michael Whitfield Family", "permissions": "rwx"}
+    assert per_user_mount_path("home/%U/mw-fam", access) == "home/.mounts/mw-fam"
+
+
+def test_per_user_mount_path_no_grant_also_resolves_to_the_shared_segment():
+    # unreachable via plan_mounts() (access_grant_usernames() returns no
+    # one to expand for, so no entry is ever built with this path at all)
+    # but per_user_mount_path() itself has no reason to special-case it.
+    assert per_user_mount_path("home/%U/x", {}) == "home/.mounts/x"
+
+
 # -- plan_mounts -----------------------------------------------------------
 
 
@@ -614,27 +670,77 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
     plan = plan_mounts(r, group_members)
     by_local_path = {e["local_path"]: e for e in plan}
 
-    # per-user node mw-fam (access.group: Michael Whitfield Family)
-    # expands to one mount per resolved member
+    # per-user node mw-fam (access.group: Michael Whitfield Family) --
+    # `group`-only, so every member's own folder is a symlink back to one
+    # shared mount (per_user_mount_path()), not a mount of its own
     assert "home/mike/mw-fam" in by_local_path
+    assert by_local_path["home/mike/mw-fam"]["remote"] is None
+    assert by_local_path["home/mike/mw-fam"]["symlink_target"] == "home/.mounts/mw-fam"
     assert "home/%U/mw-fam" not in by_local_path
+    assert by_local_path["home/.mounts/mw-fam"]["remote"] == "some-remote:/fam"
 
     # whitfield-media (access.group: Whitfield Family & Friends) is its
-    # own, separate node -- mike gets a mount there too, via his own
+    # own, separate node -- mike gets a symlink there too, via his own
     # membership in that group, not via mw-fam's
-    assert "home/mike/whitfield-media" in by_local_path
-    assert "home/dana/whitfield-media" in by_local_path
-    # but nobody unresolvable (no group_members entry) gets one
+    assert by_local_path["home/mike/whitfield-media"]["symlink_target"] == "home/.mounts/whitfield-media"
+    assert by_local_path["home/dana/whitfield-media"]["symlink_target"] == "home/.mounts/whitfield-media"
+    # only one real mount backs both of them
+    assert by_local_path["home/.mounts/whitfield-media"]["remote"] == "some-remote:/media"
+    # but nobody unresolvable (no group_members entry) gets a symlink
     assert not any(
         p.startswith("home/") and p.endswith("/whitfield-media")
-        and p not in ("home/mike/whitfield-media", "home/dana/whitfield-media")
+        and p not in (
+            "home/mike/whitfield-media",
+            "home/dana/whitfield-media",
+            "home/.mounts/whitfield-media",
+        )
         for p in by_local_path
     )
 
     # bravo's client mount (root, local_path "") nests everything under it
     root_slug = by_local_path[""]["slug"]
     assert by_local_path[".cache/storage-node-bravo"]["requires_slug"] == root_slug
-    assert by_local_path["home/mike/mw-fam"]["requires_slug"] == root_slug
+    assert by_local_path["home/.mounts/mw-fam"]["requires_slug"] == root_slug
+
+
+def test_plan_mounts_group_only_per_user_node_collapses_to_one_mount():
+    # the redundancy this whole mechanism exists to avoid: without it, 3
+    # resolved members of the same group would mean 3 separate rclone
+    # mounts of the exact same remote path (3x the VFS cache, 3
+    # processes, no cache coherency between them) even though the access
+    # grant backing all 3 is identical -- one real, group-gid-owned mount
+    # plus 3 symlinks does the same job.
+    r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
+    group_members = {
+        "Whitfield Family & Friends": ["mike", "dana", "jd"],
+        "Michael Whitfield Family": [],
+    }
+    plan = plan_mounts(r, group_members)
+
+    real_mounts = [
+        e for e in plan if e["local_path"] == "home/.mounts/whitfield-media"
+    ]
+    assert len(real_mounts) == 1
+    real_mount = real_mounts[0]
+    assert real_mount["remote"] == "some-remote:/media"
+    assert real_mount["symlink_target"] is None
+    assert real_mount["access"] == {
+        "group": "Whitfield Family & Friends",
+        "permissions": "rx",
+    }
+
+    symlinks = {e["local_path"]: e for e in plan if e["symlink_target"]}
+    for user in ("mike", "dana", "jd"):
+        link = symlinks[f"home/{user}/whitfield-media"]
+        assert link["remote"] is None
+        assert link["symlink_target"] == "home/.mounts/whitfield-media"
+        # access is enforced once, at the real mount -- the symlink itself
+        # carries none of its own
+        assert link["access"] == {}
+
+    # a group with no resolved members gets no mount and no symlinks at all
+    assert "home/.mounts/mw-fam" not in {e["local_path"] for e in plan}
+    assert not any(e["local_path"].endswith("/mw-fam") for e in plan)
 
 
 def test_plan_mounts_entries_carry_access_for_ownership_and_mode():
@@ -654,10 +760,14 @@ def test_plan_mounts_entries_carry_access_for_ownership_and_mode():
         "owner": "jd",
         "permissions": DEFAULT_ACCESS_PERMISSIONS,
     }
-    assert by_local_path["home/alex/media-prod"]["access"] == {
+    # media-prod is `group`-only -- its own access grant lives on the one
+    # real, shared mount now (per_user_mount_path()), not on alex's symlink
+    assert by_local_path["home/.mounts/media-prod"]["access"] == {
         "group": "Media Production",
         "permissions": DEFAULT_ACCESS_PERMISSIONS,
     }
+    assert by_local_path["home/alex/media-prod"]["access"] == {}
+    assert by_local_path["home/alex/media-prod"]["symlink_target"] == "home/.mounts/media-prod"
     assert by_local_path["backups"]["access"] == {}
 
 
@@ -683,13 +793,22 @@ def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
     sys_configs = by_local_path["home/jd/sys-configs"]
     assert sys_configs["remote"] == "peer-storage-node-alpha-home-jd-sys-configs:/srv/stortree/home/jd/sys-configs"
 
-    # bravo-owned, per-user, sourced directly from bravo -- not relayed
-    # through alpha (root_host), preserving the mesh
+    # bravo-owned, per-user, `group`-only -- gadget peer-sources exactly
+    # one real mount, at bravo's own shared path (bravo's own plan_mounts()
+    # run resolved whitfield-media to that same path first, per
+    # per_user_mount_path() -- nothing ever lives at a per-user path on
+    # bravo's disk for a group-only grant, so that's the only real path a
+    # peer could source it from), not relayed through alpha (root_host)
     assert "home/mike/mw-fam" not in {
         p for p, e in by_local_path.items() if e["remote"] and "alpha" in e["remote"]
     }
-    whitfield = by_local_path["home/mike/whitfield-media"]
-    assert whitfield["remote"] == "peer-storage-node-bravo-home-mike-whitfield-media:/srv/stortree/home/mike/whitfield-media"
+    whitfield_mount = by_local_path["home/.mounts/whitfield-media"]
+    assert whitfield_mount["remote"] == "peer-storage-node-bravo-home-.mounts-whitfield-media:/srv/stortree/home/.mounts/whitfield-media"
+    # mike's own folder is a symlink to that one real mount, not a peer
+    # mount of its own
+    whitfield_link = by_local_path["home/mike/whitfield-media"]
+    assert whitfield_link["remote"] is None
+    assert whitfield_link["symlink_target"] == "home/.mounts/whitfield-media"
 
     # the samba node itself ("home") is a pure container -- delegates
     # entirely to its own children above, gets no mount/peer of its own
@@ -700,7 +819,7 @@ def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
     # which was never a mount to nest under in the first place
     root_slug = by_local_path[""]["slug"]
     assert sys_configs["requires_slug"] == root_slug
-    assert whitfield["requires_slug"] == root_slug
+    assert whitfield_mount["requires_slug"] == root_slug
 
 
 def test_plan_mounts_nested_nonuser_paths_require_their_parent():

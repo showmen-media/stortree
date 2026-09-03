@@ -42,6 +42,16 @@ DEFAULT_ACCESS_PERMISSIONS = "rwx"
 # placeholder shows up consistently in smb.conf and in resolved paths.
 PER_USER_PLACEHOLDER = "%U"
 
+# Segment substituted for PER_USER_PLACEHOLDER when a `group`-only grant
+# backs every member's folder with one real, shared mount instead of one
+# per member (interpretation call #2, revisited) -- see
+# per_user_mount_path() below for why. Dot-prefixed to match this
+# tree's existing hidden-subtree convention (`.cache`) and to keep it
+# out of the way of any real per-user segment name, which %U itself
+# forbids (Samba's own connecting-user names can't contain a literal
+# "%" either).
+SHARED_MOUNT_SEGMENT = ".mounts"
+
 # Convention used by stortree_peer_trust/stortree_secrets: where a
 # serving host's SSH keypair for peer sftp mounts lives.
 PEER_SSH_KEY_PATH = "/etc/stortree/peer_ssh_key"
@@ -466,14 +476,19 @@ def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None, group_members=
 
     for peer in resolved.get("peer_dependencies", []):
         if peer.get("per_user"):
-            users = access_grant_usernames(peer.get("access"), group_members)
-            expanded = [
-                (
-                    peer["local_path"].replace(PER_USER_PLACEHOLDER, u),
-                    peer["remote_path"].replace(PER_USER_PLACEHOLDER, u),
-                )
-                for u in users
-            ]
+            # Exactly one section, at the same real path plan_mounts()
+            # resolves this node to -- an owner grant's own path, or a
+            # group-only grant's one shared mount (per_user_mount_path()),
+            # never one per member; see plan_mounts()'s matching collapse
+            # and per_user_mount_path()'s own docstring for why one real
+            # mount now backs every member instead of one full duplicate
+            # each. No section at all if nobody's actually granted access.
+            access = peer.get("access") or {}
+            if access_grant_usernames(access, group_members):
+                real_path = per_user_mount_path(peer["local_path"], access)
+                expanded = [(real_path, real_path)]
+            else:
+                expanded = []
         else:
             expanded = [(peer["local_path"], peer["remote_path"])]
 
@@ -586,6 +601,36 @@ def access_grant_usernames(access, group_members=None):
     return []
 
 
+def per_user_mount_path(path, access):
+    """Where a `user-subdirs` descendant's %U-templated `path` is actually
+    mounted/created, as distinct from where each authorized user's own
+    folder ends up (access_grant_usernames() above) -- the two only
+    differ for a `group`-only grant. An `owner` grant (with or without
+    `group` alongside it) still pins one real folder to that one user
+    directly, `%U` -> the owner's own name, same as ever: one user, one
+    folder, one mount, nothing to share.
+
+    A `group`-only grant instead resolves `%U` to `SHARED_MOUNT_SEGMENT`
+    -- one real mount, shared by every member, rather than one full
+    duplicate per member. rclone's FUSE mount can't tell two
+    `--allow-other` mounts of the identical remote path apart from two
+    independent processes: N members used to mean N redundant rclone
+    procs and N redundant VFS caches of the exact same bytes (no cache
+    coherency between them either -- one member's write wouldn't show up
+    in another's cache until its own dir-cache-time/vfs-cache-* expired),
+    even though the access grant backing all of them was always the same
+    single group the whole time (access_mode()/access_group() compute
+    identically for every one of those duplicate entries -- nothing about
+    *which* member's copy it was ever varied the enforcement). One real
+    mount, gid-owned exactly as before, does the same job.
+    `plan_mounts()` fans that one real mount back out to each member's
+    own folder with a symlink instead of a second mount -- see its
+    per-user expansion for both server_subtrees and peer_dependencies,
+    and filter_rclone_conf()'s matching peer-section collapse."""
+    segment = (access or {}).get("owner") or SHARED_MOUNT_SEGMENT
+    return path.replace(PER_USER_PLACEHOLDER, segment)
+
+
 def needed_groups(resolved):
     """Every group name this host's resolved facts reference in an
     `access` grant -- the set `getent group` needs to be run against
@@ -635,18 +680,28 @@ def needed_users(resolved):
 def plan_mounts(resolved, group_members=None):
     """Flatten this host's resolved server_subtrees/client_mounts/
     peer_dependencies into one flat plan of every local path that has to
-    exist (spec.md §2), expanding a user-subdirs entry's %U-templated path
-    into one entry per user actually granted access to it (interpretation
-    call #2) using `group_members` (e.g. `ansible_facts.getent_group |
-    stortree_group_members`).
+    exist (spec.md §2), resolving a user-subdirs entry's %U-templated
+    path against its own `access` grant (interpretation call #2) using
+    `group_members` (e.g. `ansible_facts.getent_group |
+    stortree_group_members`): an `owner` grant (with or without `group`
+    alongside it) still gets one real mount at that one user's own path,
+    same as ever; a `group`-only grant instead gets exactly one real
+    mount, at `per_user_mount_path()`'s shared location, plus one
+    symlink entry per member fanning that single mount back out to each
+    member's own folder -- see per_user_mount_path() for why one mount
+    now serves every member instead of one full duplicate each.
 
     Not every entry is an rclone mount: a server_subtrees entry with
     `remote: None` (a node with no `rclone.remote` of its own -- it never
     inherits one, see _walk_tree()/docs/config-schema.md "Node
-    inheritance") is a plain directory that has to exist, not a mount --
-    callers should render an rclone unit only for entries with a
-    truthy `remote`, e.g. `stortree_mounts_plan | selectattr('remote')`.
-    A client_mounts entry always has a remote (the root `rclone.remote`).
+    inheritance") is a plain directory that has to exist, not a mount;
+    a per-user symlink entry (`symlink_target` set) is neither a mount
+    nor a plain directory, just a link back to the one real mount its
+    node resolved to -- callers should render an rclone unit only for
+    entries with a truthy `remote`, e.g. `stortree_mounts_plan |
+    selectattr('remote')`, and a symlink only for entries with a truthy
+    `symlink_target`. A client_mounts entry always has a remote (the
+    root `rclone.remote`) and is never per-user.
 
     Every peer_dependencies entry becomes a mount too -- a samba
     descendant this host doesn't own is data this host's local tree still
@@ -656,19 +711,55 @@ def plan_mounts(resolved, group_members=None):
     already names its own real owning host). The root-level entry
     (`local_path == ""`) is skipped here since it's already the
     client_mounts entry above; every other entry gets its own mount,
-    per-user-expanded the same way as a per-user server_subtrees entry,
-    using its own `access`/`args` (never the owning host's).
+    per-user-resolved the same way as a per-user server_subtrees entry
+    (including the shared-mount-plus-symlinks case -- the owning host's
+    own plan_mounts() run collapses its `group`-only node to that exact
+    same shared path first, so a peer sourcing it has to sftp from that
+    real path, not a per-user one nothing lives at), using its own
+    `access`/`args` (never the owning host's).
 
-    Each returned entry: {local_path, remote, args, slug, requires_slug}.
-    `requires_slug` names the nearest ancestor entry that's an actual
-    mount (truthy `remote`) whose local_path is the longest proper-prefix
-    ancestor of this one, if any -- for systemd RequiresMountsFor= so a
-    nested mount starts after the mount it nests under, skipping over any
-    non-mounted (plain-directory) ancestor in between, which has no unit
-    of its own to require (spec.md §2).
+    Each returned entry: {local_path, remote, args, slug, requires_slug,
+    symlink_target}. `symlink_target` is the real entry's `local_path`
+    for a per-user symlink entry, else None. `requires_slug` names the
+    nearest ancestor entry that's an actual mount (truthy `remote`) whose
+    local_path is the longest proper-prefix ancestor of this one, if any
+    -- for systemd RequiresMountsFor= so a nested mount starts after the
+    mount it nests under, skipping over any non-mounted (plain-directory
+    or symlink) ancestor in between, which has no unit of its own to
+    require (spec.md §2).
     """
     group_members = group_members or {}
     entries = []
+
+    def _expand_per_user(node_path, access, remote_of):
+        """Shared by the server_subtrees and peer_dependencies loops
+        below: resolves one per-user node's %U-templated `node_path`
+        against its own `access` into (real entry, [symlink entries]),
+        or (None, []) if nobody's actually granted access to it at all
+        (access_grant_usernames() returns no one). `remote_of(path)`
+        builds the real entry's `remote` from its resolved real path --
+        different for a server_subtrees node (its own literal `remote`,
+        unaffected by which path it ends up at) versus a peer_dependency
+        (`_peer_remote_ref`, which bakes the resolved path into the
+        synthesized sftp reference itself)."""
+        users = access_grant_usernames(access, group_members)
+        if not users:
+            return None, []
+        real_path = per_user_mount_path(node_path, access)
+        real_entry = {"local_path": real_path, "remote": remote_of(real_path), "access": access}
+        if access.get("owner"):
+            return real_entry, []
+        symlinks = [
+            {
+                "local_path": node_path.replace(PER_USER_PLACEHOLDER, user),
+                "remote": None,
+                "args": {},
+                "access": {},
+                "symlink_target": real_path,
+            }
+            for user in users
+        ]
+        return real_entry, symlinks
 
     for m in resolved.get("client_mounts", []):
         entries.append(
@@ -686,15 +777,13 @@ def plan_mounts(resolved, group_members=None):
                 }
             )
             continue
-        for user in access_grant_usernames(n["access"], group_members):
-            entries.append(
-                {
-                    "local_path": n["path"].replace(PER_USER_PLACEHOLDER, user),
-                    "remote": n["remote"],
-                    "args": n["args"],
-                    "access": n["access"],
-                }
-            )
+        real_entry, symlinks = _expand_per_user(
+            n["path"], n["access"], lambda _p: n["remote"]
+        )
+        if real_entry is not None:
+            real_entry["args"] = n["args"]
+            entries.append(real_entry)
+        entries.extend(symlinks)
 
     for p in resolved.get("peer_dependencies", []):
         if p["local_path"] == "":
@@ -711,19 +800,20 @@ def plan_mounts(resolved, group_members=None):
                 }
             )
             continue
-        for user in access_grant_usernames(p.get("access"), group_members):
-            local_path = p["local_path"].replace(PER_USER_PLACEHOLDER, user)
-            remote_path = p["remote_path"].replace(PER_USER_PLACEHOLDER, user)
-            entries.append(
-                {
-                    "local_path": local_path,
-                    "remote": _peer_remote_ref(p["owning_host"], local_path, remote_path),
-                    "args": p["args"],
-                    "access": p.get("access") or {},
-                }
-            )
+        access = p.get("access") or {}
+        # local_path and remote_path are always the same string pre-expansion
+        # (resolve() sets both from the same node path, see peer_dependencies
+        # above) -- per_user_mount_path() only needs to run once.
+        real_entry, symlinks = _expand_per_user(
+            p["local_path"], access, lambda rp: _peer_remote_ref(p["owning_host"], rp, rp)
+        )
+        if real_entry is not None:
+            real_entry["args"] = p["args"]
+            entries.append(real_entry)
+        entries.extend(symlinks)
 
     for e in entries:
+        e.setdefault("symlink_target", None)
         e["slug"] = _slug(e["local_path"])
 
     mount_entries = [e for e in entries if e["remote"]]
