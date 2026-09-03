@@ -27,6 +27,8 @@ ExecStart=/usr/bin/rclone mount {{ entry.remote }} {{ (stortree_root ~ '/' ~ ent
 {% if access.group is defined %}
   --gid {{ stortree_group_gids[access.group] }} \
 {% endif %}
+{% else %}
+  --allow-root \
 {% endif %}
   --config {{ stortree_etc }}/rclone.conf
 ExecStop=/bin/fusermount -uz {{ (stortree_root ~ '/' ~ entry.local_path) if entry.local_path else stortree_root }}

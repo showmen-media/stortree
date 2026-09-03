@@ -59,11 +59,21 @@
 # clobber the real enforcement this whole file exists to set up. A
 # remote-backed node's mount additionally omits --allow-other
 # unless `access` grants an owner and/or group (rendered unconditionally
-# below, from the same three filters, so the two always agree): without
-# it, FUSE restricts a mount to the mounting user (stortree) and root --
-# no other local process, including an SSH session from an
-# LDAP-authenticated user, can reach it at all, matching what a fresh
-# mount with no grant should do. With a grant, the template instead
+# below, from the same three filters, so the two always agree), taking
+# --allow-root instead (also below -- the one mount option this file
+# does add unconditionally, both branches, since `stortree` itself, the
+# fixed account every mount unit actually runs as, is neither an
+# `access` grant's own concern nor ever something to lock out; without
+# it root gets nothing either, not even the "Ensure every resolved mount
+# point or plain directory exists" task below its own mount ever sits
+# under, on any host whose own root client mount ends up masking
+# `stortree_root` this way): with neither flag, FUSE restricts a mount
+# to the mounting user (stortree) alone -- no other local process,
+# including root and an SSH session from an LDAP-authenticated user,
+# can reach it at all. --allow-root widens that to stortree and root
+# specifically, matching what a fresh mount with no `access` grant
+# should do -- root able to administer it, nobody else. With a grant,
+# the template instead
 # uid/gid-owns the mount directly (--uid/--gid, --dir-perms, --file-perms
 # from the same mode) and adds --allow-other back -- real kernel-enforced
 # access, checked against whoever's actually connecting (smbd included,
@@ -83,6 +93,33 @@
     state: present
     update_cache: true
     cache_valid_time: 3600
+  tags: [mounts]
+
+- name: Allow FUSE mounts to grant access beyond the mounting user
+  # A precondition for both --allow-other (a granted mount, `access`
+  # owner/group) and --allow-root (an ungranted one, stortree-mount@.service.j2)
+  # alike -- libfuse's own fusermount refuses either mount option outright
+  # ("fusermount: option allow_other only allowed if 'user_allow_other' is
+  # set in /etc/fuse.conf") from a non-root mounting process (stortree,
+  # always -- User= in the unit template) without this, root's own access
+  # included: --allow-root only ever widens a private mount from "just the
+  # mounting user" to "the mounting user and root" (the FUSE default this
+  # codebase's own comments elsewhere assume, but which libfuse doesn't
+  # actually grant on its own), it does not bypass the same fusermount-level
+  # gate --allow-other is subject to. Ahead of every other task below --
+  # an already-running mount that needed either flag would otherwise have
+  # started without it (rclone doesn't retry a rejected mount option, it
+  # just fails outright, spec.md's "Enable and start every resolved mount"
+  # task's own failure mode) before this file ever got the chance to fix
+  # that up.
+  ansible.builtin.lineinfile:
+    path: /etc/fuse.conf
+    regexp: '^#?\s*user_allow_other\s*$'
+    line: user_allow_other
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
   tags: [mounts]
 
 - name: Compute this host's flat mount plan
