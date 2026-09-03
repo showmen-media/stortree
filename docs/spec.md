@@ -414,11 +414,31 @@ or the dotted shorthand `access.group` / `access.user`) resolve against
 the SSSD-provided groups/users, then `stortree_acl` applies them with
 `ansible.posix.acl` (both default and effective ACLs, recursive) directly
 on the physical path — on whichever host actually serves that subtree, or
-peer-sources it (§1/§2), same as any other resolved mount. Because this
-is POSIX-level, it governs access uniformly whether the path is reached
-via Samba, SSH, or a local process. ACLs are naturally idempotent to
-reapply with the same spec, so the role always recomputes and reapplies
-from the resolved facts rather than diffing against previous runs.
+peer-sources it (§1/§2), same as any other resolved mount, but **only for
+an entry with no `remote`** (a plain local directory). rclone's FUSE mount
+never implements `setxattr`, so `setfacl` always fails on a remote-backed
+entry with "Operation not supported" — `stortree_acl` filters those out
+(`rejectattr('remote')`) rather than attempting and failing.
+
+For that remaining, larger class of paths, access control drops to two
+separate mechanisms instead of one uniform POSIX layer: `stortree_mounts`
+renders every rclone unit without `--allow-other`, so FUSE itself refuses
+any process but the mounting user (`stortree`) and root — no SSH session
+or local process reaches it, for any user, full stop; `stortree_samba`
+sets `force user`/`force group` (both `stortree`) in `[global]`, so `smbd`
+always performs the actual file I/O as that same account regardless of
+which LDAP user authenticated, letting Samba back in through the same
+door. `valid users`/`write list` (rendered from the same `access` grants,
+§4) remain the real authorization check for that Samba access — POSIX
+permissions on a remote-backed path are irrelevant to it either way now.
+Net effect: a remote-backed subtree's `access` grant is enforced for
+Samba, and is unreachable by any other means, on every host, always. Only
+a plain local directory gets real, differentiated POSIX ACLs, and stays
+reachable via SSH/local process as well as Samba.
+
+ACLs are naturally idempotent to reapply with the same spec, so the role
+always recomputes and reapplies from the resolved facts rather than
+diffing against previous runs.
 
 A per-user grant's %U has to be expanded to real usernames before any of
 this — `access_grant_usernames()` resolves a group grant against real

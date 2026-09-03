@@ -8,6 +8,14 @@
 # expanded path (docs/plan.md interpretation call #2), not a shared
 # %U-templated path that doesn't exist on disk.
 #
+# Only entries with no `remote` (a plain local directory, never rclone
+# FUSE-mounted) get an ACL applied at all -- rclone's FUSE mount never
+# implements setxattr, so setfacl always fails on one with "Operation
+# not supported", and it would be pointless even if it worked: those
+# mounts are rendered without --allow-other (stortree_mounts), so no
+# non-stortree process can reach them regardless of what any ACL says.
+# Samba still gets in via `force user`/`force group` (stortree_samba).
+#
 # ACLs are naturally idempotent to reapply with the same spec, so this
 # always recomputes and reapplies from the resolved facts rather than
 # diffing against a previous run.
@@ -35,6 +43,8 @@
   ansible.builtin.set_fact:
     stortree_acl_targets: >-
       {{ stortree_acl_plan
+         | rejectattr('remote')
+         | list
          | subelements('access', skip_missing=true) }}
   tags: [acl]
 

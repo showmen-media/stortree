@@ -12,11 +12,10 @@ Type=notify
 User={{ stortree_user }}
 Group={{ stortree_group }}
 ExecStart=/usr/bin/rclone mount {{ entry.remote }} {{ (stortree_root ~ '/' ~ entry.local_path) if entry.local_path else stortree_root }} \
-  --config {{ stortree_etc }}/rclone.conf \
 {% for k, v in entry.args.items() %}
   --{{ k }}{{ ' ' ~ (v | string) if (v is not sameas true) else '' }} \
 {% endfor %}
-  --allow-other
+  --config {{ stortree_etc }}/rclone.conf
 ExecStop=/bin/fusermount -uz {{ (stortree_root ~ '/' ~ entry.local_path) if entry.local_path else stortree_root }}
 Restart=on-failure
 RestartSec=5

@@ -225,9 +225,11 @@ Same map-of-`name -> node` shape, but they resolve differently:
   an SMB client lands in its own per-user folder, and is otherwise
   irrelevant here; if `user-subdirs` is used without `samba.subpath`, the
   per-user folders still have to be the immediate children of that node.
-  ACLs on each descendant still apply per the usual rules, so
+  `access` on each descendant still applies per the usual rules, so
   `sys-configs` (`access.user: jd`) only shows up inside `jd`'s own
-  per-user folder, not everyone else's.
+  per-user folder, not everyone else's — though *how* it's enforced
+  differs for a descendant with its own `rclone.remote` (`media-prod`
+  here) versus one without (`sys-configs`); see "Access" below.
 
 ### Access
 
@@ -248,7 +250,13 @@ access.user: jd
 
 `group`/`user` names are resolved against POSIX identities provided by
 SSSD (backed by the configured LDAP server — see `ldap.yml` below).
-`permissions` is a `rwx`-style string applied via `setfacl`.
+`permissions` is a `rwx`-style string applied via `setfacl` — but only
+for a node with no `rclone.remote` of its own. A remote-backed node
+(directly, or peer-sourced from whichever host owns it) is a rclone FUSE
+mount, which can't carry POSIX ACLs at all; `access` there is enforced
+through Samba only (`valid users`/`write list`, spec.md §4/§6), and SSH
+or any other local-process access to it is blocked outright, for every
+user, on every host — see spec.md §6 for the mechanism.
 
 ### Every inventory host participates
 

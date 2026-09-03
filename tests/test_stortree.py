@@ -506,6 +506,31 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
     assert by_local_path["home/mike/mw-fam"]["requires_slug"] == root_slug
 
 
+def test_acl_plan_excludes_remote_backed_entries():
+    # roles/stortree_acl/tasks/main.yml flattens ACL targets with
+    # `stortree_acl_plan | rejectattr('remote') | list | subelements(...)`
+    # -- rclone's FUSE mount never implements setxattr, so setfacl always
+    # fails "Operation not supported" on a remote-backed entry (spec.md
+    # §6). Mirrors that exact Jinja expression against alpha's own plan,
+    # which has one of each right next to each other under `home`: a
+    # plain per-user leaf (sys-configs, no rclone.remote) and a
+    # remote-backed one (media-prod, rclone.remote: some-gcs-bucket:).
+    from jinja2 import Environment
+
+    r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
+    group_members = {"Media Production": ["alex"]}
+    plan = plan_mounts(r, group_members)
+
+    template = Environment().from_string(
+        "{% for e in plan | rejectattr('remote') | list %}{{ e.local_path }}\n{% endfor %}"
+    )
+    kept = set(template.render(plan=plan).split())
+
+    assert "home/jd/sys-configs" in kept
+    assert "backups" in kept
+    assert not any(p.endswith("/media-prod") for p in kept)
+
+
 def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
     # gadget owns nothing (docs/config-schema.md worked example) -- every
     # piece of `home` it must still serve via Samba (spec.md "Samba

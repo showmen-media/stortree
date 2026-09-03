@@ -12,6 +12,16 @@ map acl inherit = yes
 inherit permissions = yes
 passdb backend = tdbsam
 
+# Every share's actual file I/O runs as the stortree service account,
+# whichever LDAP user authenticated the SMB session -- `valid users`/
+# `write list` below (rendered from each node's `access` grants) remain
+# the real authorization gate; this just stops that gate from also
+# depending on OS-level permissions, which a remote-backed (rclone
+# FUSE-mounted) subtree can't carry at all (no ACL support, and no
+# --allow-other -- see stortree_mounts/stortree_acl).
+force user = {{ stortree_user }}
+force group = {{ stortree_group }}
+
 {% for share in stortree.samba_shares %}
 [{{ share.node_path | regex_replace('[^A-Za-z0-9_-]', '_') }}]
    path = {{ stortree_root }}/{{ share.node_path }}{{ '/' ~ share.subpath if share.subpath else '' }}

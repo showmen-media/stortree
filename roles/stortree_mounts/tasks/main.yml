@@ -16,6 +16,18 @@
 # to exist (either nested inside an ancestor's mount, or kept as real
 # local storage on its resolved host) but has no rclone unit of its own;
 # only entries with a `remote` get one below.
+#
+# Rendered units deliberately omit --allow-other (spec.md §6): without
+# it, FUSE restricts every mount to the mounting user (stortree) and
+# root -- no other local process, including an SSH session from an
+# LDAP-authenticated user, can reach it at all. stortree_samba's `force
+# user`/`force group` is what lets smbd through anyway (it always
+# performs file I/O as stortree, regardless of which user authenticated
+# over SMB), so Samba access keeps working while direct SSH/local-process
+# access to a remote-backed subtree stays blocked -- POSIX ACLs can't
+# fill that role themselves, since rclone's FUSE mount never implements
+# setxattr (see stortree_acl, which skips remote-backed entries for the
+# same reason).
 
 - name: Install rclone and fuse
   ansible.builtin.apt:
@@ -25,17 +37,6 @@
     state: present
     update_cache: true
     cache_valid_time: 3600
-  tags: [mounts]
-
-- name: Allow non-root FUSE mounts to be shared with other users
-  # Every rendered unit passes --allow-other (spec.md §2); rclone refuses
-  # that flag unless fuse.conf opts in, which the fuse package ships
-  # commented out by default.
-  ansible.builtin.lineinfile:
-    path: /etc/fuse.conf
-    regexp: '^#?\s*user_allow_other'
-    line: user_allow_other
-    create: true
   tags: [mounts]
 
 - name: Compute this host's flat mount plan
