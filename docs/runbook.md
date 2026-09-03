@@ -89,36 +89,25 @@ you changed tree shape/hosts/remotes). Nothing needs manual cleanup --
 `stortree_mounts` removes stale units and always recomputes every path's
 ownership/mode from the current resolved facts.
 
-## Recovering a masked root mount
+## A masked mount (e.g. after upgrading `stortree-mount@.service.j2`)
 
-A host whose entire `stortree_root` is itself a whole-tree root client
-mount (§1) can end up in a state where even root can't reach anything
-under it -- e.g. after upgrading to a `stortree-mount@.service.j2` that
-changed access flags (`--allow-root`, `--allow-other`), a host that
-already had that mount active from before the upgrade keeps running the
-old, more restrictive unit until something restarts it. A plain apply
-can't fix this on its own: `stortree_common`/`stortree_mounts`'s own
-path-creation tasks fail outright trying to reach paths nested under the
-still-masked mount, before the run ever gets to the render/restart step
-that would have fixed it. Symptom: a task under `stortree_common` or
-`stortree_mounts` fails with something like `There was an issue creating
-/srv/stortree/... as requested: [Errno 17] File exists`, on a host you
-know already had that path mounted.
-
-Recover it with the opt-in `mount-recover` tag (`tags: [never,
-mount-recover]` in `roles/stortree_common/tasks/main.yml` -- deliberately
-excluded from every normal run, since it briefly stops a live,
-user-facing mount):
-
-```
-ansible-playbook playbooks/site.yml --ask-vault-pass --tags mount-recover,common,mounts --limit affected-host-name
-```
-
-That stops the stuck mount (its own `ExecStop` runs as `stortree`, the
-mount's owner, so this succeeds even though root can't reach its
-contents) and lets the rest of the run recreate paths and bring it back
-up with the correct flags. One-time per host -- once it comes back up
-correctly flagged, normal applies never hit this again on that host.
+A top-level subtree's own mount can end up active but unreachable to
+root -- e.g. after upgrading to a `stortree-mount@.service.j2` that
+changed access flags, a host that already had that mount active from
+before the upgrade keeps running the old, more restrictive unit until
+something restarts it. `stortree_mounts` detects this itself (a direct
+`stat` probe against every remote-backed entry's own mountpoint, not
+`ansible_facts.mounts`) and skips every task that would otherwise try to
+touch that path or anything nested under it, rather than fail outright
+-- no separate recovery tag needed. It still renders and restarts that
+mount's own unit in the same run (unaffected by the skip, since that
+doesn't touch the filesystem tree), which is what actually clears the
+masking; anything that was skipped underneath it then gets created
+normally on the *next* apply, once the mount is reachable again. Symptom
+along the way: `skipping: [host] => (item=...)` lines for entries nested
+under the masked subtree, and `...ignoring` after a `stat`
+`Permission denied` on the probe task itself -- both expected, not
+failures. Two runs back-to-back clear it; nothing to invoke by name.
 
 ## Recovering the control node
 

@@ -316,9 +316,9 @@
   # path nested underneath one with "File exists", Ansible's recursive
   # parent-creation colliding with the very directory it can't see
   # inside) instead of cleanly doing nothing until the masked ancestor
-  # itself is dealt with (mount-recover, docs/runbook.md, or simply a
-  # unit render below that finally gives the ancestor --allow-other so
-  # it stops being masked at all).
+  # itself is dealt with -- normally by the unit render/restart below
+  # this same run, which gives the ancestor --allow-other so it stops
+  # being masked at all (docs/runbook.md "A masked mount").
   ansible.builtin.file:
     path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
     state: directory
