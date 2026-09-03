@@ -356,6 +356,7 @@
   loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
   loop_control:
     label: "{{ item.local_path | dirname }}"
+  when: not ((item.local_path | dirname) | stortree_path_masked(stortree_masked_mount_paths))
   tags: [mounts]
 
 - name: Ensure every per-user symlink exists
@@ -377,6 +378,7 @@
   loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
   loop_control:
     label: "{{ item.local_path }}"
+  when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
   tags: [mounts]
 
 - name: Render systemd units for every resolved mount
