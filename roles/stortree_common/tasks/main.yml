@@ -32,12 +32,31 @@
   tags: [common]
 
 - name: Ensure the fixed mount root exists
+  # Skipped once `stortree_root` is itself already an active mountpoint
+  # -- true on any host with a whole-tree root client mount (a
+  # client_mounts entry, local_path == "", spec.md §1): that mount
+  # carries no `access` of its own (stortree_mounts' plan_mounts()
+  # always resolves the root client entry with access: {}), so it never
+  # gets --allow-other, and only the mounting user (stortree) can reach
+  # it at all -- root included, when this host's own root lacks
+  # CAP_SYS_ADMIN (true inside an unprivileged LXC container, which is
+  # what actually surfaced this: root couldn't even stat the live mount).
+  # Ansible (running as root) can no longer stat this path once that's
+  # the case, and `ansible.builtin.file` doesn't treat "exists but I
+  # can't see it" as already-satisfied -- it falls through to a raw
+  # create and dies on the mount's own EEXIST. Nothing to ensure once
+  # something's already mounted there, so check `ansible_facts.mounts`
+  # (gathered at this play's own start, i.e. reflecting whatever the
+  # previous apply already set up, not anything stortree_mounts changes
+  # later in this same run) and skip outright rather than touch a path
+  # this host can no longer even see.
   ansible.builtin.file:
     path: "{{ stortree_root }}"
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
     mode: "0750"
+  when: stortree_root not in (ansible_facts.mounts | map(attribute='mount') | list)
   tags: [common]
 
 - name: Ensure the per-host rendered-state directory exists

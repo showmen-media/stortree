@@ -169,7 +169,7 @@
   loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
   loop_control:
     label: "{{ item.local_path }}"
-  when: item.local_path | dirname
+  when: (item.local_path | dirname) != ''
   tags: [mounts]
 
 - name: Ensure every resolved mount point or plain directory exists
