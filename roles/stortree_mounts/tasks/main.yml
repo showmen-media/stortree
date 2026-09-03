@@ -283,7 +283,7 @@
     label: "{{ item.local_path }}"
   when:
     - (item.local_path | dirname) != ''
-    - (item.local_path | dirname) not in stortree_masked_mount_paths
+    - not ((item.local_path | dirname) | stortree_path_masked(stortree_masked_mount_paths))
   tags: [mounts]
 
 - name: Ensure every resolved mount point or plain directory exists
@@ -304,16 +304,21 @@
   # denied" before rclone ever gets to establish the mount that would've
   # made the grant visible in the first place.
   #
-  # A remote-backed entry (`item.remote` truthy) additionally skips
-  # outright once the probe above couldn't reach its own resolved path
-  # (`stortree_masked_mount_paths`) -- an already-running, unreachable
-  # mount has nothing left for this task to verify or correct (an
-  # ungranted mount is unreachable to root permanently, this file's
-  # header comment), and attempting it anyway is exactly what used to
-  # fail outright instead of cleanly doing nothing. A plain directory
-  # (no `remote`) never skips this way -- it's real, persistent local
-  # content, never itself a mount, so it was never in scope for the
-  # probe above at all.
+  # Any entry -- remote-backed or a plain directory alike -- additionally
+  # skips outright once its own path is itself masked, or nested
+  # underneath a masked ancestor (`stortree_path_masked()`, checked
+  # against `stortree_masked_mount_paths`): an already-running,
+  # unreachable mount has nothing left for this task to verify or
+  # correct for its own path (an ungranted mount is unreachable to root
+  # permanently, this file's header comment), and root can't create
+  # anything nested inside it either -- attempting either used to fail
+  # outright (a masked entry's own path with "Permission denied", or a
+  # path nested underneath one with "File exists", Ansible's recursive
+  # parent-creation colliding with the very directory it can't see
+  # inside) instead of cleanly doing nothing until the masked ancestor
+  # itself is dealt with (mount-recover, docs/runbook.md, or simply a
+  # unit render below that finally gives the ancestor --allow-other so
+  # it stops being masked at all).
   ansible.builtin.file:
     path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
     state: directory
@@ -323,7 +328,7 @@
   loop: "{{ stortree_mounts_plan | rejectattr('symlink_target') | list }}"
   loop_control:
     label: "{{ item.local_path or '(root)' }}"
-  when: not item.remote or item.local_path not in stortree_masked_mount_paths
+  when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
   tags: [mounts]
 
 - name: Ensure every per-user symlink's parent directory exists

@@ -963,6 +963,25 @@ def mount_unit_names(mount_plan):
     return [f"stortree-mount@{e['slug']}.service" for e in mount_plan if e["remote"]]
 
 
+def path_masked(path, masked_paths):
+    """Whether `path` is itself one of `masked_paths` (stortree_mounts'
+    own stortree_masked_mount_paths, built from probing each
+    remote-backed entry's mountpoint), or nested underneath one of them
+    (a real ancestor, not just a same-prefix sibling -- 'a' masks 'a/b'
+    but not 'ab'). A path resolved *through* an already-mounted-but-
+    unreachable ancestor is exactly as unreachable as that ancestor
+    itself, even though only the ancestor's own probe ever actually
+    failed -- stortree_mounts uses this to skip every task that would
+    otherwise try to touch a path root can't currently see, at any
+    depth, not just the one masked entry's own immediate parent (which
+    used to be the only case handled, until a masked mount two or more
+    levels up from a real entry -- e.g. a peer-sourced samba descendant
+    nested under a top-level subtree that's itself still masked from a
+    previous run -- showed this needed to walk the whole ancestor chain,
+    not just check one level)."""
+    return any(path == m or path.startswith(m + "/") for m in masked_paths)
+
+
 class FilterModule(object):
     def filters(self):
         return {
@@ -979,5 +998,6 @@ class FilterModule(object):
             "stortree_needed_users": needed_users,
             "stortree_plan_mounts": plan_mounts,
             "stortree_mount_unit_names": mount_unit_names,
+            "stortree_path_masked": path_masked,
             "stortree_samba_access_tokens": samba_access_tokens,
         }
