@@ -13,7 +13,8 @@ User={{ stortree_user }}
 Group={{ stortree_group }}
 {% set access = entry.access | default({}) %}
 {% set granted = access.owner is defined or access.group is defined %}
-ExecStart=/usr/bin/rclone mount {{ entry.remote }} {{ (stortree_root ~ '/' ~ entry.local_path) if entry.local_path else stortree_root }} \
+{% set mount_path = (stortree_root ~ '/' ~ entry.local_path) if entry.local_path else stortree_root %}
+ExecStart=/usr/bin/rclone mount {{ entry.remote }} {{ mount_path }} \
 {% for k, v in entry.args.items() %}
   --{{ k }}{{ ' ' ~ (v | string) if (v is not sameas true) else '' }} \
 {% endfor %}
@@ -29,7 +30,7 @@ ExecStart=/usr/bin/rclone mount {{ entry.remote }} {{ (stortree_root ~ '/' ~ ent
 {% endif %}
 {% endif %}
   --config {{ stortree_etc }}/rclone.conf
-ExecStop=/bin/fusermount -uz {{ (stortree_root ~ '/' ~ entry.local_path) if entry.local_path else stortree_root }}
+ExecStop=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do mountpoint -q "{{ mount_path }}" || exit 0; /bin/fusermount -uz "{{ mount_path }}" || exit 0; done'
 Restart=on-failure
 RestartSec=5
 
