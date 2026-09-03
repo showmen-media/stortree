@@ -469,23 +469,24 @@ For a plain local directory, that's `ansible.builtin.file`'s
 `owner`/`group`/`mode` — real, standard Unix ownership, no `acl` package
 needed at all. For a remote-backed node, `stortree_mounts` renders the
 same three values into the rclone unit instead: with neither `owner` nor
-`group` granted, the unit takes `--allow-root` instead of `--allow-other`,
-so FUSE restricts the mount to the mounting user (`stortree`) and root
-specifically — no SSH session or local process reaches it, for any other
-user, full stop, and nothing overrides that for Samba either (`smbd`
-still runs as the real authenticated user, unchanged from stock
-behavior). Root's own access isn't incidental here: `stortree_common`
-and `stortree_mounts` both manage paths nested under a mount like this
-(most notably a client host's own root client mount, §1, which always
-resolves with no `access` grant) as root, and without `--allow-root`
-that's simply not possible — libfuse's default, with neither flag, is
-mounting-user-only, root included (`--allow-root` is what actually
-widens that, contrary to what "and root" might otherwise suggest holds
-by default). Both `--allow-other` and `--allow-root` additionally
-require `user_allow_other` in `/etc/fuse.conf` (`stortree_mounts`
+`group` granted, the unit omits `--allow-other`, so FUSE restricts the
+mount to the mounting user (`stortree`) alone — no SSH session or local
+process reaches it, root included, and nothing overrides that for Samba
+either (`smbd` still runs as the real authenticated user, unchanged from
+stock behavior). Root's exclusion here isn't a gap to close: rclone's
+own `--allow-root` (libfuse's documented way to widen a private mount to
+"the mounting user and root") is silently ignored by the rclone build
+this fleet runs ("Ignoring --allow-root. Support has been removed
+upstream", logged on every mount attempt) — there is no flag that gets
+root into an ungranted mount, full stop, so `stortree_common` and
+`stortree_mounts` both treat that as permanent: neither ever tries to
+manage a path once `ansible_facts.mounts` shows it's already live,
+rather than assume root access it structurally cannot have.
+`--allow-other` (the granted-mount case just below) additionally
+requires `user_allow_other` in `/etc/fuse.conf` (`stortree_mounts`
 ensures it's set before rendering or restarting any unit) — libfuse
-refuses either option outright from a non-root mounting process without
-it, root's own access included. With `owner` and/or `group` granted, the
+refuses the option outright from a non-root mounting process without it.
+With `owner` and/or `group` granted, the
 unit instead adds `--allow-other` back and uid/gid-owns the mount
 directly (`--uid`/`--gid`, resolved from the same `getent passwd`/`getent
 group` lookups `stortree_secrets` already runs for %U-expansion below —
