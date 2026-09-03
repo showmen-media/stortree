@@ -25,21 +25,33 @@
 # that a `success=N` jump-count on an *earlier* line was tuned assuming
 # nothing sits between that line and pam_deny.so. Inserting a new
 # module there without also renumbering those earlier jump-counts
-# means a successful pam_unix/pam_winbind/pam_sss auth falls through
-# and lands on `pam_deny.so requisite`, which always fails and aborts
-# the whole stack -- i.e. a correct password gets rejected. Both
-# chains below explicitly fix those counts (verified against this
-# host's actual /etc/pam.d/common-{auth,password} -- re-verify if the
-# stack ever gains/loses a provider) rather than relying on pamd to
-# figure it out. Read straight from community.general's pamd.py before
-# relying on any of this: `control` is a required match key for every
-# state (including `updated`/`absent`, not just `before`/`after`), and
-# `module_path` for matching an *existing* rule must be the bare path
-# only (e.g. `pam_unix.so`) -- the file parser splits path from
-# trailing module arguments via regex, so a combined "path args" string
-# never matches anything and silently no-ops (`new_module_path`, used
-# only to construct a brand new line, is the one place a combined
-# string is fine).
+# means a successful pam_unix/pam_sss auth falls through and lands on
+# `pam_deny.so requisite`, which always fails and aborts the whole
+# stack -- i.e. a correct password gets rejected. Both chains below
+# explicitly fix those counts (verified against this fleet's actual
+# /etc/pam.d/common-{auth,password} -- re-verify if the stack ever
+# gains/loses a provider) rather than relying on pamd to figure it out.
+# Read straight from community.general's pamd.py before relying on any
+# of this: `control` is a required match key for every state (including
+# `updated`/`absent`, not just `before`/`after`), and `module_path` for
+# matching an *existing* rule must be the bare path only (e.g.
+# `pam_unix.so`) -- the file parser splits path from trailing module
+# arguments via regex, so a combined "path args" string never matches
+# anything and silently no-ops (`new_module_path`, used only to
+# construct a brand new line, is the one place a combined string is
+# fine).
+#
+# Whether pam_winbind.so is stacked alongside pam_unix/pam_sss changes
+# pam_unix's correct jump-count (stortree_samba actively removes
+# winbind -- it's an unwanted side effect of samba's package
+# Recommends, not something this fleet wants authenticating anyone --
+# but a host may not have converged yet), so each chain below detects
+# winbind's actual presence in the live file first and branches on it,
+# rather than guessing from the numbers alone: a fixed host's winbind-
+# absent target value (pam_unix success=3 in the auth chain) is
+# numerically identical to the winbind-present case's *trigger* value,
+# so a naive "old -> new" pair that tried to handle both shapes would
+# misfire on a second run and drift the count upward forever.
 #
 # Each chain also unconditionally removes any existing copy of the
 # sync-script line before reinserting exactly one, rather than trusting
@@ -86,6 +98,20 @@
     mode: "0700"
   tags: [pam_smbpass]
 
+- name: Check whether pam_winbind is still stacked in the auth chain
+  ansible.builtin.command: grep -q pam_winbind.so /etc/pam.d/common-auth
+  register: stortree_pam_winbind_in_auth
+  changed_when: false
+  failed_when: false
+  tags: [pam_smbpass]
+
+- name: Check whether pam_winbind is still stacked in the password chain
+  ansible.builtin.command: grep -q pam_winbind.so /etc/pam.d/common-password
+  register: stortree_pam_winbind_in_password
+  changed_when: false
+  failed_when: false
+  tags: [pam_smbpass]
+
 - name: Remove any previously-stacked sync script from the auth chain
   community.general.pamd:
     name: common-auth
@@ -95,20 +121,47 @@
     state: absent
   tags: [pam_smbpass]
 
-- name: Fix the pam_unix/pam_winbind/pam_sss jump counts in the auth chain so a success can't fall through into the sync script and pam_deny.so
+- name: Fix pam_unix's jump count in the auth chain (winbind present)
   community.general.pamd:
     name: common-auth
     type: auth
-    control: "[success={{ item.old }} default=ignore]"
-    module_path: "{{ item.module_path }}"
-    new_control: "[success={{ item.new }} default=ignore]"
+    control: "[success=3 default=ignore]"
+    module_path: pam_unix.so
+    new_control: "[success=4 default=ignore]"
     state: updated
-  loop:
-    - { module_path: pam_unix.so, old: 3, new: 4 }
-    - { module_path: pam_winbind.so, old: 2, new: 3 }
-    - { module_path: pam_sss.so, old: 1, new: 2 }
-  loop_control:
-    label: "{{ item.module_path }}"
+  when: stortree_pam_winbind_in_auth.rc == 0
+  tags: [pam_smbpass]
+
+- name: Fix pam_unix's jump count in the auth chain (winbind absent)
+  community.general.pamd:
+    name: common-auth
+    type: auth
+    control: "[success=2 default=ignore]"
+    module_path: pam_unix.so
+    new_control: "[success=3 default=ignore]"
+    state: updated
+  when: stortree_pam_winbind_in_auth.rc != 0
+  tags: [pam_smbpass]
+
+- name: Fix pam_winbind's jump count in the auth chain
+  community.general.pamd:
+    name: common-auth
+    type: auth
+    control: "[success=2 default=ignore]"
+    module_path: pam_winbind.so
+    new_control: "[success=3 default=ignore]"
+    state: updated
+  when: stortree_pam_winbind_in_auth.rc == 0
+  tags: [pam_smbpass]
+
+- name: Fix pam_sss's jump count in the auth chain
+  community.general.pamd:
+    name: common-auth
+    type: auth
+    control: "[success=1 default=ignore]"
+    module_path: pam_sss.so
+    new_control: "[success=2 default=ignore]"
+    state: updated
   tags: [pam_smbpass]
 
 - name: Stack the sync script into the auth chain, after pam_sss
@@ -132,23 +185,42 @@
     state: absent
   tags: [pam_smbpass]
 
-- name: Fix the pam_unix/pam_winbind jump counts in the password chain so a success can't fall through into the sync script and pam_deny.so
-  # pam_sss.so itself needs no adjustment here: it uses plain `sufficient`
-  # rather than a success=N jump count, so its position relative to
-  # pam_deny.so doesn't matter.
+- name: Fix pam_unix's jump count in the password chain (winbind present)
   community.general.pamd:
     name: common-password
     type: password
-    control: "[success={{ item.old }} default=ignore]"
-    module_path: "{{ item.module_path }}"
-    new_control: "[success={{ item.new }} default=ignore]"
+    control: "[success=3 default=ignore]"
+    module_path: pam_unix.so
+    new_control: "[success=4 default=ignore]"
     state: updated
-  loop:
-    - { module_path: pam_unix.so, old: 3, new: 4 }
-    - { module_path: pam_winbind.so, old: 2, new: 3 }
-  loop_control:
-    label: "{{ item.module_path }}"
+  when: stortree_pam_winbind_in_password.rc == 0
   tags: [pam_smbpass]
+
+- name: Fix pam_unix's jump count in the password chain (winbind absent)
+  community.general.pamd:
+    name: common-password
+    type: password
+    control: "[success=2 default=ignore]"
+    module_path: pam_unix.so
+    new_control: "[success=3 default=ignore]"
+    state: updated
+  when: stortree_pam_winbind_in_password.rc != 0
+  tags: [pam_smbpass]
+
+- name: Fix pam_winbind's jump count in the password chain
+  community.general.pamd:
+    name: common-password
+    type: password
+    control: "[success=2 default=ignore]"
+    module_path: pam_winbind.so
+    new_control: "[success=3 default=ignore]"
+    state: updated
+  when: stortree_pam_winbind_in_password.rc == 0
+  tags: [pam_smbpass]
+
+# pam_sss.so itself needs no jump-count fix in the password chain: it
+# uses plain `sufficient` rather than a success=N jump count, so its
+# position relative to pam_deny.so doesn't matter.
 
 - name: Stack the sync script into the password chain, before pam_sss
   community.general.pamd:

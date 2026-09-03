@@ -3,8 +3,34 @@
   ansible.builtin.apt:
     name: samba
     state: present
+    install_recommends: false
     update_cache: true
     cache_valid_time: 3600
+  tags: [samba]
+
+- name: Remove winbind
+  # samba Recommends: winbind, which apt pulls in by default -- and
+  # libpam-winbind's postinst auto-registers its own PAM profile via
+  # pam-auth-update, entangling pam_winbind into every login on the host
+  # (auth, account, password, session) even though nothing here ever
+  # asked for it. This host runs standalone `security = user` Samba with
+  # no domain join (smb.conf.j2), so winbindd has no legitimate role --
+  # but it still exposes the machine's own local SAM (the same tdbsam
+  # database stortree_pam_smbpass's sync script writes to) as a
+  # pseudo-domain named after the host's NetBIOS name, and pam_winbind
+  # authenticates against *that* instead of LDAP/SSSD, silently
+  # rewriting the PAM username to `<NETBIOS-NAME>\<user>` on success --
+  # which breaks every later PAM phase and every getpwnam() call that
+  # expects the plain LDAP username. `install_recommends: false` above
+  # stops it from being pulled back in; this removes it from hosts where
+  # it already landed.
+  ansible.builtin.apt:
+    name:
+      - winbind
+      - libpam-winbind
+      - libnss-winbind
+    state: absent
+    autoremove: true
   tags: [samba]
 
 - name: Render smb.conf (validated with testparm before it's written)
