@@ -4,10 +4,11 @@
   become: true
   gather_facts: false
   tasks:
-    - name: Alpha owns backups and home's non-bravo pieces
+    - name: Alpha owns tree, backups, and home's non-bravo pieces
       ansible.builtin.assert:
         that:
-          - "'backups' in (stortree.server_subtrees | map(attribute='path') | list)"
+          - "'tree' in (stortree.server_subtrees | map(attribute='path') | list)"
+          - "'tree/backups' in (stortree.server_subtrees | map(attribute='path') | list)"
       when: inventory_hostname == 'storage-node-alpha'
 
     - name: Bravo has a genuine peer dependency on alpha

@@ -14,36 +14,47 @@ nested, as `media-prod` does for `rclone`).
 
 ## config.yml
 
+The top level of the file *is* the map of top-level subtrees — every key
+at this one level names a real subdirectory of `/srv/stortree` directly,
+no wrapping `subdirs:` key needed here (nested subdirs still use their
+own `subdirs:`/`user-subdirs:` key, same as always). There's no single
+implicit tree root: each top-level entry is independent and stands on
+its own, shaped exactly like any other node below it:
+
 ```yaml
-host: <hostname>              # default serving host for the whole tree
-rclone.remote: <remote-spec>  # default rclone source for the tree — see "rclone.remote is verbatim" below
+<name>:                       # a real subdirectory of /srv/stortree
+  host: <hostname>            # serving host for this subtree and everything under it
+  rclone.remote: <remote-spec>  # optional — see "rclone.remote is verbatim" below;
+                               # with host+remote both set, <hostname> self-mounts it,
+                               # same rule as any other node (see "Node inheritance")
 
-client-defaults:
-  rclone.args: {...}          # base rclone mount args, merged into every client mount —
-                               # including an inventory host with no entry under clients: below
+  client-defaults:
+    rclone.args: {...}        # base rclone mount args, merged into every non-owning
+                               # host's peer mount of this subtree — including one with
+                               # no entry under clients: below
+    rclone: false              # optional — set instead of/alongside .args to keep this
+                               # subtree off every non-owning host by default; see
+                               # "Per-client mount opt-out" below
 
-clients:
-  <hostname>:
-    rclone.args: {...}        # this client's overrides, merged over client-defaults —
+  clients:
+    <hostname>:
+      rclone.args: {...}      # this client's overrides, merged over client-defaults —
                                # a host needs no entry here to become a client; see
                                # "Every inventory host participates" below
+      rclone: false            # optional per-client override of client-defaults.rclone;
+                               # see "Per-client mount opt-out" below
 
-subdirs:
-  <name>:
-    host: <hostname>          # optional; inherits nearest ancestor's host if omitted
-    rclone.remote: <remote-spec>  # optional; never inherits — see "Node inheritance" below
-                               # for what a node with no rclone.remote of its own resolves to
-    rclone.args: {...}        # optional; used as-is for this node only, does not inherit
-    access: {group: <name>, owner: <name>, permissions: <rwx-string>}  # see Access below
+  access: {group: <name>, owner: <name>, permissions: <rwx-string>}  # see Access below
                                # — a single object, all three optional; dotted shorthand
                                # (access.group:/access.owner:/access.permissions:) works too
-    samba:
-      subpath: "<template>"   # e.g. "%U" for per-connecting-user substitution
+  samba:
+    subpath: "<template>"     # e.g. "%U" for per-connecting-user substitution
                                # — every participating host exposes this node
                                # as a share, not just its resolved owner; see
                                # "Samba sharing is universal" below
-    subdirs: {...}            # recurse
-    user-subdirs: {...}       # recurse — see note below
+  subdirs: {...}               # recurse — this and everything under it works exactly the
+                               # same as it does at the top level, just nested
+  user-subdirs: {...}          # recurse — see note below
 ```
 
 ### Example
@@ -51,124 +62,203 @@ subdirs:
 A filled-in tree, used as the running example for the rest of this doc —
 a default host serving most of the tree directly, a second host serving a
 couple of subtrees of its own, and a third host that only ever
-client-mounts. It shows both `cache-dir` patterns from spec.md §1: `media-prod`
-points its `cache-dir` straight at a plain path under the fixed
-`/srv/stortree` root (the host's own local tree, no separate mount needed),
-while `storage-node-bravo` instead points its `cache-dir` at
-`.cache.subdirs.storage-node-bravo` below — a real `some-remote`-backed
-mount (a separate disk on `storage-node-bravo`'s local network), so the vfs
-cache lives off-host rather than competing for space on the box itself:
+client-mounts. It shows both `cache-dir` patterns from spec.md §1:
+`media-prod` points its `cache-dir` straight at a plain path under the
+fixed `/srv/stortree` root (the host's own local tree, no separate mount
+needed), while `storage-node-bravo` instead points its `cache-dir` at
+`.bravo-cache` below — a real `some-remote`-backed mount (a separate disk
+on `storage-node-bravo`'s local network), so the vfs cache lives off-host
+rather than competing for space on the box itself. `.bravo-cache` and
+`.gcs-cache` are their own top-level subtrees, siblings of `tree` rather
+than nested inside it — nesting a VFS-cache mount inside another host's
+own mount is exactly the kind of collision top-level subtrees exist to
+avoid (see "Top-level subtrees" below), and each sets
+`client-defaults.rclone: false` since nothing but its own owning host
+ever needs it mounted anywhere:
 
 ```yaml
-host: storage-node-alpha
-rclone.remote: storagebox:/
+tree:
+  host: storage-node-alpha
+  rclone.remote: storagebox:/
 
-client-defaults:
-  rclone.args:
-    vfs-cache-mode: full
-    vfs-cache-max-age: 100h
-    dir-cache-time: 5m
-
-clients:
-  some-storage-gadget:
+  client-defaults:
     rclone.args:
-      vfs-cache-max-size: 20G
-      cache-dir: /mnt/some-volume/.rclone-cache
-  storage-node-bravo:
-    rclone.args:
-      vfs-cache-max-size: 5G
-      cache-dir: /srv/stortree/.cache/storage-node-bravo
+      vfs-cache-mode: full
+      vfs-cache-max-age: 100h
+      dir-cache-time: 5m
 
-subdirs:
-  .cache.subdirs:
+  clients:
+    some-storage-gadget:
+      rclone.args:
+        vfs-cache-max-size: 20G
+        cache-dir: /mnt/some-volume/.rclone-cache
     storage-node-bravo:
-      host: storage-node-bravo
-      rclone.remote: some-remote:/.stortree-cache
-    some-gcs-bucket: {}
-  backups: {}
-  home:
-    samba:
-      subpath: "%U"
-    user-subdirs:
-      whitfield-media:
-        access:
-          group: "Whitfield Family & Friends"
-          permissions: rx
-        host: storage-node-bravo
-        rclone.remote: some-remote:/media
-      sys-configs:
-        access.owner: jd
-      mw-fam:
-        access.group: "Michael Whitfield Family"
-        host: storage-node-bravo
-        rclone.remote: some-remote:/fam
-      media-prod:
-        access.group: Media Production
-        rclone:
-          remote: some-gcs-bucket:/
-          args:
-            vfs-cache-mode: full
-            vfs-cache-max-size: 5G
-            vfs-cache-max-age: 100h
-            dir-cache-time: 5m
-            cache-dir: /srv/stortree/.cache/some-gcs-bucket
+      rclone.args:
+        vfs-cache-max-size: 5G
+        cache-dir: /srv/stortree/.bravo-cache
+
+  subdirs:
+    backups: {}
+    home:
+      samba:
+        subpath: "%U"
+      user-subdirs:
+        whitfield-media:
+          access:
+            group: "Whitfield Family & Friends"
+            permissions: rx
+          host: storage-node-bravo
+          rclone.remote: some-remote:/media
+        sys-configs:
+          access.owner: jd
+        mw-fam:
+          access.group: "Michael Whitfield Family"
+          host: storage-node-bravo
+          rclone.remote: some-remote:/fam
+        media-prod:
+          access.group: Media Production
+          rclone:
+            remote: some-gcs-bucket:/
+            args:
+              vfs-cache-mode: full
+              vfs-cache-max-size: 5G
+              vfs-cache-max-age: 100h
+              dir-cache-time: 5m
+              cache-dir: /srv/stortree/.gcs-cache/media-prod
+
+.bravo-cache:
+  host: storage-node-bravo
+  rclone.remote: some-remote:/.stortree-cache
+  client-defaults:
+    rclone: false
+
+.gcs-cache:
+  host: storage-node-alpha
+  rclone.remote: some-gcs-bucket:/
+  client-defaults:
+    rclone: false
 ```
 
-`storage-node-alpha` is the tree's default host: it owns everything under
-`subdirs` that doesn't override `host`. Unlike `host`, `rclone` never
-inherits (see "Node inheritance" below), so a node under
-`storage-node-alpha` that sets neither its own `rclone` nor a different
-`host` — `backups`, `.cache`, `.cache/some-gcs-bucket`, `sys-configs` —
-resolves with no remote at all: each is just a plain directory that has
-to exist under `storage-node-alpha`'s own local tree
-(`/srv/stortree/backups`, `/srv/stortree/.cache`, and so on), not a
-separate rclone mount. This is purely a resolution default — it does not
-make `storage-node-alpha` special at runtime (there is no "root host" in
-the Ansible design; see [spec.md](spec.md)). Any host in `config.yml` is
-applied to the same way, from the same control node, over the same
-`ansible-playbook` run. `storage-node-bravo` owns three subtrees of its
-own (its `.cache.subdirs` cache mount, `whitfield-media`, `mw-fam`), each
-setting its own `rclone.remote` explicitly, pointed at a different remote
-(`some-remote`) than the one `storage-node-alpha` mounts.
+`storage-node-alpha` is `tree`'s own host: it owns everything under
+`tree`'s `subdirs` that doesn't override `host`, and — since `tree` sets
+its own `host`+`rclone.remote` — self-mounts `tree` itself too (see
+"Node inheritance" below; every top-level subtree with both is an
+ordinary mountable node for its own host, not special-cased). Unlike
+`host`, `rclone` never inherits, so a node under `storage-node-alpha`
+that sets neither its own `rclone` nor a different `host` — `backups`,
+`sys-configs` — resolves with no remote at all: each is just a plain
+directory that has to exist under `storage-node-alpha`'s own local tree
+(`/srv/stortree/tree/backups`, `/srv/stortree/tree/home/<user>/
+sys-configs`), not a separate rclone mount. This is purely a resolution
+default — it does not make `storage-node-alpha` special at runtime
+(there is no "root host" in the Ansible design; see [spec.md](spec.md)).
+Any host in `config.yml` is applied to the same way, from the same
+control node, over the same `ansible-playbook` run. `storage-node-bravo`
+owns three subtrees of its own (`.bravo-cache`, `whitfield-media`,
+`mw-fam`), each setting its own `rclone.remote` explicitly, pointed at a
+different remote (`some-remote`) than the one `storage-node-alpha`
+mounts.
 
-`.cache.subdirs.storage-node-bravo` is itself a resolved subtree, like any
-other — server-owned by `storage-node-bravo`, mounted from `some-remote`
-(a device on that host's own local network). Its only purpose is to back
+`.bravo-cache` is itself a resolved top-level subtree, like `tree` —
+server-owned by `storage-node-bravo`, mounted from `some-remote` (a
+device on that host's own local network). Its only purpose is to back
 the `cache-dir` that `clients.storage-node-bravo.rclone.args` points at
-above: `storage-node-bravo` caches the files `storagebox` serves (as the
-tree's default remote, via `storage-node-alpha`) onto that local-network
-disk rather than its own. `stortree_mounts` (spec.md §2) mounts it first
-and wires the client mount's unit to require it (`RequiresMountsFor=`),
-since the cache path has to exist before anything can write into it.
-`media-prod`'s `cache-dir`, by contrast, needs no such node — it's a plain
-path under the fixed `/srv/stortree` root, backed by nothing but the
-host's own local disk.
+above: `storage-node-bravo` caches the files `storagebox` serves (as
+`tree`'s own remote, via `storage-node-alpha`) onto that local-network
+disk rather than its own. Because it's a sibling of `tree` rather than
+nested inside it, `stortree_mounts` (spec.md §2) never has to order one
+against the other — `.bravo-cache` mounts independently, with no
+`RequiresMountsFor=` relationship to `tree`'s own mount in either
+direction. `media-prod`'s `cache-dir`, by contrast, needs no such
+top-level subtree at all — it's a plain path under `.gcs-cache`, itself
+just backed by the host's own local disk once mounted.
 
 `some-storage-gadget` owns no subtree at all — it only appears under
-`clients:` — but because `home` carries a `samba:` block, it still ends up
-exporting a `home` Samba share of its own: it peer-sources every piece of
-`home` it doesn't own (which, since it owns none of `home`, is all of it)
-— `sys-configs` and `media-prod` from `storage-node-alpha`,
-`whitfield-media` and `mw-fam` from `storage-node-bravo` — the same way
-`storage-node-alpha` peer-sources `storage-node-bravo`'s pieces for its
-own copy of the share. See "Samba sharing is universal" below. The same
-would hold for a fourth host with no mention in `config.yml` at all,
-present only in the Ansible inventory — see "Every inventory host
-participates" below.
+`tree`'s `clients:` — but because `home` carries a `samba:` block, it
+still ends up exporting a `home` Samba share of its own: it peer-sources
+every piece of `home` it doesn't own (which, since it owns none of
+`home`, is all of it) — `sys-configs` and `media-prod` from
+`storage-node-alpha`, `whitfield-media` and `mw-fam` from
+`storage-node-bravo` — the same way `storage-node-alpha` peer-sources
+`storage-node-bravo`'s pieces for its own copy of the share. See "Samba
+sharing is universal" below. The same would hold for a fourth host with
+no mention in `config.yml` at all, present only in the Ansible inventory
+— see "Every inventory host participates" below.
 
 Every name here — hosts, groups, the `jd` user — is fictional; §§ below
 reference this same example throughout, all names/values used
 consistently.
 
+### Top-level subtrees
+
+Every key at the top level of `config.yml` is an independent subtree,
+sibling to every other one — none of them nests inside another, even
+though the resolved filesystem still puts them all under the one fixed
+`/srv/stortree` (spec.md §2). This matters for two things:
+
+- **Mount ordering.** A nested node's mount only ever has to wait for
+  its own real ancestor's mount (`requires_slug`, spec.md §2) — a
+  top-level subtree has no ancestor at all, so its mount never depends on
+  another top-level subtree's mount being up first, and nothing else's
+  mount ever depends on it unless something is genuinely nested inside
+  it. Two top-level subtrees whose mounts would otherwise race or shadow
+  each other (e.g. one host's own VFS-cache mount and the tree it caches
+  for) simply can't, structurally, as long as neither is nested inside
+  the other.
+- **Ownership.** A top-level subtree with its own `host`+`rclone.remote`
+  is an ordinary mountable node — its owning host self-mounts it via
+  `server_subtrees`, the same as any node anywhere else in the tree (see
+  "Node inheritance" below). There's no single implicit "tree root" that
+  behaves differently from everything nested inside it.
+
+### Per-client mount opt-out
+
+By default, every top-level subtree with its own `rclone.remote` is
+peer-mounted onto every inventory host that doesn't own it (see "Every
+inventory host participates" below). A subtree that has no business being
+visible anywhere but its own owning host — a per-host VFS-cache backing
+store like `.bravo-cache`/`.gcs-cache` above being the common case — can
+opt out with `client-defaults.rclone: false`:
+
+```yaml
+<name>:
+  host: <hostname>
+  rclone.remote: <remote-spec>
+  client-defaults:
+    rclone: false             # no non-owning host gets a mount of this by default
+  clients:
+    <hostname>:
+      rclone: false            # or true / {args: {...}} — always wins over client-defaults
+```
+
+`clients.<hostname>.rclone` always wins over `client-defaults.rclone`
+when both are set for the same host: with `client-defaults.rclone:
+false`, a `clients.<hostname>.rclone` entry that's truthy (`true`, or a
+dict — with or without `.args`) becomes an *allow-list* — only hosts
+listed that way get a mount, everyone else gets none. With
+`client-defaults.rclone` left at its default (unset, i.e. enabled), a
+`clients.<hostname>.rclone: false` entry becomes a *deny-list* instead —
+every non-owning host gets a mount except the ones explicitly disabled.
+The owning host itself is never affected either way — it always
+self-mounts via `server_subtrees`, never through this client-mount path
+at all. This applies uniformly to a top-level subtree's own peer mount
+and to any Samba descendant nested under it (see "Samba sharing is
+universal" below) — one setting governs everything a non-owning host
+would otherwise reach inside that subtree.
+
 ### Node inheritance
 
-Every node under `subdirs`/`user-subdirs` inherits `host` from its
-nearest ancestor unless it overrides it. `rclone` — both `remote` and
-`args` — is different: it **never** inherits, from an ancestor node or
-from the root. A node's `rclone` config is used exactly as set on that
-node, full stop; a node with no `rclone.remote` of its own resolves to no
-remote at all, regardless of what any ancestor (root included) sets — see
-spec.md §1 for the full rationale.
+Every node — top-level or nested under `subdirs`/`user-subdirs` — inherits
+`host` from its nearest ancestor unless it overrides it (a top-level node
+has no ancestor to inherit from, so it always sets its own `host`
+explicitly). `rclone` — both `remote` and `args` — is different: it
+**never** inherits, from an ancestor node or from a top-level one. A
+node's `rclone` config is used exactly as set on that node, full stop; a
+node with no `rclone.remote` of its own resolves to no remote at all,
+regardless of what any ancestor sets — see spec.md §1 for the full
+rationale. A node with both `host` and `rclone.remote` set is an ordinary
+mountable node, self-mounted by its owning host — true at any depth,
+top-level subtrees included (see "Top-level subtrees" above).
 
 A node that resolves with no `rclone.remote` isn't a separate mounted
 subtree — there's no remote for it to mount from. What that means
@@ -176,16 +266,14 @@ depends on whether it also changes `host`:
 
 - **Same `host` (inherited, not overridden)**: the node is just a plain
   subdirectory that has to exist inside the tree its inherited `host`
-  already serves. `backups: {}`, `.cache`, `.cache/some-gcs-bucket`, and
-  `sys-configs` (`access.owner: jd`) in the example above are all exactly
-  this — none of them set their own `rclone` or a different `host`, so
-  each resolves to an ordinary, empty directory under
-  `storage-node-alpha`'s own local tree (`/srv/stortree/backups`,
-  `/srv/stortree/.cache`, `/srv/stortree/.cache/some-gcs-bucket`,
-  `/srv/stortree/home/<user>/sys-configs`) — nothing is mounted at any of
-  those paths. `resolve()`/`stortree_plan_mounts` still track the node
-  (for ownership/mode, Samba export, per-user expansion), just without an
-  rclone unit backing it.
+  already serves. `backups: {}` and `sys-configs` (`access.owner: jd`) in
+  the example above are both exactly this — neither sets its own `rclone`
+  or a different `host`, so each resolves to an ordinary, empty directory
+  under `storage-node-alpha`'s own local tree (`/srv/stortree/tree/
+  backups`, `/srv/stortree/tree/home/<user>/sys-configs`) — nothing is
+  mounted at either path. `resolve()`/`stortree_plan_mounts` still track
+  the node (for ownership/mode, Samba export, per-user expansion), just
+  without an rclone unit backing it.
 - **Different `host`, still no `rclone` of its own**: that `host` has to
   keep the directory's data locally — there's no remote configured for it
   to mount from, so whatever ends up there is real local storage on that
@@ -297,16 +385,20 @@ every node with any `access` at all.
 
 `clients:` is only ever for a per-host override, never a prerequisite for
 being a client. Every host in the Ansible inventory
-(`inventory/hosts.yml`, spec.md "Config layout") that isn't itself some
-node's resolved `host` gets a client mount of the tree root, whether or
-not it has a `clients:` entry and whether or not it's named anywhere in
-`config.yml` at all. With an entry, `clients.<hostname>.rclone.args`
-merges over `client-defaults`; without one, it just gets `client-defaults`
-verbatim. That mount is **not** a direct mount of the root
-`rclone.remote` — it's a peer-sftp mount of the resolved owner's
-(`host:`'s) own `/srv/stortree`, provisioned by `stortree_peer_trust` the
-same way as any other peer dependency (spec.md §1/§7); a client never
-holds credentials for the root remote itself.
+(`inventory/hosts.yml`, spec.md "Config layout") that isn't itself a
+given top-level subtree's resolved `host` gets a client mount of that
+subtree, whether or not it has a `clients:` entry there and whether or
+not it's named anywhere in `config.yml` at all — unless that subtree's
+own `client-defaults`/`clients.<hostname>` opts it out (see "Per-client
+mount opt-out" above). With a `clients:` entry, `clients.<hostname>.
+rclone.args` merges over `client-defaults`; without one, it just gets
+`client-defaults` verbatim. That mount is **not** a direct mount of the
+subtree's own `rclone.remote` — it's a peer-sftp mount of the resolved
+owner's (`host:`'s) own copy of that subtree, provisioned by
+`stortree_peer_trust` the same way as any other peer dependency (spec.md
+§1/§7); a client never holds credentials for the subtree's remote itself.
+This applies independently to every top-level subtree — a host can own
+one, client-mount another, and be opted out of a third, all at once.
 
 The same goes for "Samba sharing is universal" below and for cross-host
 peer dependencies (spec.md §1/§7): both apply to every inventory host
@@ -339,9 +431,19 @@ inventory host — server, client-only, or entirely unnamed in
 
 ### A dotted-path map key
 
-`.cache.subdirs:` under `subdirs:` is the same dotted shorthand as
-elsewhere: subdir named `.cache`, containing a nested `subdirs:` map
-(`storage-node-bravo`, `some-gcs-bucket`). Not a subdir literally named `.cache.subdirs`.
+`.cache.subdirs:` under any `subdirs:` map is the same dotted shorthand
+as elsewhere: a subdir named `.cache`, containing a nested `subdirs:` map
+of its own. Not a subdir literally named `.cache.subdirs`. This splits on
+the *last* dot only, so a key with more than one dot still expands
+correctly (`.cache.subdirs` → `.cache` + `subdirs`, not shredded on every
+`.`).
+
+A bare, dot-prefixed key with no further dots after it — `.bravo-cache`
+in the worked example above, used at the top level with no `.subdirs`/
+etc suffix — is different: it's a single literal key (this codebase's
+hidden-subtree naming convention, matching `.cache`'s own leading dot),
+not a two-segment shorthand with an empty first segment. It's left
+untouched rather than being expanded into `{"": {"bravo-cache": {...}}}`.
 
 ## ldap.yml
 

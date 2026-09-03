@@ -1,0 +1,41 @@
+# Molecule managed
+#
+# Override of molecule_plugins' own default Dockerfile.j2, needed only
+# for this scenario's Debian-buster-based mock images (osixia/openldap
+# -- atmoz/sftp is Alpine and never touches the apt-get branch below).
+# buster went EOL and its packages moved to archive.debian.org; the live
+# deb.debian.org/security.debian.org mirrors 404 on it now, which broke
+# `apt-get update` outright the first time this scenario was actually
+# run (docs/plan.md "What's verified" -- it never had been, before).
+# Repointing at the archive (and disabling the now-permanently-expired
+# Valid-Until check) is the minimal fix that doesn't change which image
+# or bootstrap env vars the scenario actually exercises.
+
+{% if item.registry is defined %}
+FROM {{ item.registry.url }}/{{ item.image }}
+{% else %}
+FROM {{ item.image }}
+{% endif %}
+
+{% if item.env is defined %}
+{% for var, value in item.env.items() %}
+{% if value %}
+ENV {{ var }} {{ value }}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+RUN if [ $(command -v apt-get) ]; then \
+      if [ -f /etc/apt/sources.list ] && grep -qi buster /etc/apt/sources.list; then \
+        sed -i -e '/buster-backports/d' \
+               -e 's|http://deb\.debian\.org/debian|http://archive.debian.org/debian|g' \
+               -e 's|http://security\.debian\.org/debian-security|http://archive.debian.org/debian-security|g' \
+               /etc/apt/sources.list && \
+        echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until; \
+      fi; \
+      export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install -y python3 sudo bash ca-certificates iproute2 python3-apt aptitude rsync && apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    elif [ $(command -v dnf) ]; then dnf makecache && dnf --assumeyes install /usr/bin/python3 /usr/bin/python3-config /usr/bin/dnf-3 sudo bash iproute rsync && dnf clean all; \
+    elif [ $(command -v yum) ]; then yum makecache fast && yum install -y /usr/bin/python /usr/bin/python2-config sudo yum-plugin-ovl bash iproute rsync && sed -i 's/plugins=0/plugins=1/g' /etc/yum.conf && yum clean all; \
+    elif [ $(command -v zypper) ]; then zypper refresh && zypper install -y python3 sudo bash iproute2 rsync && zypper clean -a; \
+    elif [ $(command -v apk) ]; then apk update && apk add --no-cache python3 sudo bash ca-certificates rsync; \
+    elif [ $(command -v xbps-install) ]; then xbps-install -Syu && xbps-install -y python3 sudo bash ca-certificates iproute2 rsync && xbps-remove -O; fi

@@ -47,13 +47,15 @@ def test_access_as_a_list_is_rejected():
     # enforceable anymore (spec.md §6) -- fail loudly at resolve() rather
     # than silently doing something wrong with it.
     tree = {
-        "host": "h1",
-        "rclone.remote": "r1:/",
-        "subdirs": {
-            "leaf": {
-                "access": [{"group": "a", "permissions": "rx"}, {"group": "b"}],
-            }
-        },
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "leaf": {
+                    "access": [{"group": "a", "permissions": "rx"}, {"group": "b"}],
+                }
+            },
+        }
     }
     with pytest.raises(ValueError, match="access must be a single object"):
         resolve(tree, "h1", ["h1"])
@@ -65,55 +67,73 @@ def test_access_as_a_list_is_rejected():
 def test_alpha_owns_everything_not_overridden():
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     assert paths(r["server_subtrees"]) == {
-        ".cache",
-        ".cache/some-gcs-bucket",
-        "backups",
-        "home",
-        "home/%U/sys-configs",
-        "home/%U/media-prod",
+        "tree",
+        "tree/backups",
+        "tree/home",
+        "tree/home/%U/sys-configs",
+        "tree/home/%U/media-prod",
+        ".gcs-cache",
     }
+    # alpha owns both top-level subtrees it has a remote for -- unlike
+    # the old single-implicit-root design, a top-level entry is an
+    # ordinary mountable node now, so its owner self-mounts it same as
+    # any other node with its own host+remote
+    tree = by_path(r["server_subtrees"], "tree")
+    assert tree["remote"] == "storagebox:/"
+    gcs_cache = by_path(r["server_subtrees"], ".gcs-cache")
+    assert gcs_cache["remote"] == "some-gcs-bucket:/"
     # backups sets neither its own rclone nor a different host -- rclone
     # never inherits, so it resolves with no remote at all (just a plain
     # directory that has to exist under alpha's own local tree)
-    backups = by_path(r["server_subtrees"], "backups")
+    backups = by_path(r["server_subtrees"], "tree/backups")
     assert backups["remote"] is None
     assert backups["args"] == {}
-    # root host never gets a generic client mount of its own remote
+    # alpha doesn't own .bravo-cache, but that subtree's own
+    # client-defaults.rclone: false keeps it off every host that isn't
+    # explicitly listed in its `clients:` -- alpha isn't, so no client
+    # mount at all
     assert r["client_mounts"] == []
 
 
 def test_bravo_owns_three_subtrees_with_a_different_remote():
     r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
     assert paths(r["server_subtrees"]) == {
-        ".cache/storage-node-bravo",
-        "home/%U/whitfield-media",
-        "home/%U/mw-fam",
+        ".bravo-cache",
+        "tree/home/%U/whitfield-media",
+        "tree/home/%U/mw-fam",
     }
-    for entry in r["server_subtrees"]:
-        assert entry["remote"].startswith("some-remote:")
+    for path in ("tree/home/%U/whitfield-media", "tree/home/%U/mw-fam"):
+        assert by_path(r["server_subtrees"], path)["remote"].startswith("some-remote:")
+    assert by_path(r["server_subtrees"], ".bravo-cache")["remote"] == (
+        "some-remote:/.stortree-cache"
+    )
 
-    # bravo also has a `clients:` entry -- both lists at once (spec.md §1)
+    # bravo also has a `clients:` entry on `tree` -- both lists at once
+    # (spec.md §1). .gcs-cache is disabled by default (client-defaults.
+    # rclone: false) and bravo isn't in its `clients:`, so it gets none.
     assert len(r["client_mounts"]) == 1
     mount = r["client_mounts"][0]
-    # the root client mount is peer-sourced from alpha (root_host), not a
-    # direct mount of the tree's own rclone.remote -- see the matching
+    assert mount["local_path"] == "tree"
+    # the client mount is peer-sourced from alpha (tree's own owner),
+    # not a direct mount of tree's own rclone.remote -- see the matching
     # peer_dependencies entry below
-    assert mount["remote"] == "peer-storage-node-alpha-root:/srv/stortree"
+    assert mount["remote"] == "peer-storage-node-alpha-tree:/srv/stortree/tree"
     # client-defaults merged with clients.storage-node-bravo overrides
     assert mount["args"]["vfs-cache-mode"] == "full"  # from client-defaults
     assert mount["args"]["vfs-cache-max-size"] == "5G"  # bravo's own override
-    assert mount["args"]["cache-dir"] == "/srv/stortree/.cache/storage-node-bravo"
+    assert mount["args"]["cache-dir"] == "/srv/stortree/.bravo-cache"
 
 
 def test_gadget_owns_nothing_but_gets_a_client_mount_and_full_samba_share():
     r = resolve(EXAMPLE_TREE, "some-storage-gadget", EXAMPLE_HOSTS)
     assert r["server_subtrees"] == []
     assert len(r["client_mounts"]) == 1
+    assert r["client_mounts"][0]["local_path"] == "tree"
     assert r["client_mounts"][0]["args"]["vfs-cache-max-size"] == "20G"
 
     assert len(r["samba_shares"]) == 1
     share = r["samba_shares"][0]
-    assert share["node_path"] == "home"
+    assert share["node_path"] == "tree/home"
     assert share["subpath"] == "%U"
 
     # owns none of it -- every descendant is a peer dependency
@@ -122,10 +142,10 @@ def test_gadget_owns_nothing_but_gets_a_client_mount_and_full_samba_share():
     by_owner = {}
     for p in r["peer_dependencies"]:
         by_owner.setdefault(p["owning_host"], set()).add(p["local_path"])
-    assert "home/%U/whitfield-media" in by_owner["storage-node-bravo"]
-    assert "home/%U/mw-fam" in by_owner["storage-node-bravo"]
-    assert "home/%U/sys-configs" in by_owner["storage-node-alpha"]
-    assert "home/%U/media-prod" in by_owner["storage-node-alpha"]
+    assert "tree/home/%U/whitfield-media" in by_owner["storage-node-bravo"]
+    assert "tree/home/%U/mw-fam" in by_owner["storage-node-bravo"]
+    assert "tree/home/%U/sys-configs" in by_owner["storage-node-alpha"]
+    assert "tree/home/%U/media-prod" in by_owner["storage-node-alpha"]
 
 
 def test_alpha_peer_depends_only_on_bravos_pieces():
@@ -133,80 +153,171 @@ def test_alpha_peer_depends_only_on_bravos_pieces():
     owners = {p["owning_host"] for p in r["peer_dependencies"]}
     assert owners == {"storage-node-bravo"}
     local_paths = {p["local_path"] for p in r["peer_dependencies"]}
-    assert local_paths == {"home/%U/whitfield-media", "home/%U/mw-fam"}
+    assert local_paths == {"tree/home/%U/whitfield-media", "tree/home/%U/mw-fam"}
 
 
 def test_alpha_peer_served_by_includes_bravo_and_gadget():
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     servers = {p["serving_host"] for p in r["peer_served_by"]}
     assert servers == {"storage-node-bravo", "some-storage-gadget"}
+    # .gcs-cache is alpha's own too, but client-defaults.rclone: false
+    # keeps it out of peer_served_by for hosts that aren't in its
+    # `clients:` (neither bravo nor gadget is)
+    assert not any(p["local_path"] == ".gcs-cache" for p in r["peer_served_by"])
 
 
-def test_every_non_root_host_peer_sources_its_client_mount_from_root_host():
-    # A client mount is never a direct mount of the tree's own
-    # rclone.remote -- it's a peer-sftp mount of root_host's own
-    # /srv/stortree, sourced the same way as any samba peer dependency
-    # (docs/spec.md §1).
+def test_every_non_owning_host_peer_sources_tree_from_its_owner():
+    # A client mount of a top-level subtree is never a direct mount of
+    # that subtree's own rclone.remote -- it's a peer-sftp mount of the
+    # owning host's own copy, sourced the same way as any samba peer
+    # dependency (docs/spec.md §1).
     for hostname in ("storage-node-bravo", "some-storage-gadget"):
         r = resolve(EXAMPLE_TREE, hostname, EXAMPLE_HOSTS)
-        root_peers = [
+        tree_peers = [
             p
             for p in r["peer_dependencies"]
-            if p["owning_host"] == "storage-node-alpha" and p["local_path"] == ""
+            if p["owning_host"] == "storage-node-alpha" and p["local_path"] == "tree"
         ]
-        assert len(root_peers) == 1
-        assert r["client_mounts"][0]["remote"] == "peer-storage-node-alpha-root:/srv/stortree"
+        assert len(tree_peers) == 1
+        assert (
+            r["client_mounts"][0]["remote"]
+            == "peer-storage-node-alpha-tree:/srv/stortree/tree"
+        )
 
-    # root_host itself never peer-sources its own client mount -- it has
-    # none (test_alpha_owns_everything_not_overridden already asserts
-    # client_mounts == [] for it)
+    # alpha itself never peer-sources its own client mount of tree -- it
+    # owns tree outright (test_alpha_owns_everything_not_overridden
+    # already asserts client_mounts == [] for it)
     alpha = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
-    assert not any(
-        p["local_path"] == "" for p in alpha["peer_dependencies"]
-    )
+    assert not any(p["local_path"] == "tree" for p in alpha["peer_dependencies"])
 
-    # ...and alpha's peer_served_by reflects serving that root mount to
-    # every other host, in addition to whatever samba pieces it serves
-    root_served = [p for p in alpha["peer_served_by"] if p["local_path"] == ""]
-    assert {p["serving_host"] for p in root_served} == {
+    # ...and alpha's peer_served_by reflects serving tree to every other
+    # host, in addition to whatever samba pieces it serves
+    tree_served = [p for p in alpha["peer_served_by"] if p["local_path"] == "tree"]
+    assert {p["serving_host"] for p in tree_served} == {
         "storage-node-bravo",
         "some-storage-gadget",
     }
 
 
-def test_root_with_no_remote_gets_no_root_peer_dependency():
-    # A root with no rclone.remote of its own has nothing to peer for --
-    # the client still resolves (local root directory gets created by
-    # stortree_mounts), just no mount and no peer dependency for it.
-    tree = {"host": "h1", "subdirs": {"plain": {"host": "h2"}}}
+def test_subtree_with_no_remote_gets_no_peer_dependency():
+    # A top-level subtree with no rclone.remote of its own has nothing to
+    # peer for -- the client still resolves (local directory gets created
+    # by stortree_mounts), just no mount and no peer dependency for it.
+    tree = {"top": {"host": "h1", "subdirs": {"plain": {"host": "h2"}}}}
     r = resolve(tree, "h2", ["h1", "h2"])
-    assert r["client_mounts"] == [{"remote": None, "path": "", "args": {}}]
-    assert not any(p["local_path"] == "" for p in r["peer_dependencies"])
+    assert r["client_mounts"] == [{"local_path": "top", "remote": None, "args": {}}]
+    assert not any(p["local_path"] == "top" for p in r["peer_dependencies"])
+
+
+# -- client-defaults.rclone / clients.<host>.rclone opt-out --------------
+
+
+def test_client_defaults_rclone_false_keeps_a_subtree_local_by_default():
+    tree = {
+        "private": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "client-defaults": {"rclone": False},
+        }
+    }
+    for hostname in ("h2", "h3"):
+        r = resolve(tree, hostname, ["h1", "h2", "h3"])
+        assert r["client_mounts"] == []
+        assert not any(p["local_path"] == "private" for p in r["peer_dependencies"])
+    # the owner is unaffected either way -- it self-mounts via
+    # server_subtrees, never through the client-mount/gating path at all
+    owner = resolve(tree, "h1", ["h1", "h2", "h3"])
+    assert paths(owner["server_subtrees"]) == {"private"}
+
+
+def test_clients_override_acts_as_an_allow_list_when_defaults_are_false():
+    tree = {
+        "private": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "client-defaults": {"rclone": False},
+            "clients": {"h2": {"rclone": {"args": {"vfs-cache-max-size": "1G"}}}},
+        }
+    }
+    allowed = resolve(tree, "h2", ["h1", "h2", "h3"])
+    assert allowed["client_mounts"] == [
+        {
+            "local_path": "private",
+            "remote": "peer-h1-private:/srv/stortree/private",
+            "args": {"vfs-cache-max-size": "1G"},
+        }
+    ]
+
+    denied = resolve(tree, "h3", ["h1", "h2", "h3"])
+    assert denied["client_mounts"] == []
+    assert not any(p["local_path"] == "private" for p in denied["peer_dependencies"])
+
+
+def test_clients_override_acts_as_a_deny_list_when_defaults_are_enabled():
+    tree = {
+        "shared": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "clients": {"h2": {"rclone": False}},
+        }
+    }
+    denied = resolve(tree, "h2", ["h1", "h2", "h3"])
+    assert denied["client_mounts"] == []
+
+    allowed = resolve(tree, "h3", ["h1", "h2", "h3"])
+    assert len(allowed["client_mounts"]) == 1
+    assert allowed["client_mounts"][0]["local_path"] == "shared"
+
+
+def test_bravo_cache_and_gcs_cache_reach_no_other_host():
+    # the two independent per-host VFS-cache subtrees in the worked
+    # example are exactly what client-defaults.rclone: false exists for
+    # -- confirm neither ever shows up for a host that doesn't own it
+    for hostname in EXAMPLE_HOSTS:
+        r = resolve(EXAMPLE_TREE, hostname, EXAMPLE_HOSTS)
+        mounted_paths = {m["local_path"] for m in r["client_mounts"]}
+        owned_paths = paths(r["server_subtrees"])
+        for cache_path, owner in ((".bravo-cache", "storage-node-bravo"), (".gcs-cache", "storage-node-alpha")):
+            if hostname == owner:
+                assert cache_path in owned_paths
+            else:
+                assert cache_path not in mounted_paths
+                assert not any(
+                    p["local_path"] == cache_path for p in r["peer_dependencies"]
+                )
 
 
 def test_sys_configs_access_defaults_permissions_and_is_per_user():
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
-    sys_configs = by_path(r["server_subtrees"], "home/%U/sys-configs")
+    sys_configs = by_path(r["server_subtrees"], "tree/home/%U/sys-configs")
     assert sys_configs["per_user"] is True
     assert sys_configs["access"] == {"owner": "jd", "permissions": DEFAULT_ACCESS_PERMISSIONS}
 
 
 def test_rclone_remote_does_not_inherit():
-    r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {"container": {"subdirs": {"child": {}}}},
+        }
+    }
+    r = resolve(tree, "h1", ["h1"])
     # neither sets its own rclone nor a different host -- no inheritance
-    # from root or from each other means both resolve with no remote
-    cache = by_path(r["server_subtrees"], ".cache")
-    cache_gcs = by_path(r["server_subtrees"], ".cache/some-gcs-bucket")
-    assert cache["remote"] is None
-    assert cache_gcs["remote"] is None
-    # host still inherits though -- both are still alpha's own subtrees
-    assert cache["host"] == cache_gcs["host"] == "storage-node-alpha"
+    # from the top-level subtree or from each other means both resolve
+    # with no remote
+    container = by_path(r["server_subtrees"], "top/container")
+    child = by_path(r["server_subtrees"], "top/container/child")
+    assert container["remote"] is None
+    assert child["remote"] is None
+    # host still inherits though -- both are still h1's own subtrees
+    assert container["host"] == child["host"] == "h1"
 
 
 def test_rclone_remote_is_verbatim_when_set_explicitly():
     r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
-    whitfield_media = by_path(r["server_subtrees"], "home/%U/whitfield-media")
-    mw_fam = by_path(r["server_subtrees"], "home/%U/mw-fam")
+    whitfield_media = by_path(r["server_subtrees"], "tree/home/%U/whitfield-media")
+    mw_fam = by_path(r["server_subtrees"], "tree/home/%U/mw-fam")
     # each sets its own rclone.remote explicitly, path included, and
     # resolve() never appends the node's tree position to it
     assert whitfield_media["remote"] == "some-remote:/media"
@@ -218,12 +329,14 @@ def test_node_with_no_rclone_and_unchanged_host_has_no_remote():
     # own, host unchanged from the inherited ancestor -- just a plain
     # directory that has to exist, not a mount
     tree = {
-        "host": "h1",
-        "rclone.remote": "r1:/",
-        "subdirs": {"plain": {}},
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {"plain": {}},
+        }
     }
     r = resolve(tree, "h1", ["h1"])
-    plain = by_path(r["server_subtrees"], "plain")
+    plain = by_path(r["server_subtrees"], "top/plain")
     assert plain["host"] == "h1"
     assert plain["remote"] is None
 
@@ -233,12 +346,14 @@ def test_node_with_changed_host_and_no_rclone_is_local_only():
     # no rclone of its own -- the new host keeps the directory locally,
     # no remote to mount from
     tree = {
-        "host": "h1",
-        "rclone.remote": "r1:/",
-        "subdirs": {"local-on-h2": {"host": "h2"}},
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {"local-on-h2": {"host": "h2"}},
+        }
     }
     r = resolve(tree, "h2", ["h1", "h2"])
-    local_only = by_path(r["server_subtrees"], "local-on-h2")
+    local_only = by_path(r["server_subtrees"], "top/local-on-h2")
     assert local_only["host"] == "h2"
     assert local_only["remote"] is None
 
@@ -279,7 +394,7 @@ def test_host_unnamed_anywhere_in_config_resolves_like_any_other():
         p["local_path"] for p in gadget["peer_dependencies"]
     }
 
-    # and alpha/bravo now also serve charlie
+    # and alpha now also serves charlie
     alpha = resolve(EXAMPLE_TREE, "storage-node-alpha", hosts)
     assert "storage-node-charlie" in {
         p["serving_host"] for p in alpha["peer_served_by"]
@@ -291,18 +406,20 @@ def test_host_unnamed_anywhere_in_config_resolves_like_any_other():
 
 def test_rclone_args_do_not_inherit():
     tree = {
-        "host": "h1",
-        "rclone": {"remote": "r1:/", "args": {}},
-        "subdirs": {
-            "parent": {
-                "rclone": {"remote": "r1:/parent", "args": {"vfs-cache-mode": "full"}},
-                "subdirs": {"child": {"rclone.remote": "r1:/child"}},
-            }
-        },
+        "top": {
+            "host": "h1",
+            "rclone": {"remote": "r1:/", "args": {}},
+            "subdirs": {
+                "parent": {
+                    "rclone": {"remote": "r1:/parent", "args": {"vfs-cache-mode": "full"}},
+                    "subdirs": {"child": {"rclone.remote": "r1:/child"}},
+                }
+            },
+        }
     }
     r = resolve(tree, "h1", ["h1"])
-    parent = by_path(r["server_subtrees"], "parent")
-    child = by_path(r["server_subtrees"], "parent/child")
+    parent = by_path(r["server_subtrees"], "top/parent")
+    child = by_path(r["server_subtrees"], "top/parent/child")
     assert parent["args"] == {"vfs-cache-mode": "full"}
     assert child["args"] == {}  # not inherited, even though host is
     assert child["host"] == "h1"
@@ -311,51 +428,69 @@ def test_rclone_args_do_not_inherit():
 
 def test_rclone_remote_does_not_inherit_from_parent_node():
     tree = {
-        "host": "h1",
-        "rclone.remote": "r1:/",
-        "subdirs": {
-            "parent": {
-                "rclone.remote": "r1:/parent",
-                "subdirs": {"child": {}},
-            }
-        },
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "parent": {
+                    "rclone.remote": "r1:/parent",
+                    "subdirs": {"child": {}},
+                }
+            },
+        }
     }
     r = resolve(tree, "h1", ["h1"])
-    child = by_path(r["server_subtrees"], "parent/child")
+    child = by_path(r["server_subtrees"], "top/parent/child")
     # child sets no rclone of its own -- gets none, not parent's r1:/parent
-    # nor root's r1:/
+    # nor top's r1:/
     assert child["remote"] is None
     assert child["host"] == "h1"
 
 
 def test_dotted_and_nested_forms_are_equivalent():
     dotted = {
-        "host": "h1",
-        "rclone.remote": "r1:/",
-        "subdirs": {"a": {"rclone.remote": "r2:/x", "access.owner": "jd"}},
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {"a": {"rclone.remote": "r2:/x", "access.owner": "jd"}},
+        }
     }
     nested = {
-        "host": "h1",
-        "rclone": {"remote": "r1:/"},
-        "subdirs": {
-            "a": {"rclone": {"remote": "r2:/x"}, "access": {"owner": "jd"}}
-        },
+        "top": {
+            "host": "h1",
+            "rclone": {"remote": "r1:/"},
+            "subdirs": {
+                "a": {"rclone": {"remote": "r2:/x"}, "access": {"owner": "jd"}}
+            },
+        }
     }
     assert resolve(dotted, "h1", ["h1"]) == resolve(nested, "h1", ["h1"])
 
 
 def test_dotted_cache_subdirs_key_expands_to_literal_dotted_name():
     tree = {
-        "host": "h1",
-        "rclone.remote": "r1:/",
-        "subdirs": {
-            ".cache.subdirs": {
-                "thing": {"host": "h1"},
-            }
-        },
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                ".cache.subdirs": {
+                    "thing": {"host": "h1"},
+                }
+            },
+        }
     }
     r = resolve(tree, "h1", ["h1"])
-    assert paths(r["server_subtrees"]) == {".cache", ".cache/thing"}
+    assert paths(r["server_subtrees"]) == {"top", "top/.cache", "top/.cache/thing"}
+
+
+def test_bare_leading_dot_top_level_key_is_not_shredded():
+    # a bare dot-prefixed key (this codebase's hidden-subtree convention,
+    # e.g. `.bravo-cache`) has to survive _expand_dotted() untouched when
+    # it's used at the top level with no `.subdirs`/etc suffix after it
+    # -- unlike `.cache.subdirs` above, there's no second dot to split on
+    tree = {".private-cache": {"host": "h1", "rclone.remote": "r1:/"}}
+    r = resolve(tree, "h1", ["h1"])
+    assert paths(r["server_subtrees"]) == {".private-cache"}
 
 
 # -- filter_rclone_conf ---------------------------------------------------
@@ -505,15 +640,17 @@ def test_needed_groups_covers_non_per_user_grants_too():
     # reason, unlike group_members (%U-expansion) which only matters for
     # a per-user node. An owner-only grant contributes no group either way.
     tree = {
-        "host": "h1",
-        "rclone.remote": "r1:/",
-        "subdirs": {
-            "shared": {
-                "samba": {"subpath": ""},
-                "access.group": "not-per-user-group",
-                "subdirs": {"leaf": {"host": "h2", "access.owner": "jd"}},
-            }
-        },
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "shared": {
+                    "samba": {"subpath": ""},
+                    "access.group": "not-per-user-group",
+                    "subdirs": {"leaf": {"host": "h2", "access.owner": "jd"}},
+                }
+            },
+        }
     }
     r = resolve(tree, "h1", ["h1", "h2"])
     assert needed_groups(r) == ["not-per-user-group"]
@@ -673,34 +810,41 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
     # per-user node mw-fam (access.group: Michael Whitfield Family) --
     # `group`-only, so every member's own folder is a symlink back to one
     # shared mount (per_user_mount_path()), not a mount of its own
-    assert "home/mike/mw-fam" in by_local_path
-    assert by_local_path["home/mike/mw-fam"]["remote"] is None
-    assert by_local_path["home/mike/mw-fam"]["symlink_target"] == "home/.mounts/mw-fam"
-    assert "home/%U/mw-fam" not in by_local_path
-    assert by_local_path["home/.mounts/mw-fam"]["remote"] == "some-remote:/fam"
+    assert "tree/home/mike/mw-fam" in by_local_path
+    assert by_local_path["tree/home/mike/mw-fam"]["remote"] is None
+    assert by_local_path["tree/home/mike/mw-fam"]["symlink_target"] == "tree/home/.mounts/mw-fam"
+    assert "tree/home/%U/mw-fam" not in by_local_path
+    assert by_local_path["tree/home/.mounts/mw-fam"]["remote"] == "some-remote:/fam"
 
     # whitfield-media (access.group: Whitfield Family & Friends) is its
     # own, separate node -- mike gets a symlink there too, via his own
     # membership in that group, not via mw-fam's
-    assert by_local_path["home/mike/whitfield-media"]["symlink_target"] == "home/.mounts/whitfield-media"
-    assert by_local_path["home/dana/whitfield-media"]["symlink_target"] == "home/.mounts/whitfield-media"
+    assert by_local_path["tree/home/mike/whitfield-media"]["symlink_target"] == "tree/home/.mounts/whitfield-media"
+    assert by_local_path["tree/home/dana/whitfield-media"]["symlink_target"] == "tree/home/.mounts/whitfield-media"
     # only one real mount backs both of them
-    assert by_local_path["home/.mounts/whitfield-media"]["remote"] == "some-remote:/media"
+    assert by_local_path["tree/home/.mounts/whitfield-media"]["remote"] == "some-remote:/media"
     # but nobody unresolvable (no group_members entry) gets a symlink
     assert not any(
-        p.startswith("home/") and p.endswith("/whitfield-media")
+        p.startswith("tree/home/") and p.endswith("/whitfield-media")
         and p not in (
-            "home/mike/whitfield-media",
-            "home/dana/whitfield-media",
-            "home/.mounts/whitfield-media",
+            "tree/home/mike/whitfield-media",
+            "tree/home/dana/whitfield-media",
+            "tree/home/.mounts/whitfield-media",
         )
         for p in by_local_path
     )
 
-    # bravo's client mount (root, local_path "") nests everything under it
-    root_slug = by_local_path[""]["slug"]
-    assert by_local_path[".cache/storage-node-bravo"]["requires_slug"] == root_slug
-    assert by_local_path["home/.mounts/mw-fam"]["requires_slug"] == root_slug
+    # bravo's client mount of `tree` nests everything under it that's
+    # sourced through that peer connection
+    tree_slug = by_local_path["tree"]["slug"]
+    assert by_local_path["tree/home/.mounts/mw-fam"]["requires_slug"] == tree_slug
+
+    # bravo's OWN cache mount is a sibling top-level subtree, not nested
+    # under `tree` at all -- it requires nothing (this is the whole point
+    # of top-level subtrees being independent: a host's own mount never
+    # ends up depending on another top-level subtree's mount being up
+    # first)
+    assert by_local_path[".bravo-cache"]["requires_slug"] is None
 
 
 def test_plan_mounts_group_only_per_user_node_collapses_to_one_mount():
@@ -718,7 +862,7 @@ def test_plan_mounts_group_only_per_user_node_collapses_to_one_mount():
     plan = plan_mounts(r, group_members)
 
     real_mounts = [
-        e for e in plan if e["local_path"] == "home/.mounts/whitfield-media"
+        e for e in plan if e["local_path"] == "tree/home/.mounts/whitfield-media"
     ]
     assert len(real_mounts) == 1
     real_mount = real_mounts[0]
@@ -731,15 +875,15 @@ def test_plan_mounts_group_only_per_user_node_collapses_to_one_mount():
 
     symlinks = {e["local_path"]: e for e in plan if e["symlink_target"]}
     for user in ("mike", "dana", "jd"):
-        link = symlinks[f"home/{user}/whitfield-media"]
+        link = symlinks[f"tree/home/{user}/whitfield-media"]
         assert link["remote"] is None
-        assert link["symlink_target"] == "home/.mounts/whitfield-media"
+        assert link["symlink_target"] == "tree/home/.mounts/whitfield-media"
         # access is enforced once, at the real mount -- the symlink itself
         # carries none of its own
         assert link["access"] == {}
 
     # a group with no resolved members gets no mount and no symlinks at all
-    assert "home/.mounts/mw-fam" not in {e["local_path"] for e in plan}
+    assert "tree/home/.mounts/mw-fam" not in {e["local_path"] for e in plan}
     assert not any(e["local_path"].endswith("/mw-fam") for e in plan)
 
 
@@ -756,27 +900,27 @@ def test_plan_mounts_entries_carry_access_for_ownership_and_mode():
     plan = plan_mounts(r, group_members)
     by_local_path = {e["local_path"]: e for e in plan}
 
-    assert by_local_path["home/jd/sys-configs"]["access"] == {
+    assert by_local_path["tree/home/jd/sys-configs"]["access"] == {
         "owner": "jd",
         "permissions": DEFAULT_ACCESS_PERMISSIONS,
     }
     # media-prod is `group`-only -- its own access grant lives on the one
     # real, shared mount now (per_user_mount_path()), not on alex's symlink
-    assert by_local_path["home/.mounts/media-prod"]["access"] == {
+    assert by_local_path["tree/home/.mounts/media-prod"]["access"] == {
         "group": "Media Production",
         "permissions": DEFAULT_ACCESS_PERMISSIONS,
     }
-    assert by_local_path["home/alex/media-prod"]["access"] == {}
-    assert by_local_path["home/alex/media-prod"]["symlink_target"] == "home/.mounts/media-prod"
-    assert by_local_path["backups"]["access"] == {}
+    assert by_local_path["tree/home/alex/media-prod"]["access"] == {}
+    assert by_local_path["tree/home/alex/media-prod"]["symlink_target"] == "tree/home/.mounts/media-prod"
+    assert by_local_path["tree/backups"]["access"] == {}
 
 
 def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
     # gadget owns nothing (docs/config-schema.md worked example) -- every
-    # piece of `home` it must still serve via Samba (spec.md "Samba
+    # piece of `tree/home` it must still serve via Samba (spec.md "Samba
     # sharing is universal") comes from a real mount now, sourced
     # directly (mesh) from whichever host actually owns that piece, not
-    # funneled through root_host.
+    # funneled through tree's own owner.
     r = resolve(EXAMPLE_TREE, "some-storage-gadget", EXAMPLE_HOSTS)
     group_members = {
         "Michael Whitfield Family": ["mike"],
@@ -789,46 +933,53 @@ def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
     # peer mount (sourced live from alpha's own filesystem at that exact
     # path), since it's a leaf with real per-user content, not a
     # structural container
-    assert "home/jd/sys-configs" in by_local_path
-    sys_configs = by_local_path["home/jd/sys-configs"]
-    assert sys_configs["remote"] == "peer-storage-node-alpha-home-jd-sys-configs:/srv/stortree/home/jd/sys-configs"
+    assert "tree/home/jd/sys-configs" in by_local_path
+    sys_configs = by_local_path["tree/home/jd/sys-configs"]
+    assert sys_configs["remote"] == (
+        "peer-storage-node-alpha-tree-home-jd-sys-configs:"
+        "/srv/stortree/tree/home/jd/sys-configs"
+    )
 
     # bravo-owned, per-user, `group`-only -- gadget peer-sources exactly
     # one real mount, at bravo's own shared path (bravo's own plan_mounts()
     # run resolved whitfield-media to that same path first, per
     # per_user_mount_path() -- nothing ever lives at a per-user path on
     # bravo's disk for a group-only grant, so that's the only real path a
-    # peer could source it from), not relayed through alpha (root_host)
-    assert "home/mike/mw-fam" not in {
+    # peer could source it from), not relayed through alpha
+    assert "tree/home/mike/mw-fam" not in {
         p for p, e in by_local_path.items() if e["remote"] and "alpha" in e["remote"]
     }
-    whitfield_mount = by_local_path["home/.mounts/whitfield-media"]
-    assert whitfield_mount["remote"] == "peer-storage-node-bravo-home-.mounts-whitfield-media:/srv/stortree/home/.mounts/whitfield-media"
+    whitfield_mount = by_local_path["tree/home/.mounts/whitfield-media"]
+    assert whitfield_mount["remote"] == (
+        "peer-storage-node-bravo-tree-home-.mounts-whitfield-media:"
+        "/srv/stortree/tree/home/.mounts/whitfield-media"
+    )
     # mike's own folder is a symlink to that one real mount, not a peer
     # mount of its own
-    whitfield_link = by_local_path["home/mike/whitfield-media"]
+    whitfield_link = by_local_path["tree/home/mike/whitfield-media"]
     assert whitfield_link["remote"] is None
-    assert whitfield_link["symlink_target"] == "home/.mounts/whitfield-media"
+    assert whitfield_link["symlink_target"] == "tree/home/.mounts/whitfield-media"
 
-    # the samba node itself ("home") is a pure container -- delegates
+    # the samba node itself ("tree/home") is a pure container -- delegates
     # entirely to its own children above, gets no mount/peer of its own
-    assert "home" not in by_local_path
+    assert "tree/home" not in by_local_path
 
-    # every peer-sourced entry nests directly under gadget's own root
-    # client mount (also peer-sourced, from alpha) -- not under "home",
-    # which was never a mount to nest under in the first place
-    root_slug = by_local_path[""]["slug"]
-    assert sys_configs["requires_slug"] == root_slug
-    assert whitfield_mount["requires_slug"] == root_slug
+    # every peer-sourced entry under `tree` nests directly under gadget's
+    # own client mount of `tree` (also peer-sourced, from alpha) -- not
+    # under "tree/home", which was never a mount to nest under in the
+    # first place
+    tree_slug = by_local_path["tree"]["slug"]
+    assert sys_configs["requires_slug"] == tree_slug
+    assert whitfield_mount["requires_slug"] == tree_slug
 
 
-def test_plan_mounts_nested_nonuser_paths_require_their_parent():
+def test_plan_mounts_nested_paths_require_their_nearest_real_mount_ancestor():
     r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
-    plan = plan_mounts(r, {})
+    plan = plan_mounts(r, {"Michael Whitfield Family": ["mike"]})
     by_local_path = {e["local_path"]: e for e in plan}
 
-    root_slug = by_local_path[""]["slug"]
-    assert by_local_path[".cache/storage-node-bravo"]["requires_slug"] == root_slug
+    tree_slug = by_local_path["tree"]["slug"]
+    assert by_local_path["tree/home/.mounts/mw-fam"]["requires_slug"] == tree_slug
 
 
 def test_plan_mounts_skips_remote_less_ancestors_for_requires_slug():
@@ -837,28 +988,30 @@ def test_plan_mounts_skips_remote_less_ancestors_for_requires_slug():
     # has to require the nearest *actual* mounted ancestor instead,
     # skipping over the remote-less one in between
     tree = {
-        "host": "h1",
-        "rclone.remote": "r1:/",
-        "subdirs": {
-            "top": {
-                "rclone.remote": "r1:/top",
-                "subdirs": {
-                    "plain": {
-                        "subdirs": {
-                            "nested": {"rclone.remote": "r1:/nested"},
+        "tree": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "top": {
+                    "rclone.remote": "r1:/top",
+                    "subdirs": {
+                        "plain": {
+                            "subdirs": {
+                                "nested": {"rclone.remote": "r1:/nested"},
+                            }
                         }
-                    }
-                },
-            }
-        },
+                    },
+                }
+            },
+        }
     }
     r = resolve(tree, "h1", ["h1"])
     plan = plan_mounts(r, {})
     by_local_path = {e["local_path"]: e for e in plan}
 
-    top = by_local_path["top"]
-    plain = by_local_path["top/plain"]
-    nested = by_local_path["top/plain/nested"]
+    top = by_local_path["tree/top"]
+    plain = by_local_path["tree/top/plain"]
+    nested = by_local_path["tree/top/plain/nested"]
 
     assert plain["remote"] is None
     assert plain["requires_slug"] == top["slug"]
@@ -868,11 +1021,11 @@ def test_plan_mounts_skips_remote_less_ancestors_for_requires_slug():
 def test_mount_unit_names():
     plan = [
         {"slug": "backups", "remote": "r1:/"},
-        {"slug": "root", "remote": "r1:/"},
+        {"slug": "tree", "remote": "r1:/"},
     ]
     assert mount_unit_names(plan) == [
         "stortree-mount@backups.service",
-        "stortree-mount@root.service",
+        "stortree-mount@tree.service",
     ]
 
 
@@ -890,30 +1043,17 @@ def test_plan_mounts_slug_distinguishes_hyphen_from_nesting():
     # both naively collapse to "media-prod" under a plain "/" -> "-"
     # substitution -- they must not share a systemd unit slug
     tree = {
-        "host": "h1",
-        "rclone.remote": "r1:/",
-        "subdirs": {
-            "media-prod": {"rclone.remote": "r1:/a"},
-            "media": {"subdirs": {"prod": {"rclone.remote": "r1:/b"}}},
-        },
+        "tree": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "media-prod": {"rclone.remote": "r1:/a"},
+                "media": {"subdirs": {"prod": {"rclone.remote": "r1:/b"}}},
+            },
+        }
     }
     r = resolve(tree, "h1", ["h1"])
     plan = plan_mounts(r, {})
     by_local_path = {e["local_path"]: e for e in plan}
 
-    assert by_local_path["media-prod"]["slug"] != by_local_path["media/prod"]["slug"]
-
-
-def test_plan_mounts_raises_on_slug_collision():
-    # a top-level segment literally named "root" collides with the
-    # reserved slug for a client's own root mount (local_path "") --
-    # plan_mounts must fail loudly rather than let the two systemd units
-    # silently clobber each other
-    tree = {
-        "host": "h1",
-        "rclone.remote": "r1:/",
-        "subdirs": {"root": {"host": "h2", "rclone.remote": "r2:/"}},
-    }
-    r = resolve(tree, "h2", ["h1", "h2"])
-    with pytest.raises(ValueError, match="root"):
-        plan_mounts(r, {})
+    assert by_local_path["tree/media-prod"]["slug"] != by_local_path["tree/media/prod"]["slug"]

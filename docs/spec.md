@@ -102,30 +102,39 @@ filter directly:
   `access` rules. A node with no `rclone.remote` of its own resolves with
   no remote at all — it's a plain directory that has to exist, not a
   separate rclone mount; §2 covers what that means for mount planning.
-- **Client mounts** — a peer-sftp mount of the tree root, sourced from
-  the host that actually owns it (`host:`'s resolved value, "root_host"
-  below) rather than the root's own third-party `rclone.remote` — for
-  every host in `all_hosts` that isn't itself a server subtree's resolved
-  `host`. This is the same peer-sourcing rule §1 already applies to any
-  samba descendant a host doesn't own, just for the one root-level piece
-  that isn't a node in the tree at all (root is the inheritance anchor,
-  not a mountable node of its own — see "Node inheritance",
-  config-schema.md): a client never holds direct credentials to the root
-  remote itself, only an SFTP hop into root_host's own already-mounted
-  `/srv/stortree` (provisioned by `stortree_peer_trust`, §7, exactly like
-  any other peer dependency). If the host has an entry under the root
-  `clients:` map, `clients.<hostname>.rclone.args` merges over
-  `client-defaults`; otherwise it gets `client-defaults` verbatim — a
-  `clients:` entry is only ever a per-host override, never a prerequisite
-  for being a client (see "Every inventory host participates",
-  config-schema.md). A root with no `rclone.remote` of its own has
-  nothing to peer for — the client still gets its local root directory
-  created, just no mount and no peer dependency for it. Unlike a samba
-  peer dependency, this one implies no Samba behavior of its own — it
-  exists purely so a client's local tree has real content — but it does
-  mean every non-root host now needs `stortree_peer_trust` (§7) to reach
-  root_host, which the role already handles the same way as any other
-  peer dependency.
+- **Client mounts** — one per top-level subtree in `config.yml` (every
+  key at the file's own top level, config-schema.md "Top-level
+  subtrees") that this host doesn't own: a peer-sftp mount sourced from
+  the host that actually owns it (that subtree's own `host:`) rather
+  than the subtree's own third-party `rclone.remote`. This is the same
+  peer-sourcing rule §1 already applies to any samba descendant a host
+  doesn't own, just generalized to every top-level subtree instead of
+  being funneled through one shared tree root — there's no single
+  implicit root any more; each top-level subtree stands on its own,
+  independently peer-mounted or self-mounted (config-schema.md "Node
+  inheritance"). A client never holds direct credentials to a subtree's
+  own remote, only an SFTP hop into its owning host's own already-mounted
+  copy of it (provisioned by `stortree_peer_trust`, §7, exactly like any
+  other peer dependency). If the host has an entry under that subtree's
+  own `clients:` map, `clients.<hostname>.rclone.args` merges over that
+  subtree's own `client-defaults`; otherwise it gets `client-defaults`
+  verbatim — a `clients:` entry is only ever a per-host override, never a
+  prerequisite for being a client (see "Every inventory host
+  participates", config-schema.md). A subtree's own
+  `client-defaults`/`clients.<hostname>` can also set `rclone: false`
+  instead of (or alongside) `.args` to opt a host — or every non-owning
+  host by default — out of mounting it at all (config-schema.md
+  "Per-client mount opt-out"); this is the mechanism a subtree with no
+  business being visible past its own owning host (e.g. a per-host
+  VFS-cache backing store) uses to stay local-only. A subtree with no
+  `rclone.remote` of its own has nothing to peer for — the client still
+  gets its local directory created, just no mount and no peer dependency
+  for it. Unlike a samba peer dependency, this one implies no Samba
+  behavior of its own — it exists purely so a client's local tree has
+  real content — but it does mean a non-owning host now needs
+  `stortree_peer_trust` (§7) to reach whichever host owns each top-level
+  subtree it client-mounts, which the role already handles the same way
+  as any other peer dependency.
 - **Samba shares** — every node anywhere in the tree that carries a
   `samba:` block, resolved for *every* host in `all_hosts`, not just the
   node's own resolved `host` or hosts named anywhere in `config.yml`. A
@@ -250,10 +259,11 @@ plain directory, just a link back to the one real mount its node
 resolved to, and gets no unit either.
 
 Every peer dependency (§1) becomes one of these mount entries too, not
-just the root client mount — a samba descendant this host doesn't own is
-real data its own local tree still has to contain, sourced directly from
-whichever host actually owns it (mesh, one peer relationship per distinct
-owning host, never funneled through root_host). The one exception is the
+just a top-level subtree's own client mount — a samba descendant this
+host doesn't own is real data its own local tree still has to contain,
+sourced directly from whichever host actually owns it (mesh, one peer
+relationship per distinct owning host, never funneled through one shared
+tree root — there is no such thing any more). The one exception is the
 samba node marking a subtree for export itself when it carries no
 `rclone.remote` of its own and has children: that's a pure structural
 container (the common case — `home` in the worked example above), and
@@ -327,13 +337,13 @@ host's `stortree` SSH endpoint (keys provisioned by `stortree_peer_trust`,
 §7) and the local path already resolved for that subtree there — into the
 filtered `rclone.conf` rendered for the serving host. The serving host's
 mount unit (§2) then mounts that synthesized remote at the correct nested
-path, same as any other resolved mount. The root-level peer dependency
-behind every client mount (§1) synthesizes the same way, just with an
-empty local path — the section's `path` is root_host's own
-`/srv/stortree`, and the client's mount unit references the synthesized
-section's bare name (mounting that remote's own root, same convention as
-a bare `rclone.remote` section name) instead of the tree's third-party
-`rclone.remote` value. A per-user peer dependency's %U gets resolved to a
+path, same as any other resolved mount. The top-level-subtree peer
+dependency behind every client mount (§1) synthesizes the same way, just
+with that subtree's own top-level path as the local path — the section's
+`path` is the owning host's own copy of that one subtree, and the
+client's mount unit references the synthesized section's name the same
+way any other peer-sourced mount does, instead of the subtree's own
+third-party `rclone.remote` value. A per-user peer dependency's %U gets resolved to a
 single real path here too, exactly the way `stortree_mounts` (§2, §6)
 independently resolves the same entry to its own one real mount — an
 owner grant's own path, or a group-only grant's one shared `.mounts`
@@ -623,10 +633,13 @@ tree:
    (recommended — pair with `internal-sftp`/`ForceCommand` via the
    `sshd_config` fragment, §6).
 
-Every non-root host is the *serving* side of at least one peer dependency
-unconditionally now — its own root client mount (§1) — so this
-provisions on every `ansible-playbook` run for the whole fleet, not only
-where a `samba:` block is in play. Because Samba sharing is universal
+Every host that doesn't own every top-level subtree in `config.yml` is
+the *serving* side of at least one peer dependency unconditionally now —
+its own top-level-subtree client mounts (§1), one per top-level subtree
+it doesn't own and isn't opted out of (config-schema.md "Per-client mount
+opt-out") — so this provisions on every `ansible-playbook` run for the
+whole fleet, not only where a `samba:` block is in play. Because Samba
+sharing is universal
 (§1) on top of that, the set of hosts needing this provisioned can extend
 further still to ones with no server subtrees of their own, and even ones
 with no mention in `config.yml` at all (present only in
