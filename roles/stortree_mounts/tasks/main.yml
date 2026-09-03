@@ -148,6 +148,33 @@
     label: "{{ item.local_path or '(root)' }}"
   tags: [mounts]
 
+- name: Ensure every per-user symlink's parent directory exists
+  # A `group`-only grant with no sibling owner-only leaf under the same
+  # `home/<user>` folder (e.g. mp-fam with no sys-configs alongside it)
+  # produces *only* a symlink entry for that user -- no plain-directory
+  # or mount entry ever resolves to `home/<user>` itself, so nothing
+  # above would otherwise create it. That's harmless for a plain
+  # directory or mount point (state: directory above auto-creates any
+  # missing parent, like `mkdir -p`), but `state: link` below does not:
+  # unlike every other host that happens to still have this leftover
+  # from before per-user symlinks existed (a real per-user mount once
+  # sat here and auto-created its own parent the same way), a freshly
+  # provisioned host has nothing to fall back on and fails outright
+  # ("No such file or directory") trying to place the link.  No `access`
+  # of its own to set ownership/mode from -- it isn't a node in the tree,
+  # just an implied container -- so it gets the same plain default every
+  # unmodeled path got before `access` existed.
+  ansible.builtin.file:
+    path: "{{ stortree_root ~ '/' ~ (item.local_path | dirname) }}"
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0750"
+  loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
+  loop_control:
+    label: "{{ item.local_path | dirname }}"
+  tags: [mounts]
+
 - name: Ensure every per-user symlink exists
   # Fans a `group`-only node's one real, shared mount back out to each
   # authorized member's own folder (stortree_plan_mounts' symlink_target,
