@@ -1,0 +1,18 @@
+[Unit]
+Description=stortree per-user bind mount %i (managed by stortree, do not edit by hand)
+After=stortree-mount@{{ entry.symlink_target | stortree_slug }}.service
+Requires=stortree-mount@{{ entry.symlink_target | stortree_slug }}.service
+RequiresMountsFor={{ stortree_root }}/{{ entry.symlink_target }}
+{% if entry.requires_slug %}
+After=stortree-mount@{{ entry.requires_slug }}.service
+RequiresMountsFor={{ stortree_root }}/{{ entry.local_path }}
+{% endif %}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mount --bind {{ stortree_root }}/{{ entry.symlink_target }} {{ stortree_root }}/{{ entry.local_path }}
+ExecStop=/bin/umount {{ stortree_root }}/{{ entry.local_path }}
+
+[Install]
+WantedBy=multi-user.target

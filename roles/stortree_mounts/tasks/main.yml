@@ -7,9 +7,11 @@
 # an `owner` grant still gets one real mount at that one user's own path;
 # a `group`-only grant instead gets exactly one real, shared mount (at
 # `stortree_plan_mounts`' hidden `.mounts` path for that node) plus one
-# symlink per member fanning it back out to each member's own folder --
-# see `per_user_mount_path()` in filter_plugins/stortree.py for why one
-# mount now serves every member instead of one full duplicate each
+# bind mount per member fanning it back out to each member's own folder
+# (a real symlink can't do this job when the member's own folder lives on
+# a remote-backed node itself -- see the per-user bind-mount tasks below
+# for why) -- see `per_user_mount_path()` in filter_plugins/stortree.py
+# for why one mount now serves every member instead of one full duplicate each
 # (N members used to mean N redundant rclone procs/VFS caches of
 # identical content, with no cache coherency between them, even though
 # the access grant behind every one of those duplicates was always the
@@ -24,11 +26,13 @@
 # cleanup step too -- run *before* path creation below, not after: a
 # node that used to be a real per-user mount (before this host had any
 # `.mounts`-collapsed group grant, or before a member left a group) and
-# is now a symlink's target has to have its old per-user unit stopped
-# and unmounted first, or turning that still-busy mountpoint directory
-# into a symlink fails outright ("Device or resource busy").
+# is now instead the destination of a per-user bind mount has to have
+# its old per-user unit stopped and unmounted first, or that still-busy
+# mountpoint directory ends up bind-mounted on top of yet another live
+# mount instead of the plain, empty directory a bind mount needs to
+# start from.
 #
-# Every directory/symlink-creation task below is `ignore_errors: true`
+# Every directory-creation task below is `ignore_errors: true`
 # for exactly this reason too, not just to route around a masked
 # ancestor: a path nested under a mount whose *own* config just changed
 # (a corrected `rclone.remote`, say) can't be created until that mount
@@ -53,10 +57,13 @@
 # inheritance"), so not every entry in the flat mount plan is an actual
 # rclone mount -- an entry with no `remote` is either a plain directory
 # that has to exist (either nested inside an ancestor's mount, or kept as
-# real local storage on its resolved host) or a per-user symlink fanning
-# a `group`-only node's one shared mount back out to a member's own
-# folder (`symlink_target` set) -- neither has an rclone unit of its own;
-# only entries with a `remote` get one below.
+# real local storage on its resolved host) or a per-user bind mount
+# fanning a `group`-only node's one shared mount back out to a member's
+# own folder (`symlink_target` set -- the field name predates the switch
+# from a real symlink to a bind mount, see filter_plugins/stortree.py's
+# plan_mounts() docstring for why) -- neither has an rclone unit of its
+# own; only entries with a `remote` get one below, and only entries with
+# a `symlink_target` get a stortree-bind@ unit further down.
 #
 # Every plain directory (no `remote`) gets its Unix owner/group/mode set
 # from its own `access` grant (spec.md §6, stortree_access_owner/_group/
@@ -71,13 +78,17 @@
 # `owner`; chowning the pre-mount directory to a granted `owner` leaves
 # `stortree` with no bits on it at all, and `fusermount` refuses to
 # mount there ("Permission denied") before the grant it was chasing ever
-# becomes visible. A symlink entry carries no `access` of its own (it's
-# enforced once, at the real mount its target points to) and skips
-# ownership/mode entirely -- a symlink's own mode bits are meaningless
-# on Linux (always reported as 0777, kernel-ignored when following it),
-# and touching them risks an Ansible `file` chmod following the link
-# through to the real mount's target instead, which would silently
-# clobber the real enforcement this whole file exists to set up. A
+# becomes visible. A per-user bind-mount entry carries no `access` of its
+# own either (it's enforced once, at the real mount `symlink_target`
+# points to, exactly as a symlink's target enforcement would have been)
+# -- but unlike a symlink, its own mountpoint directory is a real,
+# separate inode that has to be creatable and traversable in its own
+# right before anything can be bound onto it, so it still gets the same
+# plain stortree:stortree 0750 default as any other unmodeled container
+# path (no `access`-driven chown/chmod needed -- what's actually visible
+# once mounted is entirely the bound-in target's own enforcement,
+# unaffected by this directory's own ownership once something's mounted
+# over it). A
 # remote-backed node's mount additionally omits --allow-other unless
 # `access` grants an owner and/or group (rendered unconditionally below,
 # from the same three filters, so the two always agree): with neither
@@ -152,7 +163,7 @@
   # in a per-user access grant, whether this host owns the node
   # (server_subtrees) or peer-sources it (peer_dependencies) -- both get
   # %U-resolved here into either one real mount per authorized user
-  # (an `owner` grant) or one shared mount plus one symlink per member
+  # (an `owner` grant) or one shared mount plus one bind mount per member
   # (a `group`-only grant).
   ansible.builtin.set_fact:
     stortree_mounts_plan: "{{ stortree | stortree_plan_mounts(stortree_group_members) }}"
@@ -187,12 +198,14 @@
 - name: Find currently installed stortree mount units
   # Run before any path is touched below (see this file's header comment)
   # -- a path that's switching roles between runs (real per-user mount ->
-  # symlink, most notably) needs its old unit stopped and unmounted
-  # *before* stortree_mounts_plan's new shape is applied to disk, not
-  # after.
+  # bind-mount destination, most notably) needs its old unit stopped and
+  # unmounted *before* stortree_mounts_plan's new shape is applied to
+  # disk, not after.
   ansible.builtin.find:
     paths: /etc/systemd/system
-    patterns: "stortree-mount@*.service"
+    patterns:
+      - "stortree-mount@*.service"
+      - "stortree-bind@*.service"
   register: stortree_mounts_installed_units
   tags: [mounts]
 
@@ -387,22 +400,20 @@
   ignore_errors: true
   tags: [mounts]
 
-- name: Ensure every per-user symlink's parent directory exists
+- name: Ensure every per-user bind mountpoint's parent directory exists
   # A `group`-only grant with no sibling owner-only leaf under the same
   # `home/<user>` folder (e.g. mp-fam with no sys-configs alongside it)
-  # produces *only* a symlink entry for that user -- no plain-directory
+  # produces *only* a bind-mount entry for that user -- no plain-directory
   # or mount entry ever resolves to `home/<user>` itself, so nothing
-  # above would otherwise create it. That's harmless for a plain
-  # directory or mount point (state: directory above auto-creates any
-  # missing parent, like `mkdir -p`), but `state: link` below does not:
-  # unlike every other host that happens to still have this leftover
-  # from before per-user symlinks existed (a real per-user mount once
-  # sat here and auto-created its own parent the same way), a freshly
-  # provisioned host has nothing to fall back on and fails outright
-  # ("No such file or directory") trying to place the link.  No `access`
-  # of its own to set ownership/mode from -- it isn't a node in the tree,
-  # just an implied container -- so it gets the same plain default every
-  # unmodeled path got before `access` existed.
+  # above would otherwise create it. Explicit and ahead of the bind-
+  # mountpoint task below, same reason as "Ensure every mount point's
+  # parent directory exists" above: don't rely on implicit multi-level
+  # directory creation against a backend (this file's already hit one in
+  # production) that doesn't reliably support creating more than one
+  # missing path level in a single step. No `access` of its own to set
+  # ownership/mode from -- it isn't a node in the tree, just an implied
+  # container -- so it gets the same plain default every unmodeled path
+  # got before `access` existed.
   ansible.builtin.file:
     path: "{{ stortree_root ~ '/' ~ (item.local_path | dirname) }}"
     state: directory
@@ -416,22 +427,30 @@
   ignore_errors: true
   tags: [mounts]
 
-- name: Ensure every per-user symlink exists
+- name: Ensure every per-user bind mountpoint directory exists
   # Fans a `group`-only node's one real, shared mount back out to each
-  # authorized member's own folder (stortree_plan_mounts' symlink_target,
-  # docs/config-schema.md "subdirs vs user-subdirs") -- `force: true`
-  # since the target of this exact path used to be a real per-user
-  # mountpoint directory before this feature existed (or before a member
-  # joined the group): the stale-unit cleanup above already stopped and
-  # unmounted it, but the now-empty directory it leaves behind still has
-  # to be replaced with a symlink, which plain `state: link` refuses to
-  # do on its own. No owner/group/mode set here -- see this file's header
-  # comment for why a symlink carries none of its own.
+  # authorized member's own folder via a kernel bind mount, not a real
+  # symlink (stortree_plan_mounts' symlink_target field, still named for
+  # the mechanism this replaced -- see plan_mounts()'s own docstring): a
+  # symlink is a directory entry the *target* directory's own backend has
+  # to be able to represent, and not every remote backend can (an SMB
+  # share, in production, flatly refused with an I/O error trying to
+  # create one at all). A bind mount needs an ordinary, empty directory
+  # to mount onto instead -- exactly what every other mountpoint in this
+  # file already gets (the "Ensure every resolved mount point or plain
+  # directory exists" task above, which this mirrors), stortree:stortree
+  # 0750 same as any other unmodeled path (no `access` of its own -- it
+  # isn't a node in the tree, just an implied container whose real
+  # enforcement lives on the mount it's about to be bound onto). The
+  # actual bind mount itself happens via the stortree-bind@ unit rendered
+  # below, not here -- this task only has to get an empty directory in
+  # place for that unit's ExecStart to mount onto.
   ansible.builtin.file:
     path: "{{ stortree_root ~ '/' ~ item.local_path }}"
-    state: link
-    src: "{{ stortree_root ~ '/' ~ item.symlink_target }}"
-    force: true
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0750"
   loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
   loop_control:
     label: "{{ item.local_path }}"
@@ -449,6 +468,19 @@
     loop_var: entry
     label: "{{ entry.local_path or '(root)' }}"
   register: stortree_mounts_units_rendered
+  notify: stortree mounts changed
+  tags: [mounts]
+
+- name: Render systemd units for every per-user bind mount
+  ansible.builtin.template:
+    src: stortree-bind@.service.j2
+    dest: "/etc/systemd/system/stortree-bind@{{ entry.slug }}.service"
+    mode: "0644"
+  loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
+  loop_control:
+    loop_var: entry
+    label: "{{ entry.local_path }}"
+  register: stortree_binds_units_rendered
   notify: stortree mounts changed
   tags: [mounts]
 
@@ -476,6 +508,16 @@
   when: item.changed
   tags: [mounts]
 
+- name: Restart any bind mount whose unit file actually changed
+  ansible.builtin.systemd_service:
+    name: "stortree-bind@{{ item.entry.slug }}.service"
+    state: restarted
+  loop: "{{ stortree_binds_units_rendered.results }}"
+  loop_control:
+    label: "{{ item.entry.local_path }}"
+  when: item.changed
+  tags: [mounts]
+
 - name: Enable and start every resolved mount
   ansible.builtin.systemd_service:
     name: "stortree-mount@{{ item.slug }}.service"
@@ -484,4 +526,14 @@
   loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
   loop_control:
     label: "{{ item.local_path or '(root)' }}"
+  tags: [mounts]
+
+- name: Enable and start every per-user bind mount
+  ansible.builtin.systemd_service:
+    name: "stortree-bind@{{ item.slug }}.service"
+    enabled: true
+    state: started
+  loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
+  loop_control:
+    label: "{{ item.local_path }}"
   tags: [mounts]

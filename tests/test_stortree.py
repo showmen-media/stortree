@@ -6,6 +6,7 @@ import yaml
 from filter_plugins.stortree import (
     DEFAULT_ACCESS_PERMISSIONS,
     PER_USER_PLACEHOLDER,
+    _slug,
     access_grant_usernames,
     access_group,
     access_mode,
@@ -815,6 +816,14 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
     assert by_local_path["tree/home/mike/mw-fam"]["symlink_target"] == "tree/home/.mounts/mw-fam"
     assert "tree/home/%U/mw-fam" not in by_local_path
     assert by_local_path["tree/home/.mounts/mw-fam"]["remote"] == "some-remote:/fam"
+    # the stortree-bind@.service.j2 template computes its own dependency
+    # unit's slug straight from `symlink_target` (via the stortree_slug
+    # filter, i.e. _slug()) rather than looking the real entry back up in
+    # the plan -- has to agree with the real entry's own `slug` field
+    assert (
+        _slug(by_local_path["tree/home/mike/mw-fam"]["symlink_target"])
+        == by_local_path["tree/home/.mounts/mw-fam"]["slug"]
+    )
 
     # whitfield-media (access.group: Whitfield Family & Friends) is its
     # own, separate node -- mike gets a symlink there too, via his own
@@ -1036,6 +1045,22 @@ def test_mount_unit_names_excludes_remote_less_entries():
         {"slug": "plain-dir", "remote": None},
     ]
     assert mount_unit_names(plan) == ["stortree-mount@backups.service"]
+
+
+def test_mount_unit_names_includes_bind_units_for_per_user_fan_out():
+    # a per-user fan-out entry (symlink_target set, no remote of its own)
+    # gets a stortree-bind@ unit, not a stortree-mount@ one -- it's a
+    # kernel bind mount back onto the real entry, not a second rclone
+    # mount (see plan_mounts()'s own docstring for why a real symlink
+    # can't do this job instead).
+    plan = [
+        {"slug": "tree-home-.mounts-mp\\x2dfam", "remote": "r1:/", "symlink_target": None},
+        {"slug": "tree-home-chris-mp\\x2dfam", "remote": None, "symlink_target": "tree/home/.mounts/mp-fam"},
+    ]
+    assert mount_unit_names(plan) == [
+        "stortree-mount@tree-home-.mounts-mp\\x2dfam.service",
+        "stortree-bind@tree-home-chris-mp\\x2dfam.service",
+    ]
 
 
 def test_plan_mounts_slug_distinguishes_hyphen_from_nesting():

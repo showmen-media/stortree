@@ -253,10 +253,13 @@ plus `systemd_service` (`daemon_reload: true`, `enabled`/`state:
 started`). Every entry in the plan gets something created on disk: a
 remote-less entry is a plain directory that has to exist (nested inside a
 mounted ancestor, or as real local storage on its own resolved host if
-not), and gets no rclone unit; a per-user symlink entry (§6 — the
-per-member fan-out for a `group`-only grant) is neither a mount nor a
-plain directory, just a link back to the one real mount its node
-resolved to, and gets no unit either.
+not), and gets no rclone unit; a per-user bind-mount entry (§6 — the
+per-member fan-out for a `group`-only grant) gets an ordinary directory
+too, plus its own `templates/stortree-bind@.service.j2` unit (`mount
+--bind <real mount's path> <this entry's path>`, `Type=oneshot,
+RemainAfterExit=yes`, ordered after and requiring both the real mount it
+fans out and whatever mount it's itself nested under) — not an rclone
+unit, since it isn't a second rclone mount of the same remote.
 
 Every peer dependency (§1) becomes one of these mount entries too, not
 just a top-level subtree's own client mount — a samba descendant this
@@ -286,31 +289,32 @@ per-user server_subtrees node's is — see §6 for the full mechanism, using
 `stortree_group_members` (§6 for where that fact comes from): an `owner`
 grant still gets one real mount at that one user's own path; a
 `group`-only grant instead gets exactly one real, shared mount (at a
-hidden `.mounts` path standing in for `%U`) plus one symlink per member
-fanning it back out to each member's own folder, rather than one full
-duplicate mount per member. `stortree_mounts` computes this for both
+hidden `.mounts` path standing in for `%U`) plus one bind mount per
+member fanning it back out to each member's own folder, rather than one
+full duplicate mount per member. `stortree_mounts` computes this for both
 server_subtrees and peer_dependencies alike (`stortree_plan_mounts` in
 `filter_plugins/stortree.py`), so a peer sources the owning host's real,
 shared path directly — that's the only place real content for a
 `group`-only grant ever actually lives on the owning host's own disk, the
-same way its own per-member paths are symlinks rather than mounts there
-too.
+same way its own per-member paths are bind mounts rather than second
+mounts there too.
 
 Ansible's own idempotence covers what a hand-rolled reconciler would
 otherwise have to implement: `template` only rewrites a unit file when its
 rendered content changes, and `systemd_service` only touches
 enabled/running state when it's out of sync — so a stale mount that's no
 longer in the resolved tree still needs an explicit cleanup step (the role
-also lists `/etc/systemd/system/stortree-mount-*.service`, diffs it
-against the currently-resolved unit names, and removes/`daemon-reload`s
-any that are no longer wanted). This cleanup runs *before* any path on
-disk is touched, not after — a path that's switching from a real per-user
-mount to a symlink (a member's own folder, once a `group`-only grant
-collapses to a shared mount) needs its stale unit stopped and unmounted
-first, or turning that still-busy mountpoint into a symlink fails
-outright. systemd itself handles restart policy, resource limits, and
-logging (journald) for the `rclone mount` process once the unit is in
-place.
+also lists both `/etc/systemd/system/stortree-mount@*.service` and
+`stortree-bind@*.service`, diffs that against the currently-resolved unit
+names, and removes/`daemon-reload`s any that are no longer wanted). This
+cleanup runs *before* any path on disk is touched, not after — a path
+that's switching from a real per-user mount to a bind-mount destination
+(a member's own folder, once a `group`-only grant collapses to a shared
+mount) needs its stale unit stopped and unmounted first, or that
+still-busy mountpoint ends up bind-mounted on top of yet another live
+mount instead of a plain, empty directory. systemd itself handles restart
+policy, resource limits, and logging (journald) for both the `rclone
+mount` process and the bind-mount unit once each is in place.
 
 ### 3. Secrets handling
 
@@ -579,21 +583,30 @@ resolves a `group`-only node's %U to one shared, hidden path
 (`SHARED_MOUNT_SEGMENT` — `.mounts`, matching this tree's existing
 dot-prefixed hidden-subtree convention, e.g. `.cache`) and mounts it
 exactly once there, gid-owned exactly as before; every actual member's
-own folder becomes a plain Unix symlink to that one real mount instead of
-a second mount. The symlink itself carries no `access` of its own and
-gets no ownership/mode applied (a symlink's mode bits are meaningless on
-Linux, and setting them risks an `ansible.builtin.file` chmod following
-the link through to the real mount instead) — enforcement lives entirely
-at the one real mount, same uid/gid/mode as always, and every member's
-symlink reaches it identically. Samba follows the symlink transparently:
-by default (`wide links = no`) Samba refuses a symlink that resolves
-*outside* the exporting share's own path, but `home/<user>/mw-fam` ->
-`home/.mounts/mw-fam` stays inside the same `home` share the whole way,
-so no `smb.conf` change is needed for this to work. A peer-sourced
+own folder becomes a kernel bind mount onto that one real mount instead
+of a second rclone mount. Not a real symlink: a symlink is a directory
+entry the *target* directory's own backend has to be able to represent,
+and not every remote backend can — a Hetzner Storage Box's SMB share, in
+production, flatly refused with an I/O error trying to create one inside
+it at all (SMB has no native symlink representation without extensions
+this fleet's remote doesn't support), so every per-user symlink under a
+top-level subtree backed by that remote failed identically, every run,
+regardless of directory-creation ordering. A bind mount is a kernel VFS
+relationship instead, entirely local to this host and independent of
+what the underlying remote backend can store, so it works everywhere a
+symlink sometimes couldn't. Each per-user path gets its own ordinary
+directory first (stortree:stortree 0750, no `access` of its own — the
+same plain default any unmodeled container path gets), then its own
+`stortree-bind@` unit `mount --bind`s the real mount's path onto it —
+enforcement still lives entirely at the one real mount, same uid/gid/mode
+as always, and every member's bind mount reaches it identically. Samba
+follows a bind mount exactly like it would any real directory — no
+`wide links` consideration at all (that only applies to actual symlinks),
+so no `smb.conf` change is needed for this to work either. A peer-sourced
 `group`-only descendant (§2/§3) resolves the exact same way on the
 *owning* host first, so a peer never has anything to source but that one
 real, shared path — there's nothing at a per-member path on the owning
-host's own disk for a `group`-only grant, symlink included.
+host's own disk for a `group`-only grant, bind mount included.
 
 The optional `sshd_config` fragment (`stortree_sshd`, only runs when
 `stortree/sshd_config` is present in the repo) is templated to

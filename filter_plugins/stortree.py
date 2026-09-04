@@ -618,7 +618,12 @@ def _slug(path):
     would. The empty (root) path maps to the reserved "root" -- see the
     explicit uniqueness check in plan_mounts() for the backstop against
     the one remaining case this doesn't rule out on its own (a real
-    top-level segment literally named "root")."""
+    top-level segment literally named "root"). Also exposed directly as
+    the `stortree_slug` filter: a per-user bind-mount unit's own template
+    needs to compute its `symlink_target`'s unit slug from that raw path
+    string alone (there's no separate plan_mounts() entry lookup handy at
+    render time), the same way plan_mounts() computes every entry's own
+    `slug` field here."""
     if not path:
         return "root"
     return "-".join(_escape_slug_segment(seg) for seg in path.split("/"))
@@ -709,9 +714,15 @@ def per_user_mount_path(path, access):
     *which* member's copy it was ever varied the enforcement). One real
     mount, gid-owned exactly as before, does the same job.
     `plan_mounts()` fans that one real mount back out to each member's
-    own folder with a symlink instead of a second mount -- see its
-    per-user expansion for both server_subtrees and peer_dependencies,
-    and filter_rclone_conf()'s matching peer-section collapse."""
+    own folder with a bind mount instead of a second rclone mount -- see
+    its per-user expansion for both server_subtrees and
+    peer_dependencies, and filter_rclone_conf()'s matching peer-section
+    collapse. A real symlink can't do this fan-out job when the member's
+    own folder lives on a remote-backed node itself (spec.md §6) -- a
+    bind mount is a kernel VFS relationship, not a directory entry the
+    remote backend has to
+    represent, so it works regardless of whether that backend can store
+    symlinks at all."""
     segment = (access or {}).get("owner") or SHARED_MOUNT_SEGMENT
     return path.replace(PER_USER_PLACEHOLDER, segment)
 
@@ -772,21 +783,25 @@ def plan_mounts(resolved, group_members=None):
     alongside it) still gets one real mount at that one user's own path,
     same as ever; a `group`-only grant instead gets exactly one real
     mount, at `per_user_mount_path()`'s shared location, plus one
-    symlink entry per member fanning that single mount back out to each
-    member's own folder -- see per_user_mount_path() for why one mount
-    now serves every member instead of one full duplicate each.
+    bind-mount entry per member fanning that single mount back out to
+    each member's own folder -- see per_user_mount_path() for why one
+    mount now serves every member instead of one full duplicate each.
 
     Not every entry is an rclone mount: a server_subtrees entry with
     `remote: None` (a node with no `rclone.remote` of its own -- it never
     inherits one, see _walk_tree()/docs/config-schema.md "Node
     inheritance") is a plain directory that has to exist, not a mount;
-    a per-user symlink entry (`symlink_target` set) is neither a mount
-    nor a plain directory, just a link back to the one real mount its
-    node resolved to -- callers should render an rclone unit only for
-    entries with a truthy `remote`, e.g. `stortree_mounts_plan |
-    selectattr('remote')`, and a symlink only for entries with a truthy
-    `symlink_target`. A client_mounts entry always has a remote (the
-    root `rclone.remote`) and is never per-user.
+    a per-user bind-mount entry (`symlink_target` set) is neither an
+    rclone mount nor a plain directory left alone, just a kernel bind
+    mount back onto the one real mount its node resolved to -- callers
+    should render an rclone unit only for entries with a truthy `remote`,
+    e.g. `stortree_mounts_plan | selectattr('remote')`, and a bind-mount
+    unit only for entries with a truthy `symlink_target` (the field name
+    predates the switch from a real symlink to a bind mount -- see this
+    field's own note below for why a symlink doesn't work here -- kept
+    as-is rather than renamed everywhere a per-user fan-out is read).
+    A client_mounts entry always has a remote (the root `rclone.remote`)
+    and is never per-user.
 
     Every peer_dependencies entry becomes a mount too -- a samba
     descendant this host doesn't own is data this host's local tree still
@@ -797,21 +812,33 @@ def plan_mounts(resolved, group_members=None):
     (`local_path == ""`) is skipped here since it's already the
     client_mounts entry above; every other entry gets its own mount,
     per-user-resolved the same way as a per-user server_subtrees entry
-    (including the shared-mount-plus-symlinks case -- the owning host's
-    own plan_mounts() run collapses its `group`-only node to that exact
-    same shared path first, so a peer sourcing it has to sftp from that
-    real path, not a per-user one nothing lives at), using its own
+    (including the shared-mount-plus-bind-mounts case -- the owning
+    host's own plan_mounts() run collapses its `group`-only node to that
+    exact same shared path first, so a peer sourcing it has to sftp from
+    that real path, not a per-user one nothing lives at), using its own
     `access`/`args` (never the owning host's).
 
     Each returned entry: {local_path, remote, args, slug, requires_slug,
     symlink_target}. `symlink_target` is the real entry's `local_path`
-    for a per-user symlink entry, else None. `requires_slug` names the
-    nearest ancestor entry that's an actual mount (truthy `remote`) whose
-    local_path is the longest proper-prefix ancestor of this one, if any
-    -- for systemd RequiresMountsFor= so a nested mount starts after the
-    mount it nests under, skipping over any non-mounted (plain-directory
-    or symlink) ancestor in between, which has no unit of its own to
-    require (spec.md §2).
+    for a per-user bind-mount entry, else None -- a real symlink would be
+    a directory entry the *target* directory's own backend has to be
+    able to represent, which not every remote backend can (an SMB share,
+    in production, flatly refused with an I/O error trying to create one
+    at all: SMB has no native symlink representation without extensions
+    this fleet's Storage Box remote doesn't support); a bind mount is a
+    kernel VFS relationship instead, entirely local to this host, so it
+    works regardless of what the underlying remote can store. `requires_
+    slug` names the nearest ancestor entry that's an actual mount (truthy
+    `remote`) whose local_path is the longest proper-prefix ancestor of
+    this one, if any -- for systemd RequiresMountsFor= so a nested mount
+    (or a per-user bind mount's own mountpoint, which lives at exactly
+    this kind of nested path) starts after the mount it nests under,
+    skipping over any non-mounted (plain-directory) ancestor in between,
+    which has no unit of its own to require (spec.md §2). A per-user
+    bind-mount entry's own unit additionally orders after and requires
+    `symlink_target`'s mount directly (stortree_mounts renders this),
+    since that's the *content* it's fanning out, not just a path it's
+    nested under.
     """
     group_members = group_members or {}
     entries = []
@@ -967,12 +994,17 @@ def samba_access_tokens(access_list, include_self=False):
 
 
 def mount_unit_names(mount_plan):
-    """The full `stortree-mount@<slug>.service` unit filename for every
-    actual rclone mount in a stortree_plan_mounts() result (entries with
-    no `remote` are plain directories, not mounts -- see plan_mounts())
-    -- used by stortree_mounts to work out which currently-installed
-    units are stale."""
-    return [f"stortree-mount@{e['slug']}.service" for e in mount_plan if e["remote"]]
+    """The full systemd unit filename for every actual mount in a
+    stortree_plan_mounts() result -- `stortree-mount@<slug>.service` for
+    an rclone mount (truthy `remote`), `stortree-bind@<slug>.service` for
+    a per-user bind mount (truthy `symlink_target`, see plan_mounts()'s
+    own docstring for why that field's name still says "symlink"). An
+    entry with neither is a plain directory, not a mount at all -- see
+    plan_mounts(). Used by stortree_mounts to work out which currently-
+    installed units (of either kind) are stale."""
+    return [f"stortree-mount@{e['slug']}.service" for e in mount_plan if e["remote"]] + [
+        f"stortree-bind@{e['slug']}.service" for e in mount_plan if e.get("symlink_target")
+    ]
 
 
 def path_masked(path, masked_paths):
@@ -1009,6 +1041,7 @@ class FilterModule(object):
             "stortree_needed_groups": needed_groups,
             "stortree_needed_users": needed_users,
             "stortree_plan_mounts": plan_mounts,
+            "stortree_slug": _slug,
             "stortree_mount_unit_names": mount_unit_names,
             "stortree_path_masked": path_masked,
             "stortree_samba_access_tokens": samba_access_tokens,

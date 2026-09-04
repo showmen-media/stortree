@@ -63,8 +63,11 @@ implementation:
    member), so mounting the same remote path once per member was pure
    duplication (N redundant rclone procs/VFS caches of the same
    content). `stortree_plan_mounts` now resolves that case to one real,
-   shared mount plus one symlink per member instead (spec.md §6,
-   `per_user_mount_path()` in `filter_plugins/stortree.py`) — an `owner`
+   shared mount plus one bind mount per member instead (spec.md §6,
+   `per_user_mount_path()` in `filter_plugins/stortree.py`) — a real
+   symlink can't do this job when the member's folder lives on a
+   remote-backed node whose backend can't represent one (e.g. an SMB
+   share), so the fan-out is a kernel bind mount instead. An `owner`
    grant is unaffected, since it was already exactly one real mount.
 3. **Molecule shared `full-tree` scenario location.** Not specified in
    spec.md. Resolved to: `molecule/full-tree/` at repo root (the
