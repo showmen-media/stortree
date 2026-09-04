@@ -69,26 +69,33 @@
 # from its own `access` grant (spec.md §6, stortree_access_owner/_group/
 # _mode): with neither `owner` nor `group` granted, that's the plain
 # default (owner stortree, full control; group stortree, read+traverse;
-# other none) every path had before `access` existed. A remote-backed
-# node's own mountpoint directory does NOT follow `access` this way --
-# it stays stortree:stortree 0750 no matter what's granted, since the
-# grant is enforced by the mount that covers it instead (see below), and
-# the account that actually performs that mount is unconditionally
-# `stortree` (User= in the unit template), never the grant's own
-# `owner`; chowning the pre-mount directory to a granted `owner` leaves
-# `stortree` with no bits on it at all, and `fusermount` refuses to
-# mount there ("Permission denied") before the grant it was chasing ever
-# becomes visible. A per-user bind-mount entry carries no `access` of its
-# own either (it's enforced once, at the real mount `symlink_target`
-# points to, exactly as a symlink's target enforcement would have been)
-# -- but unlike a symlink, its own mountpoint directory is a real,
-# separate inode that has to be creatable and traversable in its own
-# right before anything can be bound onto it, so it still gets the same
-# plain stortree:stortree 0750 default as any other unmodeled container
-# path (no `access`-driven chown/chmod needed -- what's actually visible
-# once mounted is entirely the bound-in target's own enforcement,
-# unaffected by this directory's own ownership once something's mounted
-# over it). A
+# other execute-only) every path had before `access` existed, plus a
+# public-execute traversal bit (access_mode() in filter_plugins/
+# stortree.py) -- without it, an ordinary LDAP-authenticated user (never
+# a member of the local `stortree` group) can't even `chdir()` through
+# this ancestor to reach a real grant nested underneath it, no matter how
+# permissive that grant itself is: every directory component on the path
+# needs its own execute bit, and Samba/SSH access both run as that real
+# user post-privilege-drop, subject to the same kernel checks as anyone
+# else. A remote-backed node's own mountpoint directory does NOT follow
+# `access` this way -- it stays stortree:stortree 0751 no matter what's
+# granted, since the grant is enforced by the mount that covers it
+# instead (see below), and the account that actually performs that mount
+# is unconditionally `stortree` (User= in the unit template), never the
+# grant's own `owner`; chowning the pre-mount directory to a granted
+# `owner` leaves `stortree` with no bits on it at all, and `fusermount`
+# refuses to mount there ("Permission denied") before the grant it was
+# chasing ever becomes visible. A per-user bind-mount entry carries no
+# `access` of its own either (it's enforced once, at the real mount
+# `symlink_target` points to, exactly as a symlink's target enforcement
+# would have been) -- but unlike a symlink, its own mountpoint directory
+# is a real, separate inode that has to be creatable and traversable in
+# its own right before anything can be bound onto it, so it still gets
+# the same plain stortree:stortree 0751 default as any other unmodeled
+# container path (no `access`-driven chown/chmod needed -- what's
+# actually visible once mounted is entirely the bound-in target's own
+# enforcement, unaffected by this directory's own ownership once
+# something's mounted over it). A
 # remote-backed node's mount additionally omits --allow-other unless
 # `access` grants an owner and/or group (rendered unconditionally below,
 # from the same three filters, so the two always agree): with neither
@@ -167,6 +174,18 @@
   # (a `group`-only grant).
   ansible.builtin.set_fact:
     stortree_mounts_plan: "{{ stortree | stortree_plan_mounts(stortree_group_members) }}"
+  tags: [mounts]
+
+- name: Compute this host's per-user container ownership
+  # One entry per real <user-subdirs-prefix>/<username> folder any of
+  # this host's resolved access grants (server_subtrees or
+  # peer_dependencies) needs -- see user_container_paths() in
+  # filter_plugins/stortree.py for why this can't just be read off
+  # stortree_mounts_plan's own entries (that per-user container path
+  # never appears there as an entry of its own, only implied as an
+  # ancestor of one).
+  ansible.builtin.set_fact:
+    stortree_user_containers: "{{ stortree | stortree_user_containers(stortree_group_members) }}"
   tags: [mounts]
 
 - name: Note which mounts have another mount nested inside them
@@ -325,7 +344,7 @@
   # (next task) -- it was necessarily created and correctly owned
   # whenever the mount itself first came up; nothing about a `remote`
   # entry's own parent ownership is meant to change afterward anyway
-  # (always stortree:stortree 0750, this file's header comment).
+  # (always stortree:stortree 0751, this file's header comment).
   ansible.builtin.set_fact:
     stortree_mounts_already_mounted_paths: >-
       {{ stortree_mount_point_probe.results
@@ -366,7 +385,7 @@
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
-    mode: "0750"
+    mode: "0751"
   loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
   loop_control:
     label: "{{ item.local_path }}"
@@ -381,7 +400,7 @@
   # Ownership/mode come from the path's own `access` grant, not a fixed
   # default -- see this file's header comment -- *except* for a
   # remote-backed entry's own mountpoint, which stays stortree:stortree
-  # 0750 regardless of its `access` grant. That pre-mount directory is
+  # 0751 regardless of its `access` grant. That pre-mount directory is
   # never what an `access` grant is actually describing (the unit below
   # already renders the same grant into rclone's --uid/--gid/--dir-perms/
   # --file-perms, which is what's actually visible once mounted) -- it
@@ -415,7 +434,7 @@
     state: directory
     owner: "{{ stortree_user if item.remote else (item.access | stortree_access_owner(stortree_user)) }}"
     group: "{{ stortree_group if item.remote else (item.access | stortree_access_group(stortree_group)) }}"
-    mode: "{{ '0750' if item.remote else (item.access | stortree_access_mode) }}"
+    mode: "{{ '0751' if item.remote else (item.access | stortree_access_mode) }}"
   loop: "{{ stortree_mounts_plan | rejectattr('symlink_target') | list }}"
   loop_control:
     label: "{{ item.local_path or '(root)' }}"
@@ -442,7 +461,7 @@
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
-    mode: "0750"
+    mode: "0751"
   loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
   loop_control:
     label: "{{ item.local_path | dirname }}"
@@ -462,7 +481,7 @@
   # to mount onto instead -- exactly what every other mountpoint in this
   # file already gets (the "Ensure every resolved mount point or plain
   # directory exists" task above, which this mirrors), stortree:stortree
-  # 0750 same as any other unmodeled path (no `access` of its own -- it
+  # 0751 same as any other unmodeled path (no `access` of its own -- it
   # isn't a node in the tree, just an implied container whose real
   # enforcement lives on the mount it's about to be bound onto). The
   # actual bind mount itself happens via the stortree-bind@ unit rendered
@@ -473,8 +492,39 @@
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
-    mode: "0750"
+    mode: "0751"
   loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
+  loop_control:
+    label: "{{ item.local_path }}"
+  when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
+  ignore_errors: true
+  tags: [mounts]
+
+- name: Own every per-user container by the one real user it's for
+  # Every task above that touches a per-user container path (the two
+  # "...parent directory exists" tasks, and Ansible's own implicit
+  # parent creation inside "Ensure every resolved mount point or plain
+  # directory exists") only ever sets it to the plain stortree:stortree
+  # default -- correct for an ordinary unmodeled ancestor, but a
+  # user-subdirs container is never just that: it's the one real folder
+  # a specific person's descendant grants (owner or group) actually live
+  # under, and access_mode()'s public-execute bit on the stortree:stortree
+  # default only makes it *traversable*, not owned by that person -- no
+  # different from anyone else's home directory being merely
+  # world-executable rather than actually theirs. This task runs last so
+  # it always overrides whichever of the above most recently touched that
+  # exact path, same idempotent last-word pattern as every other
+  # ownership task in this file. 0750, not 0751: this directory is now
+  # privately owned by that one real user, so (unlike the plain
+  # stortree:stortree default) nobody else ever needs to traverse through
+  # it -- only its owner and the administering `stortree` group.
+  ansible.builtin.file:
+    path: "{{ stortree_root ~ '/' ~ item.local_path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ stortree_group }}"
+    mode: "0750"
+  loop: "{{ stortree_user_containers }}"
   loop_control:
     label: "{{ item.local_path }}"
   when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))

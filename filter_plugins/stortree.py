@@ -103,14 +103,22 @@ def _expand_dotted(obj):
 
 
 def _normalize_access(raw):
-    """Normalize `access` into a single {group?, owner?, permissions}
-    dict -- never a list (docs/config-schema.md "Access"). A remote-backed
-    node can only ever carry real, kernel-enforced access as plain Unix
-    ownership + mode (rclone's FUSE mount has no POSIX ACL support, spec.md
-    §6) -- which is exactly what one owner + one group + one shared
-    permissions level can express, and no more, so the schema doesn't let
-    you write anything that can't actually be enforced. `raw` with
-    neither `group` nor `owner` (including None) normalizes to `{}`."""
+    """Normalize `access` into a single {group?, owner?, permissions,
+    permissions_explicit} dict -- never a list (docs/config-schema.md
+    "Access"). A remote-backed node can only ever carry real,
+    kernel-enforced access as plain Unix ownership + mode (rclone's FUSE
+    mount has no POSIX ACL support, spec.md §6) -- which is exactly what
+    one owner + one group + one shared permissions level can express, and
+    no more, so the schema doesn't let you write anything that can't
+    actually be enforced. `raw` with neither `group` nor `owner`
+    (including None) normalizes to `{}`.
+
+    `permissions_explicit` records whether the config actually wrote a
+    `permissions` value here, before it gets defaulted below --
+    access_mode() needs that distinction (an operator who wrote one out
+    gets it enforced exactly, other-bits included; a default is free to
+    also carry the public-execute safety net that keeps a distinct grant
+    nested underneath this node still reachable, see access_mode())."""
     if raw is None:
         raw = {}
     if isinstance(raw, list):
@@ -121,6 +129,7 @@ def _normalize_access(raw):
     entry = dict(raw)
     if not (entry.get("group") or entry.get("owner")):
         return {}
+    entry["permissions_explicit"] = "permissions" in entry
     entry.setdefault("permissions", DEFAULT_ACCESS_PERMISSIONS)
     return entry
 
@@ -154,24 +163,46 @@ def access_group(access, default_group):
 def access_mode(access):
     """The Unix mode a node's `access` implies, as a "0NNN" string ready
     for ansible.builtin.file/rclone's --dir-perms/--file-perms alike.
-    `other` is always 0 -- nothing here is ever meant to be world-
-    readable. With neither `owner` nor `group` granted, this is the
-    plain default (owner: stortree, full control; group: stortree,
-    read+traverse) every path had before `access` existed. Granting just
-    one of the two still gives the *other* slot its own sensible default
-    rather than leaving it at 0: an explicit `owner` grant still lets
-    stortree itself administer the path (owner bits stay full even
-    though the path's actual Unix owner is the granted user, not
-    stortree); an explicit `group` grant makes the path private to that
-    group with no separate stortree-group carve-out, since it was
-    deliberately scoped to someone else."""
+    `other` never gets read or write -- nothing here is ever meant to be
+    world-readable -- but every node on the path from `stortree_root`
+    down to any real grant has to stay *traversable* by everyone, or a
+    grant several levels down (e.g. a `user-subdirs` descendant's own
+    `access.group`) is unreachable no matter how permissive it is itself:
+    `open()`/`chdir()` need execute on every ancestor directory, and the
+    connecting user is almost never a member of the local `stortree`
+    group that owns an ungranted ancestor. So `other` carries a bare
+    execute bit (traversal only, no listing, no reading) everywhere this
+    function doesn't know the config author explicitly opted out of it.
+
+    With neither `owner` nor `group` granted, this is the plain default
+    (owner: stortree, full control; group: stortree, read+traverse;
+    other: execute-only) every path had before `access` existed, now with
+    that execute bit added. Granting just one of the two still gives the
+    *other* slot its own sensible default rather than leaving it at 0: an
+    explicit `owner` grant still lets stortree itself administer the path
+    (owner bits stay full even though the path's actual Unix owner is the
+    granted user, not stortree); an explicit `group` grant makes the path
+    private to that group with no separate stortree-group carve-out,
+    since it was deliberately scoped to someone else.
+
+    When `access` carries an *explicit* `permissions` (`permissions_
+    explicit`, set by `_normalize_access()` before it defaults the field)
+    that choice is honored exactly, other-bits included -- an operator
+    who wrote out `permissions:` themselves gets it enforced literally,
+    even if that happens to make a deeper, differently-scoped descendant
+    grant unreachable through this node. Only the *default* permissions
+    level (no `permissions` written in config.yml at all) carries the
+    public-execute safety net; a hand-built `access` dict with no
+    `permissions_explicit` key at all (e.g. in a test) is treated the
+    same as an unset default, which is the safer assumption."""
     access = access or {}
     if not (access.get("owner") or access.get("group")):
-        return "0750"
+        return "0751"
     bits = _permission_bits(access.get("permissions", DEFAULT_ACCESS_PERMISSIONS))
     owner_bits = bits if access.get("owner") else 7
     group_bits = bits if access.get("group") else 0
-    return f"0{owner_bits}{group_bits}0"
+    other_bit = 0 if access.get("permissions_explicit") else 1
+    return f"0{owner_bits}{group_bits}{other_bit}"
 
 
 def _walk_tree(tree):
@@ -773,6 +804,54 @@ def needed_users(resolved):
     return sorted(users)
 
 
+def user_container_paths(resolved, group_members=None):
+    """Every per-user container directory a `user-subdirs` node implies
+    -- the immediate `<prefix>/<username>` folder (docs/config-schema.md
+    "subdirs vs user-subdirs": "the immediate children of a user-subdirs
+    node are per-user folders") that every one of its descendants'
+    resolved users needs to already exist -- paired with the one specific
+    user it should be privately owned by, closing the gap
+    access_mode()'s public-execute bit only papers over: that bit makes
+    the container *traversable* by anyone (needed so an unrelated
+    descendant grant nested underneath stays reachable at all), not
+    *owned* by the one person it's actually for. A real per-user
+    container -- one you can also drop a file straight into, like an
+    ordinary home directory -- has to be owned by that person outright.
+
+    `node_path` still carries `PER_USER_PLACEHOLDER` (`%U`) at this
+    point (server_subtrees nodes always do; a peer_dependencies entry's
+    `local_path` does too, pre-expansion -- see plan_mounts()'s own note
+    on this) -- the container path is everything before it, one call to
+    access_grant_usernames() away from knowing exactly which real
+    usernames it needs to exist for. Every descendant nested under the
+    same `user-subdirs` prefix that resolves to the same user contributes
+    the identical container -- deduped here (by `local_path`) rather than
+    left to the caller, since e.g. two sibling descendants both resolving
+    under `home/%U` would otherwise both try to claim `home/jd`
+    independently. Covers both `server_subtrees` (this host's own nodes)
+    and `peer_dependencies` (a peer-sourced per-user descendant) -- the
+    same two scopes needed_groups()/needed_users() already cover, for the
+    same reason: a client-only host with no server_subtrees of its own
+    still has to own its peer-sourced per-user containers correctly."""
+    group_members = group_members or {}
+    containers = {}
+    for n in resolved.get("server_subtrees", []) + resolved.get("peer_dependencies", []):
+        if not n.get("per_user"):
+            continue
+        node_path = n.get("path") or n.get("local_path")
+        access = n.get("access")
+        if not node_path or not access or PER_USER_PLACEHOLDER not in node_path:
+            continue
+        prefix = node_path.split(PER_USER_PLACEHOLDER)[0].rstrip("/")
+        for user in access_grant_usernames(access, group_members):
+            local_path = f"{prefix}/{user}" if prefix else user
+            containers[local_path] = user
+    return [
+        {"local_path": path, "owner": owner}
+        for path, owner in sorted(containers.items())
+    ]
+
+
 def plan_mounts(resolved, group_members=None):
     """Flatten this host's resolved server_subtrees/client_mounts/
     peer_dependencies into one flat plan of every local path that has to
@@ -1040,6 +1119,7 @@ class FilterModule(object):
             "stortree_access_mode": access_mode,
             "stortree_needed_groups": needed_groups,
             "stortree_needed_users": needed_users,
+            "stortree_user_containers": user_container_paths,
             "stortree_plan_mounts": plan_mounts,
             "stortree_slug": _slug,
             "stortree_mount_unit_names": mount_unit_names,

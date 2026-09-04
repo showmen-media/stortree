@@ -6,6 +6,7 @@ import yaml
 from filter_plugins.stortree import (
     DEFAULT_ACCESS_PERMISSIONS,
     PER_USER_PLACEHOLDER,
+    _normalize_access,
     _slug,
     access_grant_usernames,
     access_group,
@@ -21,6 +22,7 @@ from filter_plugins.stortree import (
     plan_mounts,
     resolve,
     samba_access_tokens,
+    user_container_paths,
     user_uids_from_getent,
 )
 
@@ -292,7 +294,11 @@ def test_sys_configs_access_defaults_permissions_and_is_per_user():
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     sys_configs = by_path(r["server_subtrees"], "tree/home/%U/sys-configs")
     assert sys_configs["per_user"] is True
-    assert sys_configs["access"] == {"owner": "jd", "permissions": DEFAULT_ACCESS_PERMISSIONS}
+    assert sys_configs["access"] == {
+        "owner": "jd",
+        "permissions": DEFAULT_ACCESS_PERMISSIONS,
+        "permissions_explicit": False,
+    }
 
 
 def test_rclone_remote_does_not_inherit():
@@ -690,6 +696,86 @@ def test_needed_users_covers_server_subtrees_and_peer_dependencies():
     assert needed_users(r) == ["jd"]
 
 
+def test_user_container_paths_owner_and_group_grants():
+    r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
+    group_members = {
+        "Whitfield Family & Friends": ["mike", "jd"],
+        "Michael Whitfield Family": ["dana"],
+        "Media Production": ["alex"],
+    }
+    containers = user_container_paths(r, group_members)
+    assert containers == [
+        {"local_path": "tree/home/alex", "owner": "alex"},
+        {"local_path": "tree/home/dana", "owner": "dana"},
+        {"local_path": "tree/home/jd", "owner": "jd"},
+        {"local_path": "tree/home/mike", "owner": "mike"},
+    ]
+
+
+def test_user_container_paths_covers_peer_dependencies_too():
+    # gadget owns nothing itself -- every per-user container it still
+    # needs to create/own comes from peer_dependencies alone, same
+    # reasoning as needed_groups()/needed_users() covering both scopes.
+    r = resolve(EXAMPLE_TREE, "some-storage-gadget", EXAMPLE_HOSTS)
+    group_members = {
+        "Whitfield Family & Friends": ["jd"],
+        "Michael Whitfield Family": [],
+        "Media Production": ["alex"],
+    }
+    containers = user_container_paths(r, group_members)
+    assert containers == [
+        {"local_path": "tree/home/alex", "owner": "alex"},
+        {"local_path": "tree/home/jd", "owner": "jd"},
+    ]
+
+
+def test_user_container_paths_dedupes_across_sibling_descendants():
+    # jd shows up via both sys-configs (owner) and fam (group membership)
+    # -- one container, not two, and it must still resolve to exactly the
+    # one owner both descendants agree on.
+    tree = {
+        "top": {
+            "host": "h1",
+            "subdirs": {
+                "home": {
+                    "user-subdirs": {
+                        "sys-configs": {"access.owner": "jd"},
+                        "fam": {"access.group": "Fam"},
+                    }
+                }
+            },
+        }
+    }
+    r = resolve(tree, "h1", ["h1"])
+    containers = user_container_paths(r, {"Fam": ["jd", "mo"]})
+    assert containers == [
+        {"local_path": "top/home/jd", "owner": "jd"},
+        {"local_path": "top/home/mo", "owner": "mo"},
+    ]
+
+
+def test_user_container_paths_ignores_non_per_user_and_ungranted_nodes():
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "shared": {"access.group": "not-per-user"},
+                "home": {
+                    "user-subdirs": {
+                        # no access at all -- an intermediate per-user
+                        # container with nothing granted contributes no
+                        # container of its own
+                        "empty": {},
+                    }
+                },
+            },
+        }
+    }
+    r = resolve(tree, "h1", ["h1"])
+    assert user_container_paths(r, {}) == []
+
+
 def test_access_owner_defaults_to_stortree_when_unset():
     assert access_owner({}, "stortree") == "stortree"
     assert access_owner(None, "stortree") == "stortree"
@@ -711,25 +797,51 @@ def test_access_group_uses_the_granted_group():
 
 def test_access_mode_with_no_grant_is_the_plain_default():
     # owner: stortree (full control), group: stortree (read+traverse),
-    # other: none -- what every path had before `access` existed.
-    assert access_mode({}) == "0750"
-    assert access_mode(None) == "0750"
+    # other: execute-only -- what every path had before `access` existed,
+    # plus the traversal bit so a real grant nested underneath (e.g. a
+    # user-subdirs descendant) stays reachable through this node.
+    assert access_mode({}) == "0751"
+    assert access_mode(None) == "0751"
 
 
 def test_access_mode_group_only_leaves_owner_full_and_sets_group_bits():
-    assert access_mode({"group": "g", "permissions": "rx"}) == "0750"
-    assert access_mode({"group": "g", "permissions": "rwx"}) == "0770"
+    # no `permissions_explicit` key (as a hand-built dict here has none)
+    # is treated the same as an unset default -- other stays execute-only.
+    assert access_mode({"group": "g", "permissions": "rx"}) == "0751"
+    assert access_mode({"group": "g", "permissions": "rwx"}) == "0771"
 
 
 def test_access_mode_owner_only_is_private_to_that_owner():
     # deliberately no stortree-group carve-out -- an owner-only grant was
     # scoped to one specific person, not shared with anyone else by default
-    assert access_mode({"owner": "jd", "permissions": "rwx"}) == "0700"
-    assert access_mode({"owner": "jd", "permissions": "rx"}) == "0500"
+    assert access_mode({"owner": "jd", "permissions": "rwx"}) == "0701"
+    assert access_mode({"owner": "jd", "permissions": "rx"}) == "0501"
 
 
 def test_access_mode_owner_and_group_share_the_same_permissions_level():
-    assert access_mode({"owner": "jd", "group": "g", "permissions": "rwx"}) == "0770"
+    assert access_mode({"owner": "jd", "group": "g", "permissions": "rwx"}) == "0771"
+
+
+def test_access_mode_explicit_permissions_is_honored_with_no_public_execute():
+    # permissions_explicit=True (what _normalize_access() sets when
+    # config.yml actually wrote out `permissions:` itself) is a deliberate
+    # operator choice -- enforced exactly, no safety-net execute bit added,
+    # even though that can make a distinct descendant grant nested
+    # underneath this node unreachable.
+    access = {"group": "g", "permissions": "rx", "permissions_explicit": True}
+    assert access_mode(access) == "0750"
+    access = {"owner": "jd", "permissions": "rwx", "permissions_explicit": True}
+    assert access_mode(access) == "0700"
+
+
+def test_access_mode_default_permissions_from_normalize_access_gets_public_execute():
+    # end-to-end through _normalize_access(), not a hand-built dict: a
+    # config.yml grant with no `permissions` at all is exactly the case
+    # the public-execute safety net exists for.
+    access = _normalize_access({"owner": "jd"})
+    assert access_mode(access) == "0701"
+    access = _normalize_access({"group": "g", "permissions": "rx"})
+    assert access_mode(access) == "0750"
 
 
 def test_samba_access_tokens_quotes_names_with_spaces():
@@ -880,6 +992,7 @@ def test_plan_mounts_group_only_per_user_node_collapses_to_one_mount():
     assert real_mount["access"] == {
         "group": "Whitfield Family & Friends",
         "permissions": "rx",
+        "permissions_explicit": True,
     }
 
     symlinks = {e["local_path"]: e for e in plan if e["symlink_target"]}
@@ -912,12 +1025,14 @@ def test_plan_mounts_entries_carry_access_for_ownership_and_mode():
     assert by_local_path["tree/home/jd/sys-configs"]["access"] == {
         "owner": "jd",
         "permissions": DEFAULT_ACCESS_PERMISSIONS,
+        "permissions_explicit": False,
     }
     # media-prod is `group`-only -- its own access grant lives on the one
     # real, shared mount now (per_user_mount_path()), not on alex's symlink
     assert by_local_path["tree/home/.mounts/media-prod"]["access"] == {
         "group": "Media Production",
         "permissions": DEFAULT_ACCESS_PERMISSIONS,
+        "permissions_explicit": False,
     }
     assert by_local_path["tree/home/alex/media-prod"]["access"] == {}
     assert by_local_path["tree/home/alex/media-prod"]["symlink_target"] == "tree/home/.mounts/media-prod"

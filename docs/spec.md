@@ -469,7 +469,7 @@ mount point or plain directory alike — via three pure filters
 
 - **Neither `owner` nor `group` granted**: the plain default every path
   had before `access` existed — owner `stortree` with full control,
-  group `stortree` with read+traverse, other none (`0750`).
+  group `stortree` with read+traverse, other execute-only (`0751`).
 - **`owner` only**: that user owns the path outright, at the granted
   `permissions` level; group is `stortree` with *no* access — deliberately
   private, since it was scoped to one specific person.
@@ -478,6 +478,20 @@ mount point or plain directory alike — via three pure filters
   the granted group gets `permissions`.
 - **Both**: the path is pinned to that one `owner` (no group-driven
   expansion — see below), who and whose group both get `permissions`.
+
+Every one of these except an *explicit* `permissions` (one the config
+actually wrote out, tracked as `permissions_explicit` by
+`_normalize_access()`) also carries a bare execute bit on `other`, even
+when `owner`/`group` is granted: `open()`/`chdir()` need execute on every
+ancestor directory to reach a real grant several levels down (e.g. a
+`user-subdirs` descendant's own `access.group`), and the connecting user
+is essentially never a member of the local `stortree` group that would
+otherwise own an ungranted ancestor — Samba and SSH both run as that real
+user post-privilege-drop, subject to the same kernel checks as anyone
+else. Nothing here is ever world-*readable*, only world-*traversable*. An
+operator who writes `permissions:` out explicitly gets it enforced
+exactly as written, other-bits included, even if that happens to block a
+differently-scoped descendant grant.
 
 For a plain local directory, that's `ansible.builtin.file`'s
 `owner`/`group`/`mode` — real, standard Unix ownership, no `acl` package
@@ -567,6 +581,23 @@ server_subtrees of its own — like `some-storage-gadget` in the worked
 example — never resolved the groups its peer-sourced per-user shares
 actually needed).
 
+The per-user folder `access_grant_usernames()` says a `user-subdirs`
+node needs — `home/jd`, say — is itself owned by that one real user, not
+`stortree`: `user_container_paths()` derives, from the same
+`server_subtrees`/`peer_dependencies` facts, every `<prefix>/<username>`
+container any resolved grant anywhere under that prefix implies (deduped
+by path — several sibling descendants resolving to the same user all
+agree on one container, not one each), and `stortree_mounts` chowns it
+to that user directly (`0750`, group still `stortree` so it can
+administer), after every other task in the file that might otherwise
+leave it at the plain `stortree:stortree` default. This is a real,
+ordinary-home-directory-style folder — the user can create files
+directly in it, not just reach whatever specific descendant grant
+(`mp-fam`, say) happens to live inside it — deliberately more than the
+bare traversal `access_mode()`'s public-execute bit alone would give an
+*unrelated* user passing through an ancestor they don't otherwise own;
+here, the container and the grant agree on exactly who it's for.
+
 `access_grant_usernames()` says *who* gets a folder; `per_user_mount_path()`
 says *where the real content actually lives*, and the two only disagree
 for a `group`-only grant. An `owner` grant's one user is also where the
@@ -595,7 +626,7 @@ regardless of directory-creation ordering. A bind mount is a kernel VFS
 relationship instead, entirely local to this host and independent of
 what the underlying remote backend can store, so it works everywhere a
 symlink sometimes couldn't. Each per-user path gets its own ordinary
-directory first (stortree:stortree 0750, no `access` of its own — the
+directory first (stortree:stortree 0751, no `access` of its own — the
 same plain default any unmodeled container path gets), then its own
 `stortree-bind@` unit `mount --bind`s the real mount's path onto it —
 enforcement still lives entirely at the one real mount, same uid/gid/mode

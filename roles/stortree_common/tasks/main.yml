@@ -69,7 +69,13 @@
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
-    mode: "0750"
+    # 0751, not 0750: every real `access` grant anywhere in the tree sits
+    # underneath this one root, so it needs the same public-execute
+    # traversal bit stortree_mounts/access_mode() now put on every other
+    # unmodeled container -- otherwise no LDAP-authenticated user (never
+    # a member of the local `stortree` group) can ever reach a grant no
+    # matter how permissive that grant itself is (spec.md §6).
+    mode: "0751"
   when: stortree_root not in (ansible_facts.mounts | map(attribute='mount') | list)
   tags: [common]
 

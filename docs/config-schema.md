@@ -331,6 +331,16 @@ Same map-of-`name -> node` shape, but they resolve differently:
   mechanism. `sys-configs` (`owner`-only) has no such sharing to do — an
   `owner` grant always was, and still is, one folder for one person.
 
+  The per-user folder itself (`home/jd`, not `home/jd/sys-configs`) is
+  owned outright by that one real user, not by `stortree` — an ordinary
+  home directory, not just a passthrough to whatever's granted beneath
+  it: `jd` can create files directly in `home/jd`, not only reach
+  `sys-configs`. Every descendant under the same `user-subdirs` node that
+  resolves to the same user (e.g. `jd` being both `sys-configs`'s owner
+  and a `mw-fam` group member) shares that one container; nothing about
+  which descendant triggered it changes who owns it. See spec.md §6
+  (`user_container_paths()`) for the mechanism.
+
 ### Access
 
 `access` is always a single object — `group`, `owner`, and `permissions`
@@ -375,12 +385,19 @@ sibling's.
 
 With neither `group` nor `owner` granted, a node gets the plain default:
 owned by the `stortree` service account with full control, group
-`stortree` with read+traverse, no access for anyone else. Granting an
-`owner` makes it private to that one user instead (no group fallback);
-granting only a `group` leaves `stortree` itself with full control and
-gives the group `permissions`. See spec.md §6 for exactly how this
-becomes real, symmetric enforcement over both Samba and SSH alike, for
-every node with any `access` at all.
+`stortree` with read+traverse, and a bare execute (traversal-only, no
+read/write) bit for everyone else — needed so a real grant nested several
+levels down (e.g. a `user-subdirs` descendant's own `access.group`) stays
+reachable through this node, since the connecting user is essentially
+never a member of the local `stortree` group. Granting an `owner` makes
+it private to that one user instead (no group fallback); granting only a
+`group` leaves `stortree` itself with full control and gives the group
+`permissions`. That same traversal-only bit for everyone else is also
+added whenever `permissions` is left at its default rather than written
+out explicitly in config.yml — an explicit `permissions:` is enforced
+exactly as written instead. See spec.md §6 for exactly how this becomes
+real, symmetric enforcement over both Samba and SSH alike, for every node
+with any `access` at all.
 
 ### Every inventory host participates
 
