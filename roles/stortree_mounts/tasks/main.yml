@@ -239,6 +239,29 @@
   ansible.builtin.meta: flush_handlers
   tags: [mounts]
 
+- name: Clear failed-state bookkeeping for any stortree unit no longer backed by a file
+  # `systemctl list-units --all` (what playbooks/status.yml reports) keeps
+  # a unit's own last-known failed state around -- exactly the "not-found
+  # failed failed" rows that command surfaces -- even after "Remove stale
+  # mount unit files" above and its daemon-reload handler have made the
+  # unit's *load* state `not-found`: daemon-reload only clears that load
+  # state, not the separate failed-state bookkeeping, which needs its own
+  # explicit reset. Scoped to every current *and historical*
+  # stortree-mount@/stortree-bind@ slug, not just `stortree_mounts_stale_
+  # units` above -- a unit whose file was already removed by an earlier
+  # apply (before this task existed, or from an earlier schema/naming
+  # iteration -- e.g. a bare `home/...` slug from before top-level
+  # subtrees existed) never shows up in that set at all, since there's no
+  # file left for "Find currently installed stortree mount units" to find.
+  # Unconditional and idempotent every single apply: resetting a unit
+  # that isn't actually in a failed state is a documented no-op, so this
+  # costs nothing on a clean run and self-heals any accumulated ghost
+  # state from any past slug family, not just whatever changed today.
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    cmd: systemctl reset-failed 'stortree-mount@*.service' 'stortree-bind@*.service'
+  changed_when: false
+  tags: [mounts]
+
 - name: Probe whether each remote-backed entry's own mountpoint is reachable
   # `ansible_facts.mounts` can't be trusted for this -- Ansible's own
   # mount-fact gathering silently drops any mount whose reported device
