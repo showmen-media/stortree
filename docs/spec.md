@@ -697,6 +697,32 @@ uniform across a whole mount (no way to carve out one nested path with a
 different owner from inside the same mount), so this is the only way
 `mw-fam`'s ownership and the container's can coexist at all.
 
+Ordering alone isn't enough, though: a wrapped container's path stops
+being a real directory the moment its wrapper mounts, and becomes a
+mountpoint whose visible contents are the *staging* directory's. So a
+directory created at `home/jd/mw-fam` — the empty mountpoint every
+bind mount needs — is simply hidden the instant the wrapper comes up,
+and the bind's own `mount --bind` then fails outright against a path
+that, as far as anything above the wrapper can see, doesn't exist. This
+is how the first apply after wrapper mounts existed actually failed in
+production: all eight per-user binds, both hosts, each one's new
+`Requires=` on the wrapper dutifully bringing the wrapper up first and
+thereby hiding the very mountpoint the unit was about to mount onto.
+`physical_path()` (`filter_plugins/stortree.py`) is the fix and the
+general rule: every directory `stortree_mounts` creates is created at
+its *physical* path, rewriting anything strictly inside a wrapped
+container to the staging directory the wrapper re-presents it from, so
+it shows up at the visible container path for real and stays mountable.
+Strictly inside — the container path itself is the wrapper's own
+mountpoint and has to keep existing exactly where it is; and an
+unwrapped (plain local, directly chowned) container has no wrapper
+shadowing anything, so nothing under it moves at all. The mount units
+themselves are untouched by this: they still mount onto the visible
+path, which is the whole point — only directory *creation* follows the
+content to where it physically lives. Sequencing follows: the staging
+directory is created ahead of both bind-mountpoint tasks, since it's now
+the parent everything nested gets redirected into.
+
 The optional `sshd_config` fragment (`stortree_sshd`, only runs when
 `stortree/sshd_config` is present in the repo) is templated to
 `/etc/ssh/sshd_config.d/stortree.conf`, included via a drop-in, with

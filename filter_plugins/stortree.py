@@ -1212,6 +1212,39 @@ def user_mount_unit_names(containers):
     ]
 
 
+def physical_path(local_path, containers):
+    """Where a path actually has to be *created on disk*, given that a
+    wrapped per-user container (user_container_paths() with `requires_slug`
+    set) isn't a real directory at all once its wrapper mount is up -- it's
+    a mountpoint, and what's visible underneath it is the wrapper's own
+    staging directory, not whatever happens to sit physically at that path.
+
+    Anything created at `<container>/<...>` before the wrapper mounts is
+    therefore shadowed the instant it does, and anything mounted onto such
+    a path fails outright with the mountpoint simply not existing -- which
+    is exactly what happened in production the first apply after wrapper
+    mounts existed: every per-user bind mount's own mountpoint directory
+    had been created under the container path, the bind unit's new
+    `Requires=` pulled the wrapper mount up first, and all eight binds then
+    failed their `mount --bind` against a path the wrapper had just hidden.
+    Rewriting to the staging path puts that directory where the wrapper
+    re-presents it from, so it shows up at the visible container path for
+    real and stays mountable.
+
+    Only *strict* descendants are rewritten: the container path itself is
+    the wrapper's mountpoint and has to keep existing physically right
+    where it is. A path under an unwrapped (plain local, directly chowned)
+    container is returned untouched -- there's no wrapper mount shadowing
+    anything there."""
+    for container in containers or []:
+        if not container.get("requires_slug"):
+            continue
+        prefix = container["local_path"] + "/"
+        if local_path.startswith(prefix):
+            return container["staging_path"] + "/" + local_path[len(prefix) :]
+    return local_path
+
+
 def path_masked(path, masked_paths):
     """Whether `path` is itself one of `masked_paths` (stortree_mounts'
     own stortree_masked_mount_paths, built from probing each
@@ -1251,6 +1284,7 @@ class FilterModule(object):
             "stortree_slug": _slug,
             "stortree_mount_unit_names": mount_unit_names,
             "stortree_user_mount_unit_names": user_mount_unit_names,
+            "stortree_physical_path": physical_path,
             "stortree_path_masked": path_masked,
             "stortree_samba_access_tokens": samba_access_tokens,
         }

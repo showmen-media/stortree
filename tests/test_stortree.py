@@ -24,6 +24,7 @@ from filter_plugins.stortree import (
     resolve,
     samba_access_tokens,
     user_container_paths,
+    physical_path,
     user_mount_unit_names,
     user_uids_from_getent,
 )
@@ -1288,6 +1289,53 @@ def test_user_mount_unit_names_only_covers_containers_with_a_wrapper_mount():
         {"slug": "top-home-jd", "requires_slug": None},
     ]
     assert user_mount_unit_names(containers) == ["stortree-user-mount@tree-home-jd.service"]
+
+
+CONTAINERS_FOR_PHYSICAL_PATH = [
+    {
+        "local_path": "tree/home/jd",
+        "owner": "jd",
+        "staging_path": "tree/home/stortree-user-jd",
+        "slug": "tree-home-jd",
+        "requires_slug": "tree",
+    },
+    {
+        "local_path": "top/home/dana",
+        "owner": "dana",
+        "staging_path": "top/home/stortree-user-dana",
+        "slug": "top-home-dana",
+        "requires_slug": None,
+    },
+]
+
+
+def test_physical_path_redirects_inside_a_wrapped_container():
+    # the container path itself is the wrapper's mountpoint and has to
+    # stay physically where it is; anything *under* it is only visible
+    # through the wrapper, so it has to be created in the staging
+    # directory the wrapper re-presents from.
+    assert (
+        physical_path("tree/home/jd/mw-fam", CONTAINERS_FOR_PHYSICAL_PATH)
+        == "tree/home/stortree-user-jd/mw-fam"
+    )
+    assert (
+        physical_path("tree/home/jd/a/b/c", CONTAINERS_FOR_PHYSICAL_PATH)
+        == "tree/home/stortree-user-jd/a/b/c"
+    )
+    assert physical_path("tree/home/jd", CONTAINERS_FOR_PHYSICAL_PATH) == "tree/home/jd"
+
+
+def test_physical_path_leaves_everything_else_alone():
+    # an unwrapped (plain local, directly chowned) container has no
+    # wrapper mount shadowing anything, so nothing under it moves; nor
+    # does an unrelated path, nor a same-prefix sibling of a container.
+    assert (
+        physical_path("top/home/dana/mw-fam", CONTAINERS_FOR_PHYSICAL_PATH)
+        == "top/home/dana/mw-fam"
+    )
+    assert physical_path("tree/home/jdoe/x", CONTAINERS_FOR_PHYSICAL_PATH) == "tree/home/jdoe/x"
+    assert physical_path("tree/backups", CONTAINERS_FOR_PHYSICAL_PATH) == "tree/backups"
+    assert physical_path("tree/home", []) == "tree/home"
 
 
 def test_plan_mounts_slug_distinguishes_hyphen_from_nesting():

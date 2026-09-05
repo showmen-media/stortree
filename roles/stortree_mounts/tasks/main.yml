@@ -390,7 +390,9 @@
   # task's own comment for why re-touching an already-mounted entry's
   # parent, every single apply from here on, isn't safe to keep doing.
   ansible.builtin.file:
-    path: "{{ stortree_root ~ '/' ~ (item.local_path | dirname) }}"
+    path: >-
+      {{ stortree_root ~ '/'
+         ~ ((item.local_path | dirname) | stortree_physical_path(stortree_user_containers)) }}
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
@@ -438,8 +440,18 @@
   # itself is dealt with -- normally by the unit render/restart below
   # this same run, which gives the ancestor --allow-other so it stops
   # being masked at all (docs/runbook.md "A masked mount").
+  #
+  # `stortree_physical_path` for the same reason as the bind-mountpoint
+  # task below -- see its comment: an entry resolving *inside* a wrapped
+  # per-user container has to be created in that container's staging
+  # directory, since the container path itself is a wrapper mountpoint and
+  # anything created directly under it is shadowed the moment the wrapper
+  # mounts. Left exactly as-is for every other entry, which is all of them
+  # unless a node nests under a user-subdirs container.
   ansible.builtin.file:
-    path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
+    path: >-
+      {{ (stortree_root ~ '/' ~ (item.local_path | stortree_physical_path(stortree_user_containers)))
+         if item.local_path else stortree_root }}
     state: directory
     owner: "{{ stortree_user if item.remote else (item.access | stortree_access_owner(stortree_user)) }}"
     group: "{{ stortree_group if item.remote else (item.access | stortree_access_group(stortree_group)) }}"
@@ -448,6 +460,39 @@
   loop_control:
     label: "{{ item.local_path or '(root)' }}"
   when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
+  ignore_errors: true
+  tags: [mounts]
+
+- name: Ensure every per-user personal-mount staging directory exists
+  # The real content a wrapper mount (rendered below) re-presents with
+  # its one owner's correct --uid/--gid/--dir-perms: ordinary content,
+  # inside the very same remote-backed mount the container itself nests
+  # under, that nothing but the `stortree` account (driving both that
+  # outer mount and the wrapper mount) ever touches directly -- so its
+  # own ownership/mode here doesn't matter beyond being usable by
+  # `stortree`, same reasoning as any other pre-mount directory in this
+  # file. A sibling of the container itself (STORTREE_USER_PREFIX in
+  # filter_plugins/stortree.py), so it always resolves under the same
+  # already-existing parent (e.g. `home`) the container itself does --
+  # which the mount-point/plain-directory task above has just created, the
+  # reason this sits here rather than any earlier.
+  #
+  # Ahead of both bind-mountpoint tasks below (it used to follow them):
+  # `stortree_physical_path` redirects anything resolving inside a wrapped
+  # container into *this* directory, so it has to exist first. Same
+  # don't-rely-on-implicit-multi-level-creation reasoning as every other
+  # "...parent directory exists" task in this file, just for the one
+  # parent that isn't a tree node at all.
+  ansible.builtin.file:
+    path: "{{ stortree_root ~ '/' ~ item.staging_path }}"
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0751"
+  loop: "{{ stortree_user_containers | selectattr('requires_slug') | list }}"
+  loop_control:
+    label: "{{ item.staging_path }}"
+  when: not (item.staging_path | stortree_path_masked(stortree_masked_mount_paths))
   ignore_errors: true
   tags: [mounts]
 
@@ -466,7 +511,9 @@
   # container -- so it gets the same plain default every unmodeled path
   # got before `access` existed.
   ansible.builtin.file:
-    path: "{{ stortree_root ~ '/' ~ (item.local_path | dirname) }}"
+    path: >-
+      {{ stortree_root ~ '/'
+         ~ ((item.local_path | dirname) | stortree_physical_path(stortree_user_containers)) }}
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
@@ -496,8 +543,22 @@
   # actual bind mount itself happens via the stortree-bind@ unit rendered
   # below, not here -- this task only has to get an empty directory in
   # place for that unit's ExecStart to mount onto.
+  #
+  # `stortree_physical_path` (filter_plugins/stortree.py) because "in
+  # place" isn't the same path it reads as, once the per-user container
+  # this sits inside is a *wrapped* one: that container path is a wrapper
+  # mountpoint, and a directory created directly underneath it is shadowed
+  # the moment the wrapper mounts over it -- so the bind unit's ExecStart
+  # then finds no mountpoint at all. This is exactly how it failed in
+  # production the first apply after wrapper mounts existed (all eight
+  # binds, both hosts: the bind unit's own new `Requires=` pulled the
+  # wrapper up first, and `mount --bind` then had nothing to mount onto).
+  # Creating it in the wrapper's staging directory instead puts it where
+  # the wrapper actually re-presents the container's contents from, so it
+  # exists at the visible path for real. Unwrapped (plain local) containers
+  # rewrite to nothing at all and keep working exactly as before.
   ansible.builtin.file:
-    path: "{{ stortree_root ~ '/' ~ item.local_path }}"
+    path: "{{ stortree_root ~ '/' ~ (item.local_path | stortree_physical_path(stortree_user_containers)) }}"
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
@@ -548,30 +609,6 @@
   loop_control:
     label: "{{ item.local_path }}"
   when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
-  ignore_errors: true
-  tags: [mounts]
-
-- name: Ensure every per-user personal-mount staging directory exists
-  # The real content a wrapper mount (rendered below) re-presents with
-  # its one owner's correct --uid/--gid/--dir-perms: ordinary content,
-  # inside the very same remote-backed mount the container itself nests
-  # under, that nothing but the `stortree` account (driving both that
-  # outer mount and the wrapper mount) ever touches directly -- so its
-  # own ownership/mode here doesn't matter beyond being usable by
-  # `stortree`, same reasoning as any other pre-mount directory in this
-  # file. A sibling of the container itself (STORTREE_USER_PREFIX in
-  # filter_plugins/stortree.py), so it always resolves under the same
-  # already-existing parent (e.g. `home`) the container itself does.
-  ansible.builtin.file:
-    path: "{{ stortree_root ~ '/' ~ item.staging_path }}"
-    state: directory
-    owner: "{{ stortree_user }}"
-    group: "{{ stortree_group }}"
-    mode: "0751"
-  loop: "{{ stortree_user_containers | selectattr('requires_slug') | list }}"
-  loop_control:
-    label: "{{ item.staging_path }}"
-  when: not (item.staging_path | stortree_path_masked(stortree_masked_mount_paths))
   ignore_errors: true
   tags: [mounts]
 
