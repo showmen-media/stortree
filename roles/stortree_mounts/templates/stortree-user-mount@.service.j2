@@ -1,0 +1,24 @@
+[Unit]
+Description=stortree per-user personal mount %i (managed by stortree, do not edit by hand)
+{% if entry.requires_slug %}
+After=stortree-mount@{{ entry.requires_slug }}.service
+RequiresMountsFor={{ stortree_root }}/{{ entry.staging_path }}
+{% endif %}
+
+[Service]
+Type=notify
+User={{ stortree_user }}
+Group={{ stortree_group }}
+ExecStart=/usr/bin/rclone mount {{ stortree_root }}/{{ entry.staging_path }} {{ stortree_root }}/{{ entry.local_path }} \
+  --allow-other \
+  --dir-perms 0750 \
+  --file-perms 0640 \
+  --uid {{ stortree_user_uids[entry.owner] }} \
+  --gid {{ stortree_gid }} \
+  --vfs-cache-mode off
+ExecStop=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do mountpoint -q "{{ stortree_root }}/{{ entry.local_path }}" || exit 0; /bin/fusermount -uz "{{ stortree_root }}/{{ entry.local_path }}" || exit 0; done'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

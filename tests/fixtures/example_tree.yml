@@ -72,9 +72,15 @@ tree:
   client-defaults:
     rclone: false
 
-# storage-node-alpha's own VFS-cache backing store, same reasoning.
+# storage-node-alpha's own VFS-cache backing store -- unlike
+# .bravo-cache, genuinely local (no rclone.remote at all): media-prod's
+# own mounting host is alpha itself, so its VFS cache can just live on
+# alpha's own disk directly, no separate remote-backed mount needed.
+# client-defaults.rclone: false still matters here even without a
+# remote to peer-mount: without it, every other host would still get an
+# empty placeholder directory created for it (docs/config-schema.md
+# "Per-client mount opt-out").
 .gcs-cache:
   host: storage-node-alpha
-  rclone.remote: some-gcs-bucket:/
   client-defaults:
     rclone: false

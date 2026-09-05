@@ -73,6 +73,30 @@ implementation:
    spec.md. Resolved to: `molecule/full-tree/` at repo root (the
    conventional layout for a cross-role scenario, vs. each role's own
    `roles/<role>/molecule/default/`).
+4. **A `user-subdirs` container's own ownership.** Not specified in
+   spec.md at all — every existing mechanism enforces a *descendant's*
+   `access` grant, never the per-user container path itself
+   (`home/jd`), which every task in `stortree_mounts` left at the plain
+   `stortree:stortree` default. Resolved to: `user_container_paths()`
+   (`filter_plugins/stortree.py`) derives the one real user each
+   container belongs to, and `stortree_mounts` gives it real ownership —
+   but *how* depends on what's above it, since that's the one thing this
+   call couldn't just apply uniformly: a plain `chown`/`chmod` for a
+   container nested under a genuinely local top-level subtree (`host`
+   set, no `rclone`), since real, native Unix ownership already works
+   there; a dedicated per-user "wrapper mount" (`rclone mount`'s `local`
+   backend, source = a `stortree-user-<name>` sibling of the container,
+   target = the container itself, that user's real `--uid`/`--gid`/
+   `--dir-perms`) for one nested inside a remote-backed ancestor's own
+   rclone mount instead, discovered the hard way against a live
+   deployment: a plain `chown` there is accepted by the FUSE layer
+   (Ansible reports `changed`) but never actually persists, since a
+   single rclone mount can only ever present one uniform owner for
+   everything under it. That same constraint is also why a sibling
+   descendant with its own distinct ownership (a `group`-only grant's
+   bind mount, e.g. `mw-fam`) now has to wait for the wrapper mount too,
+   stacking its own real ownership on top exactly as it already stacked
+   on the outer mount before the wrapper existed (spec.md §6).
 
 ## Phased build plan
 

@@ -70,11 +70,12 @@ needed), while `storage-node-bravo` instead points its `cache-dir` at
 on `storage-node-bravo`'s local network), so the vfs cache lives off-host
 rather than competing for space on the box itself. `.bravo-cache` and
 `.gcs-cache` are their own top-level subtrees, siblings of `tree` rather
-than nested inside it — nesting a VFS-cache mount inside another host's
-own mount is exactly the kind of collision top-level subtrees exist to
-avoid (see "Top-level subtrees" below), and each sets
-`client-defaults.rclone: false` since nothing but its own owning host
-ever needs it mounted anywhere:
+than nested inside it — nesting a VFS-cache backing store inside another
+host's own remote-backed mount is exactly the kind of collision
+top-level subtrees exist to avoid (see "Top-level subtrees" below), and
+each sets `client-defaults.rclone: false` since nothing but its own
+owning host ever needs it mounted (or, for `.gcs-cache`, created at all)
+anywhere else:
 
 ```yaml
 tree:
@@ -134,7 +135,6 @@ tree:
 
 .gcs-cache:
   host: storage-node-alpha
-  rclone.remote: some-gcs-bucket:/
   client-defaults:
     rclone: false
 ```
@@ -165,13 +165,22 @@ device on that host's own local network). Its only purpose is to back
 the `cache-dir` that `clients.storage-node-bravo.rclone.args` points at
 above: `storage-node-bravo` caches the files `storagebox` serves (as
 `tree`'s own remote, via `storage-node-alpha`) onto that local-network
-disk rather than its own. Because it's a sibling of `tree` rather than
-nested inside it, `stortree_mounts` (spec.md §2) never has to order one
-against the other — `.bravo-cache` mounts independently, with no
-`RequiresMountsFor=` relationship to `tree`'s own mount in either
-direction. `media-prod`'s `cache-dir`, by contrast, needs no such
-top-level subtree at all — it's a plain path under `.gcs-cache`, itself
-just backed by the host's own local disk once mounted.
+disk rather than its own — a real, off-host mount, needed because
+`storage-node-bravo` is only ever reading `tree` as a peer, never as its
+owner. `.gcs-cache` is a top-level subtree too, but a much plainer one:
+no `rclone` at all, so it resolves to nothing more than an ordinary
+local directory (docs/spec.md "Node inheritance"). `media-prod`'s own
+mounting host is `storage-node-alpha` itself — no peer-sourcing
+indirection to cache around the way there is for `storage-node-bravo`'s
+read of `tree` — so its VFS cache can just live directly on `alpha`'s
+own disk, no real mount of any kind needed to back it, `.gcs-cache`
+included. It's still its own top-level subtree, a sibling of `tree`
+rather than nested inside it, so `stortree_mounts` (spec.md §2) never
+has to order one against the other; nesting it inside `tree` instead
+would put `media-prod`'s cache files behind `tree`'s own remote-backed
+mount — the exact same bucket `media-prod` mounts as its primary
+content, since `media-prod` is nested there — replacing a cache with a
+second, redundant, self-referential mount of identical remote data.
 
 `some-storage-gadget` owns no subtree at all — it only appears under
 `tree`'s `clients:` — but because `home` carries a `samba:` block, it
@@ -213,12 +222,16 @@ though the resolved filesystem still puts them all under the one fixed
 
 ### Per-client mount opt-out
 
-By default, every top-level subtree with its own `rclone.remote` is
-peer-mounted onto every inventory host that doesn't own it (see "Every
-inventory host participates" below). A subtree that has no business being
-visible anywhere but its own owning host — a per-host VFS-cache backing
-store like `.bravo-cache`/`.gcs-cache` above being the common case — can
-opt out with `client-defaults.rclone: false`:
+By default, every top-level subtree is peer-mounted (or, with no
+`rclone.remote` of its own, just created as an empty placeholder
+directory) onto every inventory host that doesn't own it (see "Every
+inventory host participates" below). A subtree that has no business
+being visible anywhere but its own owning host — a per-host VFS-cache
+backing store, remote-backed like `.bravo-cache` above or genuinely
+local like `.gcs-cache` — can opt out with `client-defaults.rclone:
+false` either way: it's not just about skipping a peer mount nobody
+needs, a remote-less subtree like `.gcs-cache` would otherwise still get
+that pointless empty placeholder directory created on every other host.
 
 ```yaml
 <name>:
@@ -338,8 +351,15 @@ Same map-of-`name -> node` shape, but they resolve differently:
   `sys-configs`. Every descendant under the same `user-subdirs` node that
   resolves to the same user (e.g. `jd` being both `sys-configs`'s owner
   and a `mw-fam` group member) shares that one container; nothing about
-  which descendant triggered it changes who owns it. See spec.md §6
-  (`user_container_paths()`) for the mechanism.
+  which descendant triggered it changes who owns it. How that ownership
+  actually gets applied depends on what's above the container: a plain
+  `chown` for a genuinely local top-level subtree (`host` set, no
+  `rclone`), or a dedicated per-user mount for one nested inside a
+  remote-backed subtree like `tree` here, since a single rclone mount
+  can't present two different paths under it with two different owners.
+  See spec.md §6 (`user_container_paths()`) for the mechanism, and its
+  own note there on what this means for a sibling like `mw-fam`'s bind
+  mount, which now has to wait for that per-user mount too.
 
 ### Access
 

@@ -22,18 +22,11 @@
   loop: "{{ stortree | stortree_needed_groups }}"
   tags: [secrets]
 
-- name: Look up the UID for every user referenced in an access.owner grant
-  # Mirrors the group lookup above -- stortree_mounts needs the numeric
-  # UID (not just the name) to uid-own a remote-backed node's mount
-  # (spec.md §6); a plain local node just hands ansible.builtin.file the
-  # name directly and needs no lookup at all.
-  ansible.builtin.getent:
-    database: passwd
-    key: "{{ item }}"
-  loop: "{{ stortree | stortree_needed_users }}"
-  tags: [secrets]
-
 - name: Compute this host's resolved group membership
+  # Moved ahead of the UID lookup below (it used to follow it) --
+  # stortree_needed_users() now also needs to know every per-user
+  # container's real owner (group-derived ones included, e.g. a
+  # group-only grant's members), which needs this fact to exist first.
   ansible.builtin.set_fact:  # noqa: var-naming[no-role-prefix]
     stortree_group_members: "{{ ansible_facts.getent_group | default({}) | stortree_group_members }}"
   tags: [secrets]
@@ -45,6 +38,21 @@
   # kernel can enforce that grant for real.
   ansible.builtin.set_fact:  # noqa: var-naming[no-role-prefix]
     stortree_group_gids: "{{ ansible_facts.getent_group | default({}) | stortree_group_gids }}"
+  tags: [secrets]
+
+- name: Look up the UID for every user referenced in an access.owner grant
+  # Mirrors the group lookup above -- stortree_mounts needs the numeric
+  # UID (not just the name) to uid-own a remote-backed node's mount
+  # (spec.md §6); a plain local node just hands ansible.builtin.file the
+  # name directly and needs no lookup at all. Passing stortree_group_
+  # members (just computed above) also covers every per-user container's
+  # own owner, group-derived ones included -- stortree_mounts needs their
+  # numeric UIDs too, for a wrapper mount's --uid (user_container_paths(),
+  # filter_plugins/stortree.py).
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ item }}"
+  loop: "{{ stortree | stortree_needed_users(stortree_group_members) }}"
   tags: [secrets]
 
 - name: Compute this host's resolved user UIDs

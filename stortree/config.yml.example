@@ -5,55 +5,83 @@
 # Copy to stortree/config.yml and edit for your fleet. This file is
 # non-secret and does not need vault encryption on its own (unlike
 # ldap.yml/rclone.conf), though nothing stops you from vaulting it too.
-host: storage-node-alpha
-rclone.remote: storagebox:/
+#
+# Every key at this top level names a real subdirectory of /srv/stortree
+# directly -- no wrapping `subdirs:` key at this one level. `tree` is
+# the main, multi-host shared subtree; `.bravo-cache` and `.gcs-cache`
+# are independent, single-host VFS-cache subtrees, siblings of `tree`
+# rather than nested inside it -- nesting a mount-in-progress inside
+# another host's own mount is exactly the collision this layout avoids
+# (docs/config-schema.md "Top-level subtrees").
 
-client-defaults:
-  rclone.args:
-    vfs-cache-mode: full
-    vfs-cache-max-age: 100h
-    dir-cache-time: 5m
+tree:
+  host: storage-node-alpha
+  rclone.remote: storagebox:/
 
-clients:
-  some-storage-gadget:
+  client-defaults:
     rclone.args:
-      vfs-cache-max-size: 20G
-      cache-dir: /mnt/some-volume/.rclone-cache
-  storage-node-bravo:
-    rclone.args:
-      vfs-cache-max-size: 5G
-      cache-dir: /srv/stortree/.cache/storage-node-bravo
+      vfs-cache-mode: full
+      vfs-cache-max-age: 100h
+      dir-cache-time: 5m
 
-subdirs:
-  .cache.subdirs:
+  clients:
+    some-storage-gadget:
+      rclone.args:
+        vfs-cache-max-size: 20G
+        cache-dir: /mnt/some-volume/.rclone-cache
     storage-node-bravo:
-      host: storage-node-bravo
-      rclone.remote: some-remote:/.stortree-cache
-    some-gcs-bucket: {}
-  backups: {}
-  home:
-    samba:
-      subpath: "%U"
-    user-subdirs:
-      whitfield-media:
-        access:
-          group: "Whitfield Family & Friends"
-          permissions: rx
-        host: storage-node-bravo
-        rclone.remote: some-remote:/media
-      sys-configs:
-        access.owner: jd
-      mw-fam:
-        access.group: "Michael Whitfield Family"
-        host: storage-node-bravo
-        rclone.remote: some-remote:/fam
-      media-prod:
-        access.group: Media Production
-        rclone:
-          remote: some-gcs-bucket:/
-          args:
-            vfs-cache-mode: full
-            vfs-cache-max-size: 5G
-            vfs-cache-max-age: 100h
-            dir-cache-time: 5m
-            cache-dir: /srv/stortree/.cache/some-gcs-bucket
+      rclone.args:
+        vfs-cache-max-size: 5G
+        cache-dir: /srv/stortree/.bravo-cache
+
+  subdirs:
+    backups: {}
+    home:
+      samba:
+        subpath: "%U"
+      user-subdirs:
+        whitfield-media:
+          access:
+            group: "Whitfield Family & Friends"
+            permissions: rx
+          host: storage-node-bravo
+          rclone.remote: some-remote:/media
+        sys-configs:
+          access.owner: jd
+        mw-fam:
+          access.group: "Michael Whitfield Family"
+          host: storage-node-bravo
+          rclone.remote: some-remote:/fam
+        media-prod:
+          access.group: Media Production
+          rclone:
+            remote: some-gcs-bucket:/
+            args:
+              vfs-cache-mode: full
+              vfs-cache-max-size: 5G
+              vfs-cache-max-age: 100h
+              dir-cache-time: 5m
+              cache-dir: /srv/stortree/.gcs-cache/media-prod
+
+# storage-node-bravo's own VFS-cache backing store -- nobody else needs
+# it mounted anywhere, so client-defaults.rclone: false keeps it off
+# every other host by default (docs/config-schema.md "Per-client mount
+# opt-out").
+.bravo-cache:
+  host: storage-node-bravo
+  rclone.remote: some-remote:/.stortree-cache
+  client-defaults:
+    rclone: false
+
+# storage-node-alpha's own VFS-cache backing store -- unlike
+# .bravo-cache, genuinely local (no rclone.remote at all): media-prod's
+# own mounting host is alpha itself, so its VFS cache can just live on
+# alpha's own disk directly, no separate remote-backed mount needed.
+# client-defaults.rclone: false still matters here even without a
+# remote to peer-mount: without it, every other host would still get an
+# empty placeholder directory created for it (docs/config-schema.md
+# "Per-client mount opt-out").
+.gcs-cache:
+  host: storage-node-alpha
+  client-defaults:
+    rclone: false

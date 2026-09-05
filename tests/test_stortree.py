@@ -23,6 +23,7 @@ from filter_plugins.stortree import (
     resolve,
     samba_access_tokens,
     user_container_paths,
+    user_mount_unit_names,
     user_uids_from_getent,
 )
 
@@ -77,14 +78,16 @@ def test_alpha_owns_everything_not_overridden():
         "tree/home/%U/media-prod",
         ".gcs-cache",
     }
-    # alpha owns both top-level subtrees it has a remote for -- unlike
-    # the old single-implicit-root design, a top-level entry is an
-    # ordinary mountable node now, so its owner self-mounts it same as
-    # any other node with its own host+remote
+    # alpha owns both top-level subtrees named above -- unlike the old
+    # single-implicit-root design, a top-level entry is an ordinary
+    # mountable node now, so its owner self-mounts it same as any other
+    # node with its own host+remote. .gcs-cache itself sets no rclone at
+    # all -- genuinely local, media-prod's own VFS cache lives directly
+    # on its resolved host's disk, no separate mount needed to back it.
     tree = by_path(r["server_subtrees"], "tree")
     assert tree["remote"] == "storagebox:/"
     gcs_cache = by_path(r["server_subtrees"], ".gcs-cache")
-    assert gcs_cache["remote"] == "some-gcs-bucket:/"
+    assert gcs_cache["remote"] is None
     # backups sets neither its own rclone nor a different host -- rclone
     # never inherits, so it resolves with no remote at all (just a plain
     # directory that has to exist under alpha's own local tree)
@@ -696,7 +699,38 @@ def test_needed_users_covers_server_subtrees_and_peer_dependencies():
     assert needed_users(r) == ["jd"]
 
 
+def test_needed_users_with_group_members_also_covers_container_owners():
+    # without group_members (the plain owner-grant-only set, resolvable
+    # before group membership itself is -- stortree_secrets' own first
+    # use of this, ahead of the getent-group lookup that produces
+    # group_members in the first place) jd is the only user; with it,
+    # every per-user container's owner is covered too, group-derived ones
+    # included, since stortree_secrets needs their numeric UIDs too for a
+    # wrapper mount's --uid (user_container_paths(), stortree_mounts).
+    r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
+    group_members = {
+        "Whitfield Family & Friends": ["mike", "jd"],
+        "Michael Whitfield Family": ["dana"],
+        "Media Production": ["alex"],
+    }
+    assert needed_users(r, group_members) == ["alex", "dana", "jd", "mike"]
+
+
+def _container_entry(local_path, owner, requires_slug=None):
+    parent = local_path.rsplit("/", 1)[0]
+    return {
+        "local_path": local_path,
+        "owner": owner,
+        "staging_path": f"{parent}/stortree-user-{owner}",
+        "slug": _slug(local_path),
+        "requires_slug": requires_slug,
+    }
+
+
 def test_user_container_paths_owner_and_group_grants():
+    # no mount_plan given -- every container's staging path can't be
+    # checked against any real mount, so requires_slug is None
+    # throughout (stortree_mounts' "plain local, chown directly" case).
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     group_members = {
         "Whitfield Family & Friends": ["mike", "jd"],
@@ -705,10 +739,10 @@ def test_user_container_paths_owner_and_group_grants():
     }
     containers = user_container_paths(r, group_members)
     assert containers == [
-        {"local_path": "tree/home/alex", "owner": "alex"},
-        {"local_path": "tree/home/dana", "owner": "dana"},
-        {"local_path": "tree/home/jd", "owner": "jd"},
-        {"local_path": "tree/home/mike", "owner": "mike"},
+        _container_entry("tree/home/alex", "alex"),
+        _container_entry("tree/home/dana", "dana"),
+        _container_entry("tree/home/jd", "jd"),
+        _container_entry("tree/home/mike", "mike"),
     ]
 
 
@@ -724,8 +758,8 @@ def test_user_container_paths_covers_peer_dependencies_too():
     }
     containers = user_container_paths(r, group_members)
     assert containers == [
-        {"local_path": "tree/home/alex", "owner": "alex"},
-        {"local_path": "tree/home/jd", "owner": "jd"},
+        _container_entry("tree/home/alex", "alex"),
+        _container_entry("tree/home/jd", "jd"),
     ]
 
 
@@ -749,8 +783,8 @@ def test_user_container_paths_dedupes_across_sibling_descendants():
     r = resolve(tree, "h1", ["h1"])
     containers = user_container_paths(r, {"Fam": ["jd", "mo"]})
     assert containers == [
-        {"local_path": "top/home/jd", "owner": "jd"},
-        {"local_path": "top/home/mo", "owner": "mo"},
+        _container_entry("top/home/jd", "jd"),
+        _container_entry("top/home/mo", "mo"),
     ]
 
 
@@ -774,6 +808,38 @@ def test_user_container_paths_ignores_non_per_user_and_ungranted_nodes():
     }
     r = resolve(tree, "h1", ["h1"])
     assert user_container_paths(r, {}) == []
+
+
+def test_user_container_paths_requires_slug_finds_the_nesting_mount():
+    # tree/home/jd's staging path (tree/home/stortree-user-jd) nests
+    # under "tree"'s own real mount (storagebox:/) -- requires_slug
+    # should name that mount's slug, the signal stortree_mounts uses to
+    # render a wrapper mount for this container instead of chowning it
+    # directly (plain chown can't work: "tree" is one single rclone
+    # mount with one uniform --uid/--gid for everything under it).
+    r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
+    plan = plan_mounts(r, {"Media Production": ["alex"]})
+    containers = user_container_paths(r, {}, plan)
+    jd = next(c for c in containers if c["local_path"] == "tree/home/jd")
+    assert jd["requires_slug"] == _slug("tree")
+
+
+def test_user_container_paths_no_requires_slug_for_a_plain_local_tree():
+    # a container under a purely local (host-set, no rclone.remote)
+    # top-level subtree nests under no real mount at all -- requires_slug
+    # stays None, so stortree_mounts chowns it directly instead of
+    # rendering a wrapper mount that has nothing to nest under.
+    tree = {
+        "top": {
+            "host": "h1",
+            "subdirs": {
+                "home": {"user-subdirs": {"sys-configs": {"access.owner": "jd"}}}
+            },
+        }
+    }
+    r = resolve(tree, "h1", ["h1"])
+    plan = plan_mounts(r, {})
+    assert user_container_paths(r, {}, plan) == [_container_entry("top/home/jd", "jd")]
 
 
 def test_access_owner_defaults_to_stortree_when_unset():
@@ -1169,13 +1235,24 @@ def test_mount_unit_names_includes_bind_units_for_per_user_fan_out():
     # mount (see plan_mounts()'s own docstring for why a real symlink
     # can't do this job instead).
     plan = [
-        {"slug": "tree-home-.mounts-mp\\x2dfam", "remote": "r1:/", "symlink_target": None},
-        {"slug": "tree-home-chris-mp\\x2dfam", "remote": None, "symlink_target": "tree/home/.mounts/mp-fam"},
+        {"slug": "tree-home-.mounts-mw\\x2dfam", "remote": "r1:/", "symlink_target": None},
+        {"slug": "tree-home-dana-mw\\x2dfam", "remote": None, "symlink_target": "tree/home/.mounts/mw-fam"},
     ]
     assert mount_unit_names(plan) == [
-        "stortree-mount@tree-home-.mounts-mp\\x2dfam.service",
-        "stortree-bind@tree-home-chris-mp\\x2dfam.service",
+        "stortree-mount@tree-home-.mounts-mw\\x2dfam.service",
+        "stortree-bind@tree-home-dana-mw\\x2dfam.service",
     ]
+
+
+def test_user_mount_unit_names_only_covers_containers_with_a_wrapper_mount():
+    # a container with requires_slug set gets a wrapper-mount unit; one
+    # without (a plain local container, chowned directly instead) gets
+    # none at all.
+    containers = [
+        {"slug": "tree-home-jd", "requires_slug": "tree"},
+        {"slug": "top-home-jd", "requires_slug": None},
+    ]
+    assert user_mount_unit_names(containers) == ["stortree-user-mount@tree-home-jd.service"]
 
 
 def test_plan_mounts_slug_distinguishes_hyphen_from_nesting():

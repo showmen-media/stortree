@@ -1,8 +1,22 @@
+{#
+Same nested-descendant-vs-wrapper-mount preference as
+stortree-bind@.service.j2 (see its own comment) -- a descendant with its
+own separate rclone.remote (not just a per-user bind-mount fan-out) can
+also sit directly under a per-user container that got its own wrapper
+mount, in which case this entry now nests inside that wrapper's own
+presented tree, not directly inside whatever plan_mounts() itself
+computed as entry.requires_slug.
+#}
+{% set container_path = entry.local_path.rsplit('/', 1)[0] if '/' in entry.local_path else '' %}
+{% set wrapper = (stortree_user_containers | selectattr('local_path', 'equalto', container_path) | selectattr('requires_slug') | list) if container_path else [] %}
 [Unit]
 Description=rclone mount %i (managed by stortree, do not edit by hand)
 After=network-online.target
 Wants=network-online.target
-{% if entry.requires_slug %}
+{% if wrapper %}
+After=stortree-user-mount@{{ wrapper[0].slug }}.service
+RequiresMountsFor={{ stortree_root }}/{{ container_path }}
+{% elif entry.requires_slug %}
 After=stortree-mount@{{ entry.requires_slug }}.service
 RequiresMountsFor={{ stortree_root }}/{{ entry.local_path }}
 {% endif %}

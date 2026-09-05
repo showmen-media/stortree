@@ -23,7 +23,7 @@ passdb backend = tdbsam
       §6): the share's own path already confines each connecting user to
       their own subtree, so their baseline access there shouldn't depend
       on any particular descendant's `access` grant existing at all. A
-      descendant with its own remote (e.g. mp-fam) doesn't strictly need
+      descendant with its own remote (e.g. mw-fam) doesn't strictly need
       its grant repeated here either way -- stortree_mounts already
       enforces it for real, at the mount itself (uid/gid-owned, kernel
       level) -- but leaving it in this union is harmless (%U already

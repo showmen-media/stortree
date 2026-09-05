@@ -526,7 +526,7 @@ same `ansible_facts.getent_passwd`/`getent_group` data instead of the
 name/member list) and `--dir-perms`/`--file-perms` (both set to the same
 mode `access_mode()` computed). Real, kernel-enforced access, checked
 against whoever is actually connecting — Samba included, since Samba
-still operates as that real user throughout. `mp-fam` in the running
+still operates as that real user throughout. `mw-fam` in the running
 example (`access.group`) is exactly this case.
 
 A %U-templated samba share's own `valid users`/`write list` (§4,
@@ -536,7 +536,7 @@ their own subtree regardless of whether they hold any specific
 descendant's grant, matching ordinary Unix home-directory semantics; only
 a non-%U share (no "self" concept) stays gated purely by `access`. A
 descendant's own grant doesn't strictly need to appear in that union at
-all once its own mount enforces it directly (`mp-fam` again) — it's
+all once its own mount enforces it directly (`mw-fam` again) — it's
 included anyway since it's harmless there and still load-bearing for a
 plain local descendant with no mount of its own to enforce anything. A
 single grant with both `owner` and `group` set contributes two tokens to
@@ -587,16 +587,49 @@ node needs — `home/jd`, say — is itself owned by that one real user, not
 `server_subtrees`/`peer_dependencies` facts, every `<prefix>/<username>`
 container any resolved grant anywhere under that prefix implies (deduped
 by path — several sibling descendants resolving to the same user all
-agree on one container, not one each), and `stortree_mounts` chowns it
-to that user directly (`0750`, group still `stortree` so it can
-administer), after every other task in the file that might otherwise
-leave it at the plain `stortree:stortree` default. This is a real,
+agree on one container, not one each). This is a real,
 ordinary-home-directory-style folder — the user can create files
 directly in it, not just reach whatever specific descendant grant
-(`mp-fam`, say) happens to live inside it — deliberately more than the
+(`mw-fam`, say) happens to live inside it — deliberately more than the
 bare traversal `access_mode()`'s public-execute bit alone would give an
 *unrelated* user passing through an ancestor they don't otherwise own;
 here, the container and the grant agree on exactly who it's for.
+
+Getting there takes one of two different mechanisms, depending on what
+the container's own ancestors look like, and `user_container_paths()`
+tells `stortree_mounts` which one applies via `requires_slug` (`_nearest_
+mount_slug()` against the resolved mount plan, checking not the
+container's own path but its *staging path*, below): a genuinely local
+container — no remote-backed ancestor anywhere above it (a top-level
+subtree with `host` set and no `rclone.remote`, config-schema.md
+"storing locally") — just gets `ansible.builtin.file`'s real `chown`/
+`chmod` applied directly; real, native ownership, nothing more needed.
+A container nested inside a remote-backed ancestor's own rclone mount
+can't be chowned that way at all — confirmed against a live deployment,
+where Ansible reported the chown as `changed`, but the next `stat`
+showed the container's owner unmoved, still whatever the ancestor
+mount's own single, uniform `--uid`/`--gid` says, for the simple reason
+that a plain `chown()`/`chmod()` through that mount's FUSE layer has
+nowhere real to persist a *different* value for just this one path.
+
+For that second case, `stortree_mounts` renders a per-user "wrapper
+mount" instead: an `rclone mount` using the `local` backend (source =
+`STORTREE_USER_PREFIX + username`, a sibling of the container itself,
+inside the very same remote-backed ancestor — ordinary content nothing
+but the `stortree` account driving both mounts ever touches directly;
+target = the container's own path), with that one user's real
+`--uid`/`--gid`/`--dir-perms`. This works where a plain `chown` can't
+because rclone's VFS-layer `--uid`/`--gid`/`--dir-perms`/`--file-perms`
+override applies uniformly to whatever a mount presents, *regardless* of
+backend or of what the underlying path natively supports — the same
+mechanism that already lets any remote-backed node's mount present
+`access`-derived ownership at all, on a backend with no native
+permission concept of its own (S3, say). No second network connection
+either: the wrapper's source is
+already local (it's read through the outer mount, which already has
+whatever network connection it needs), so `vfs-cache-mode: off` on the
+wrapper — there's no network latency at this layer to hide, only
+staleness risk against the real mount underneath it.
 
 `access_grant_usernames()` says *who* gets a folder; `per_user_mount_path()`
 says *where the real content actually lives*, and the two only disagree
@@ -617,7 +650,7 @@ exactly once there, gid-owned exactly as before; every actual member's
 own folder becomes a kernel bind mount onto that one real mount instead
 of a second rclone mount. Not a real symlink: a symlink is a directory
 entry the *target* directory's own backend has to be able to represent,
-and not every remote backend can — a Hetzner Storage Box's SMB share, in
+and not every remote backend can — a third-party SMB-backed remote, in
 production, flatly refused with an I/O error trying to create one inside
 it at all (SMB has no native symlink representation without extensions
 this fleet's remote doesn't support), so every per-user symlink under a
@@ -638,6 +671,27 @@ so no `smb.conf` change is needed for this to work either. A peer-sourced
 *owning* host first, so a peer never has anything to source but that one
 real, shared path — there's nothing at a per-member path on the owning
 host's own disk for a `group`-only grant, bind mount included.
+
+A per-user container's own wrapper mount (above) changes what a
+descendant's bind-mount unit has to wait for, when that descendant lives
+directly under a wrapped container: `mw-fam`'s `home/jd/mw-fam` used to
+just nest inside the outer remote-backed mount directly; once `home/jd`
+itself is a separate wrapper mount, `home/jd/mw-fam` nests *inside that
+wrapper's own presented tree* instead, so `mw-fam`'s bind-mount unit has
+to come after the wrapper mount, not just the outer one. `mw-fam` itself
+is completely unchanged by this — same bind mount, same gid ownership,
+same everything — only *when* its unit is allowed to start moves; the
+`stortree-bind@`/`stortree-mount@` unit templates both check, ahead of
+whatever `plan_mounts()` itself computed as `requires_slug`, whether the
+entry's own immediate parent is a container with a wrapper mount of its
+own, and prefer that dependency when one exists. This preserves the
+"real ownership stacks on top" pattern (§6) one level deeper: `mw-fam`'s
+own distinct group ownership shadows whatever the wrapper mount
+would've shown at that exact path, exactly as it already shadowed the
+outer mount before the wrapper existed — rclone's uid/gid override is
+uniform across a whole mount (no way to carve out one nested path with a
+different owner from inside the same mount), so this is the only way
+`mw-fam`'s ownership and the container's can coexist at all.
 
 The optional `sshd_config` fragment (`stortree_sshd`, only runs when
 `stortree/sshd_config` is present in the repo) is templated to

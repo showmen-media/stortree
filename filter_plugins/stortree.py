@@ -52,6 +52,20 @@ PER_USER_PLACEHOLDER = "%U"
 # "%" either).
 SHARED_MOUNT_SEGMENT = ".mounts"
 
+# Sibling-of-<username> segment name for a per-user container's staging
+# directory (user_container_paths()) -- real content, sitting inside
+# whatever remote-backed mount the container itself nests under, that a
+# per-user "wrapper" rclone mount (the `local` backend) re-presents at
+# the container's own path with that one user's real --uid/--gid/
+# --dir-perms. Not dot-prefixed like SHARED_MOUNT_SEGMENT: nothing about
+# it needs hiding from a %U-templated Samba share (a connecting user's
+# own share root is their own container, `home/<them>` -- a *sibling*
+# path like `home/stortree-user-<them>` is never reachable through it at
+# all, same as any other sibling of their own folder), and unlike
+# `.mounts` there's one of these per user, not one shared instance to set
+# apart from real per-user segment names.
+STORTREE_USER_PREFIX = "stortree-user-"
+
 # Convention used by stortree_peer_trust/stortree_secrets: where a
 # serving host's SSH keypair for peer sftp mounts lives.
 PEER_SSH_KEY_PATH = "/etc/stortree/peer_ssh_key"
@@ -787,11 +801,19 @@ def needed_groups(resolved):
     return sorted(groups)
 
 
-def needed_users(resolved):
+def needed_users(resolved, group_members=None):
     """Every username this host's resolved facts reference in an
     `access.owner` grant -- mirrors needed_groups() above, for the
     `getent passwd` lookup user_uids_from_getent() needs to uid-own a
-    remote-backed node's mount (spec.md §6)."""
+    remote-backed node's mount (spec.md §6). Also covers every per-user
+    container's own owner (`_resolved_user_containers()`, group-derived
+    ones included) when `group_members` is given -- stortree_secrets
+    needs those numeric UIDs too, for a wrapper mount's `--uid`
+    (user_container_paths(), stortree_mounts) -- omit `group_members`
+    (its default, `None`) to get the plain owner-grant-only set, since
+    that's resolvable before group membership itself is (this function's
+    own first use in stortree_secrets, ahead of the `getent group`
+    lookup that produces `group_members` in the first place)."""
     users = set()
     for n in resolved.get("server_subtrees", []):
         u = (n.get("access") or {}).get("owner")
@@ -801,22 +823,17 @@ def needed_users(resolved):
         u = (p.get("access") or {}).get("owner")
         if u:
             users.add(u)
+    if group_members is not None:
+        users.update(_resolved_user_containers(resolved, group_members).values())
     return sorted(users)
 
 
-def user_container_paths(resolved, group_members=None):
-    """Every per-user container directory a `user-subdirs` node implies
-    -- the immediate `<prefix>/<username>` folder (docs/config-schema.md
-    "subdirs vs user-subdirs": "the immediate children of a user-subdirs
-    node are per-user folders") that every one of its descendants'
-    resolved users needs to already exist -- paired with the one specific
-    user it should be privately owned by, closing the gap
-    access_mode()'s public-execute bit only papers over: that bit makes
-    the container *traversable* by anyone (needed so an unrelated
-    descendant grant nested underneath stays reachable at all), not
-    *owned* by the one person it's actually for. A real per-user
-    container -- one you can also drop a file straight into, like an
-    ordinary home directory -- has to be owned by that person outright.
+def _resolved_user_containers(resolved, group_members):
+    """{local_path: owner} for every per-user container a user-subdirs
+    node's resolved access grants imply -- the mount-plan-independent
+    core needed_users() (resolvable before stortree_mounts_plan exists)
+    and user_container_paths() (which adds wrapper-mount details on top,
+    once it does) both build on.
 
     `node_path` still carries `PER_USER_PLACEHOLDER` (`%U`) at this
     point (server_subtrees nodes always do; a peer_dependencies entry's
@@ -833,7 +850,6 @@ def user_container_paths(resolved, group_members=None):
     same two scopes needed_groups()/needed_users() already cover, for the
     same reason: a client-only host with no server_subtrees of its own
     still has to own its peer-sourced per-user containers correctly."""
-    group_members = group_members or {}
     containers = {}
     for n in resolved.get("server_subtrees", []) + resolved.get("peer_dependencies", []):
         if not n.get("per_user"):
@@ -846,10 +862,83 @@ def user_container_paths(resolved, group_members=None):
         for user in access_grant_usernames(access, group_members):
             local_path = f"{prefix}/{user}" if prefix else user
             containers[local_path] = user
-    return [
-        {"local_path": path, "owner": owner}
-        for path, owner in sorted(containers.items())
-    ]
+    return containers
+
+
+def _nearest_mount_slug(local_path, mount_entries):
+    """The `slug` of whichever entry in `mount_entries` (each with a
+    truthy `remote`) is the nearest real mount `local_path` nests under
+    -- its own `local_path` is the longest proper-prefix ancestor of
+    `local_path`, if any exist at all. Shared by plan_mounts()'s own
+    per-entry `requires_slug` (a mount or per-user bind-mount nested
+    under another real mount) and user_container_paths()'s wrapper-mount
+    ordering (a staging directory nested the exact same way) -- both are
+    "what real mount does this path have to wait for" restated for a
+    different kind of path."""
+    best = None
+    for other in mount_entries:
+        op = other["local_path"]
+        is_ancestor = op == "" or local_path.startswith(op + "/")
+        if is_ancestor and (best is None or len(op) > len(best["local_path"])):
+            best = other
+    return best["slug"] if best else None
+
+
+def user_container_paths(resolved, group_members=None, mount_plan=None):
+    """Every per-user container directory a `user-subdirs` node implies
+    -- the immediate `<prefix>/<username>` folder (docs/config-schema.md
+    "subdirs vs user-subdirs": "the immediate children of a user-subdirs
+    node are per-user folders") that every one of its descendants'
+    resolved users needs to already exist -- paired with the one specific
+    user it should be privately owned by, closing the gap
+    access_mode()'s public-execute bit only papers over: that bit makes
+    the container *traversable* by anyone (needed so an unrelated
+    descendant grant nested underneath stays reachable at all), not
+    *owned* by the one person it's actually for. A real per-user
+    container -- one you can also drop a file straight into, like an
+    ordinary home directory -- has to be owned by that person outright.
+
+    A container that's a plain local path (no remote-backed ancestor at
+    all) gets that ownership the simple way: stortree_mounts just chowns
+    it directly, real native ownership, no more machinery needed. One
+    nested inside a remote-backed ancestor's own rclone mount can't be
+    chowned that way at all -- that ancestor's mount presents one single,
+    uniform --uid/--gid for every path underneath it, and a plain
+    chown()/chmod() through the FUSE layer has nowhere real to persist a
+    *different* value for just this one path (confirmed against a live
+    deployment: Ansible reported the chown as `changed`, but the FUSE
+    layer just re-reported the mount's own fixed owner on the next
+    `stat`). The three extra fields below are for that case: `staging_
+    path` (`STORTREE_USER_PREFIX + owner`, a sibling of the container
+    itself, ordinary content inside the *same* remote-backed ancestor,
+    touched by nothing but the `stortree` account driving the wrapper
+    mount), `slug` (the wrapper mount's own systemd unit name, from the
+    *container's* path -- not the staging path's -- so it reads the same
+    way every other mount's own slug does), and `requires_slug`
+    (`_nearest_mount_slug()` against `mount_plan`'s own real mounts,
+    naming whichever one the staging path nests under, `None` if it
+    doesn't nest under any real mount at all -- i.e. a plain local
+    container, which needs no wrapper mount in the first place; see
+    stortree_mounts' own split on this field for which of the two
+    ownership mechanisms a given container actually gets)."""
+    group_members = group_members or {}
+    mount_entries = [e for e in (mount_plan or []) if e.get("remote")]
+    containers = _resolved_user_containers(resolved, group_members)
+    result = []
+    for local_path, owner in sorted(containers.items()):
+        parent = local_path.rsplit("/", 1)[0] if "/" in local_path else ""
+        prefixed = f"{STORTREE_USER_PREFIX}{owner}"
+        staging_path = f"{parent}/{prefixed}" if parent else prefixed
+        result.append(
+            {
+                "local_path": local_path,
+                "owner": owner,
+                "staging_path": staging_path,
+                "slug": _slug(local_path),
+                "requires_slug": _nearest_mount_slug(staging_path, mount_entries),
+            }
+        )
+    return result
 
 
 def plan_mounts(resolved, group_members=None):
@@ -1025,15 +1114,8 @@ def plan_mounts(resolved, group_members=None):
         seen_slugs[e["slug"]] = e["local_path"]
 
     for e in entries:
-        best = None
-        for other in mount_entries:
-            if other is e:
-                continue
-            op = other["local_path"]
-            is_ancestor = op == "" or e["local_path"].startswith(op + "/")
-            if is_ancestor and (best is None or len(op) > len(best["local_path"])):
-                best = other
-        e["requires_slug"] = best["slug"] if best else None
+        others = [other for other in mount_entries if other is not e]
+        e["requires_slug"] = _nearest_mount_slug(e["local_path"], others)
 
     # Shallowest paths first (stable sort -- ties keep their original
     # relative order): stortree_mounts creates every path one directory
@@ -1086,6 +1168,19 @@ def mount_unit_names(mount_plan):
     ]
 
 
+def user_mount_unit_names(containers):
+    """The full systemd unit filename for every per-user wrapper mount a
+    user_container_paths() result actually needs one for -- only entries
+    with `requires_slug` set (a container nested under a real remote
+    mount); one with none is a plain local path stortree_mounts chowns
+    directly instead, no wrapper unit at all. Mirrors mount_unit_names()
+    for the same reason: stortree_mounts needs this to work out which
+    currently-installed stortree-user-mount@ units are stale."""
+    return [
+        f"stortree-user-mount@{c['slug']}.service" for c in containers if c.get("requires_slug")
+    ]
+
+
 def path_masked(path, masked_paths):
     """Whether `path` is itself one of `masked_paths` (stortree_mounts'
     own stortree_masked_mount_paths, built from probing each
@@ -1123,6 +1218,7 @@ class FilterModule(object):
             "stortree_plan_mounts": plan_mounts,
             "stortree_slug": _slug,
             "stortree_mount_unit_names": mount_unit_names,
+            "stortree_user_mount_unit_names": user_mount_unit_names,
             "stortree_path_masked": path_masked,
             "stortree_samba_access_tokens": samba_access_tokens,
         }

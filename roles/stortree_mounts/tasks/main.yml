@@ -183,9 +183,14 @@
   # filter_plugins/stortree.py for why this can't just be read off
   # stortree_mounts_plan's own entries (that per-user container path
   # never appears there as an entry of its own, only implied as an
-  # ancestor of one).
+  # ancestor of one). stortree_mounts_plan (just computed above) is what
+  # lets it tell apart the two ways a container can get real ownership:
+  # `requires_slug` set means the container nests inside a remote-backed
+  # mount and needs a wrapper mount of its own (plain chown can't work
+  # there -- see user_container_paths()'s own docstring); unset means a
+  # plain local container, chowned directly, no wrapper needed.
   ansible.builtin.set_fact:
-    stortree_user_containers: "{{ stortree | stortree_user_containers(stortree_group_members) }}"
+    stortree_user_containers: "{{ stortree | stortree_user_containers(stortree_group_members, stortree_mounts_plan) }}"
   tags: [mounts]
 
 - name: Note which mounts have another mount nested inside them
@@ -225,6 +230,7 @@
     patterns:
       - "stortree-mount@*.service"
       - "stortree-bind@*.service"
+      - "stortree-user-mount@*.service"
   register: stortree_mounts_installed_units
   tags: [mounts]
 
@@ -234,7 +240,8 @@
       {{ stortree_mounts_installed_units.files
          | map(attribute='path')
          | map('basename')
-         | reject('in', stortree_mounts_plan | stortree_mount_unit_names)
+         | reject('in', (stortree_mounts_plan | stortree_mount_unit_names)
+                         + (stortree_user_containers | stortree_user_mount_unit_names))
          | list }}
   tags: [mounts]
 
@@ -277,7 +284,9 @@
   # costs nothing on a clean run and self-heals any accumulated ghost
   # state from any past slug family, not just whatever changed today.
   ansible.builtin.command:  # noqa: command-instead-of-module
-    cmd: systemctl reset-failed 'stortree-mount@*.service' 'stortree-bind@*.service'
+    cmd: >-
+      systemctl reset-failed 'stortree-mount@*.service' 'stortree-bind@*.service'
+      'stortree-user-mount@*.service'
   changed_when: false
   tags: [mounts]
 
@@ -290,8 +299,8 @@
   # non-path "device" names). rclone's own FUSE mounts report a bare
   # "remote:path" device string, and whether that string happens to
   # contain ":/" depends entirely on whether the remote path itself
-  # starts with a "/" -- `t21-synology:/.fips-stortree-cache` mounts
-  # with the reported device `t21-synology:.fips-stortree-cache` (no
+  # starts with a "/" -- `some-remote:/.stortree-cache` mounts
+  # with the reported device `some-remote:.stortree-cache` (no
   # "/" survives after the colon), which this fleet hit in production:
   # a live, healthy, currently-running mount, silently absent from
   # `ansible_facts.mounts` regardless, making any check built on that
@@ -444,7 +453,7 @@
 
 - name: Ensure every per-user bind mountpoint's parent directory exists
   # A `group`-only grant with no sibling owner-only leaf under the same
-  # `home/<user>` folder (e.g. mp-fam with no sys-configs alongside it)
+  # `home/<user>` folder (e.g. mw-fam with no sys-configs alongside it)
   # produces *only* a bind-mount entry for that user -- no plain-directory
   # or mount entry ever resolves to `home/<user>` itself, so nothing
   # above would otherwise create it. Explicit and ahead of the bind-
@@ -500,7 +509,7 @@
   ignore_errors: true
   tags: [mounts]
 
-- name: Own every per-user container by the one real user it's for
+- name: Own every plain-local per-user container by the one real user it's for
   # Every task above that touches a per-user container path (the two
   # "...parent directory exists" tasks, and Ansible's own implicit
   # parent creation inside "Ensure every resolved mount point or plain
@@ -518,16 +527,51 @@
   # privately owned by that one real user, so (unlike the plain
   # stortree:stortree default) nobody else ever needs to traverse through
   # it -- only its owner and the administering `stortree` group.
+  #
+  # Scoped to `rejectattr('requires_slug')`: a container with
+  # requires_slug set nests inside a remote-backed mount, where a plain
+  # chown()/chmod() through that mount's own FUSE layer has nowhere real
+  # to persist a different owner for just this one path -- confirmed
+  # against a live deployment, where Ansible reported this exact task as
+  # `changed` while the container's real, on-disk owner never actually
+  # moved off stortree:stortree. Those containers get a wrapper mount
+  # instead (below), which can actually enforce a per-path override; only
+  # a genuinely plain-local container (no remote-backed ancestor at all)
+  # can be chowned this simply and have it stick.
   ansible.builtin.file:
     path: "{{ stortree_root ~ '/' ~ item.local_path }}"
     state: directory
     owner: "{{ item.owner }}"
     group: "{{ stortree_group }}"
     mode: "0750"
-  loop: "{{ stortree_user_containers }}"
+  loop: "{{ stortree_user_containers | rejectattr('requires_slug') | list }}"
   loop_control:
     label: "{{ item.local_path }}"
   when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
+  ignore_errors: true
+  tags: [mounts]
+
+- name: Ensure every per-user personal-mount staging directory exists
+  # The real content a wrapper mount (rendered below) re-presents with
+  # its one owner's correct --uid/--gid/--dir-perms: ordinary content,
+  # inside the very same remote-backed mount the container itself nests
+  # under, that nothing but the `stortree` account (driving both that
+  # outer mount and the wrapper mount) ever touches directly -- so its
+  # own ownership/mode here doesn't matter beyond being usable by
+  # `stortree`, same reasoning as any other pre-mount directory in this
+  # file. A sibling of the container itself (STORTREE_USER_PREFIX in
+  # filter_plugins/stortree.py), so it always resolves under the same
+  # already-existing parent (e.g. `home`) the container itself does.
+  ansible.builtin.file:
+    path: "{{ stortree_root ~ '/' ~ item.staging_path }}"
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0751"
+  loop: "{{ stortree_user_containers | selectattr('requires_slug') | list }}"
+  loop_control:
+    label: "{{ item.staging_path }}"
+  when: not (item.staging_path | stortree_path_masked(stortree_masked_mount_paths))
   ignore_errors: true
   tags: [mounts]
 
@@ -541,6 +585,28 @@
     loop_var: entry
     label: "{{ entry.local_path or '(root)' }}"
   register: stortree_mounts_units_rendered
+  notify: stortree mounts changed
+  tags: [mounts]
+
+- name: Render systemd units for every per-user personal mount
+  # Only containers with requires_slug set get one -- see
+  # user_container_paths()/this file's "Own every plain-local per-user
+  # container..." task above for the other case. Rendered and enabled
+  # ahead of the per-user bind-mount units below: a descendant nested
+  # under one of these containers (e.g. mw-fam) now nests *inside* this
+  # wrapper mount's own presented tree, not directly inside the outer
+  # remote-backed mount, so its own bind-mount unit depends on this one
+  # being up first (stortree-bind@.service.j2's own preference for a
+  # matching wrapper mount over its plain requires_slug).
+  ansible.builtin.template:
+    src: stortree-user-mount@.service.j2
+    dest: "/etc/systemd/system/stortree-user-mount@{{ entry.slug }}.service"
+    mode: "0644"
+  loop: "{{ stortree_user_containers | selectattr('requires_slug') | list }}"
+  loop_control:
+    loop_var: entry
+    label: "{{ entry.local_path }}"
+  register: stortree_user_mounts_units_rendered
   notify: stortree mounts changed
   tags: [mounts]
 
@@ -581,6 +647,16 @@
   when: item.changed
   tags: [mounts]
 
+- name: Restart any personal mount whose unit file actually changed
+  ansible.builtin.systemd_service:
+    name: "stortree-user-mount@{{ item.entry.slug }}.service"
+    state: restarted
+  loop: "{{ stortree_user_mounts_units_rendered.results }}"
+  loop_control:
+    label: "{{ item.entry.local_path }}"
+  when: item.changed
+  tags: [mounts]
+
 - name: Restart any bind mount whose unit file actually changed
   ansible.builtin.systemd_service:
     name: "stortree-bind@{{ item.entry.slug }}.service"
@@ -599,6 +675,16 @@
   loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
   loop_control:
     label: "{{ item.local_path or '(root)' }}"
+  tags: [mounts]
+
+- name: Enable and start every per-user personal mount
+  ansible.builtin.systemd_service:
+    name: "stortree-user-mount@{{ item.slug }}.service"
+    enabled: true
+    state: started
+  loop: "{{ stortree_user_containers | selectattr('requires_slug') | list }}"
+  loop_control:
+    label: "{{ item.local_path }}"
   tags: [mounts]
 
 - name: Enable and start every per-user bind mount
