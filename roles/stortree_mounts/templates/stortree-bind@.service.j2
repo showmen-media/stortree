@@ -12,17 +12,34 @@ plan_mounts() computed it.
 #}
 {% set container_path = entry.local_path.rsplit('/', 1)[0] %}
 {% set wrapper = stortree_user_containers | selectattr('local_path', 'equalto', container_path) | selectattr('requires_slug') | list %}
+{#
+PartOf= on every mount this bind depends on, for the same reason as
+stortree-mount@.service.j2 (see its own comment) -- and a bind mount is
+the worst-affected of the three: `Type=oneshot` + `RemainAfterExit=yes`
+means the unit reports active forever once its ExecStart succeeded, with
+nothing left running to notice its mount went away. Both edges below can
+take it out. The *source* is a mount whose tree this binds from, so
+remounting it leaves this bind pointing at a detached one; the
+*container* is a mount whose tree this bind's own mountpoint lives in,
+so remounting that detaches the bind outright. Either way the path
+reverts to the empty directory underneath, silently, until something
+restarts this unit -- which nothing ever did, because as far as systemd
+was concerned it never stopped.
+#}
 [Unit]
 Description=stortree per-user bind mount %i (managed by stortree, do not edit by hand)
 After=stortree-mount@{{ entry.symlink_target | stortree_slug }}.service
 Requires=stortree-mount@{{ entry.symlink_target | stortree_slug }}.service
+PartOf=stortree-mount@{{ entry.symlink_target | stortree_slug }}.service
 RequiresMountsFor={{ stortree_root }}/{{ entry.symlink_target }}
 {% if wrapper %}
 After=stortree-user-mount@{{ wrapper[0].slug }}.service
 Requires=stortree-user-mount@{{ wrapper[0].slug }}.service
+PartOf=stortree-user-mount@{{ wrapper[0].slug }}.service
 RequiresMountsFor={{ stortree_root }}/{{ container_path }}
 {% elif entry.requires_slug %}
 After=stortree-mount@{{ entry.requires_slug }}.service
+PartOf=stortree-mount@{{ entry.requires_slug }}.service
 RequiresMountsFor={{ stortree_root }}/{{ entry.local_path }}
 {% endif %}
 
@@ -30,7 +47,15 @@ RequiresMountsFor={{ stortree_root }}/{{ entry.local_path }}
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/mount --bind {{ stortree_root }}/{{ entry.symlink_target }} {{ stortree_root }}/{{ entry.local_path }}
-ExecStop=/bin/umount {{ stortree_root }}/{{ entry.local_path }}
+{#
+Tolerant stop, matching the rclone units' own: with PartOf= above, this
+unit is now routinely stopped as part of a parent remount, by which
+point its mountpoint can already be gone along with the tree it lived
+in. A bare umount fails there and leaves the unit failed rather than
+cleanly stopped -- nothing to unmount is a successful stop, not an
+error.
+#}
+ExecStop=-/bin/sh -c 'mountpoint -q "{{ stortree_root }}/{{ entry.local_path }}" || exit 0; /bin/umount "{{ stortree_root }}/{{ entry.local_path }}"'
 
 [Install]
 WantedBy=multi-user.target

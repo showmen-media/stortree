@@ -13,11 +13,26 @@ computed as entry.requires_slug.
 Description=rclone mount %i (managed by stortree, do not edit by hand)
 After=network-online.target
 Wants=network-online.target
+{#
+PartOf= alongside every containment dependency below: this mount's own
+mountpoint lives *inside* that other mount's presented tree, so when it
+restarts, this mount is silently detached -- the rclone process keeps
+running and systemd keeps reporting the unit active, while the path it
+was serving quietly reverts to whatever sits underneath. After=/Requires=
+don't help: they propagate start ordering and stop, never restart.
+PartOf= is the one that does, so a parent remount takes its nested mounts
+with it and they come back in After= order. Deliberately not applied to
+declared `requires` below -- that's a sibling dependency (a cache
+directory), not a tree this mount's own path lives inside, and a cache
+blip shouldn't take a whole shared subtree down with it.
+#}
 {% if wrapper %}
 After=stortree-user-mount@{{ wrapper[0].slug }}.service
+PartOf=stortree-user-mount@{{ wrapper[0].slug }}.service
 RequiresMountsFor={{ stortree_root }}/{{ container_path }}
 {% elif entry.requires_slug %}
 After=stortree-mount@{{ entry.requires_slug }}.service
+PartOf=stortree-mount@{{ entry.requires_slug }}.service
 RequiresMountsFor={{ stortree_root }}/{{ entry.local_path }}
 {% endif %}
 {#

@@ -261,6 +261,29 @@ RemainAfterExit=yes`, ordered after and requiring both the real mount it
 fans out and whatever mount it's itself nested under) — not an rclone
 unit, since it isn't a second rclone mount of the same remote.
 
+Every one of those containment dependencies also carries `PartOf=`, and
+that part is not optional bookkeeping. A mount nested inside another
+mount — a nested rclone mount, a per-user wrapper mount (§6), or a bind
+mount, all three — has its mountpoint inside the parent's presented tree,
+so remounting the parent detaches it. `After=`/`Requires=` propagate
+start ordering and stop, never *restart*, so nothing brings the nested
+mount back: its path silently reverts to whatever plain directory sits
+underneath, while systemd goes on reporting the unit active. A bind mount
+is the worst case, since `Type=oneshot` + `RemainAfterExit=yes` means
+there's no process left to notice at all; an rclone mount usually dies
+with its parent and gets restarted, but not reliably. This was observed
+in production the first apply after `requires` landed: adding the key
+changed one outer mount's unit file, restarting it took every nested
+mount on that host with it, three of four wrapper mounts died and were
+restarted normally, and the fourth survived as a live process with no
+mount behind it — so the next `state: started` was a no-op and that one
+user's folder sat at the bare `stortree:stortree` directory underneath
+while the other three were correct. `PartOf=` is the directive that
+propagates restart, so a parent remount now takes its nested mounts with
+it and they come back in `After=` order. The bind unit's `ExecStop` is
+correspondingly tolerant of its mountpoint already being gone — with
+restart propagation that's a routine stop, not an error.
+
 Nesting is the only dependency the tree's shape can imply, and sibling
 top-level subtrees have no nesting relationship by construction — so a
 node can also *declare* one, with `requires` (config-schema.md

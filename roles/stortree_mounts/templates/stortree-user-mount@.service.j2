@@ -1,7 +1,20 @@
 [Unit]
 Description=stortree per-user personal mount %i (managed by stortree, do not edit by hand)
+{#
+PartOf= for the same reason as stortree-mount@.service.j2 (see its own
+comment): both this wrapper's mountpoint and the staging directory it
+serves live inside that outer mount, so an outer remount detaches this
+one while leaving the rclone process alive and the unit reporting
+active. Observed in production exactly that way -- one of four wrapper
+mounts survived an outer remount as a live process with no mount left
+behind it, so the next apply's `state: started` was a no-op and that one
+user's folder sat at the bare stortree:stortree directory underneath
+while the other three (whose processes had died and were restarted)
+were correct.
+#}
 {% if entry.requires_slug %}
 After=stortree-mount@{{ entry.requires_slug }}.service
+PartOf=stortree-mount@{{ entry.requires_slug }}.service
 RequiresMountsFor={{ stortree_root }}/{{ entry.staging_path }}
 {% endif %}
 
