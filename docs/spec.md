@@ -261,6 +261,28 @@ RemainAfterExit=yes`, ordered after and requiring both the real mount it
 fans out and whatever mount it's itself nested under) — not an rclone
 unit, since it isn't a second rclone mount of the same remote.
 
+Nesting is the only dependency the tree's shape can imply, and sibling
+top-level subtrees have no nesting relationship by construction — so a
+node can also *declare* one, with `requires` (config-schema.md
+"Requires"). The case it exists for is a VFS cache: a client mount whose
+`cache-dir` points into another top-level subtree's mount depends on
+that mount entirely outside the tree's shape, and without a declaration
+systemd starts both in parallel at boot — with rclone filling a cache
+directory on local disk that gets shadowed the moment the real mount
+arrives. `_validate_requires()` checks every declaration against the
+whole tree once, host-independently (an unknown path, a self-reference,
+a per-user target with no single mount to name, or a cycle all fail the
+apply on every host, not just where they'd bite); `plan_mounts()` then
+resolves each declaration against *this host's* own mounts into
+`requires_mounts`, dropping any target that isn't one here — a plain
+local directory, or a subtree this host doesn't mount. The unit template
+renders `After=` + `Requires=` + `RequiresMountsFor=` per surviving
+target: hard, because a dependent that starts anyway is exactly the
+failure being prevented. Deliberately declared rather than inferred from
+`cache-dir` itself — what depends on what is a fact about the fleet, not
+something to reverse-engineer out of an rclone argument that happens to
+contain a path.
+
 Every peer dependency (§1) becomes one of these mount entries too, not
 just a top-level subtree's own client mount — a samba descendant this
 host doesn't own is real data its own local tree still has to contain,

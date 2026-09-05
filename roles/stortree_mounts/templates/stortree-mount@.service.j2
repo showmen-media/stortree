@@ -20,6 +20,21 @@ RequiresMountsFor={{ stortree_root }}/{{ container_path }}
 After=stortree-mount@{{ entry.requires_slug }}.service
 RequiresMountsFor={{ stortree_root }}/{{ entry.local_path }}
 {% endif %}
+{#
+Declared `requires` (docs/config-schema.md "Requires"), on top of
+whatever nesting already implied above -- a dependency the tree's shape
+can't express, most often a cache-dir pointing into a sibling top-level
+subtree's mount. Hard, not just ordered: without Requires= this mount
+would still start when its dependency is down, and rclone would then
+quietly fill the local disk at a path that gets shadowed the moment the
+real mount arrives -- exactly the failure the declaration exists to
+prevent.
+#}
+{% for req in entry.requires_mounts | default([]) %}
+After=stortree-mount@{{ req.slug }}.service
+Requires=stortree-mount@{{ req.slug }}.service
+RequiresMountsFor={{ stortree_root }}/{{ req.local_path }}
+{% endfor %}
 
 [Service]
 Type=notify

@@ -148,6 +148,49 @@ def _normalize_access(raw):
     return entry
 
 
+def _normalize_requires(raw, node_path):
+    """Normalize a node's `requires` into a list of tree-relative paths
+    (docs/config-schema.md "Requires"): every mount named here has to be
+    up before this node's own mount starts.
+
+    This exists for the one dependency the tree's own shape can't imply:
+    `requires_slug` (plan_mounts()) is derived purely from path *nesting*,
+    which covers a mount inside another mount and nothing else. A mount
+    that depends on a sibling top-level subtree -- the real case being a
+    `cache-dir` pointing into another subtree's mount -- has no nesting
+    relationship at all, so nothing derives it and systemd starts both in
+    parallel at boot. Deliberately declared rather than inferred from
+    `cache-dir` itself: an operator saying what depends on what is a fact
+    about their fleet, not something to reverse-engineer out of an rclone
+    argument that happens to contain a path.
+
+    A bare string is accepted as shorthand for a one-element list. Paths
+    are tree-relative, exactly as they're written at the top level of
+    config.yml (`.bravo-cache`, `tree/backups`), with any leading or
+    trailing "/" trimmed -- the same strings `local_path` uses
+    everywhere else."""
+    if raw is None:
+        return []
+    items = [raw] if isinstance(raw, str) else raw
+    if not isinstance(items, list):
+        raise ValueError(
+            f"stortree: {node_path!r}'s `requires` must be a path or a list of "
+            'paths, not a mapping -- see docs/config-schema.md "Requires"'
+        )
+    paths = []
+    for item in items:
+        if not isinstance(item, str) or not item.strip("/"):
+            raise ValueError(
+                f"stortree: {node_path!r}'s `requires` entries must each be a "
+                f"non-empty tree-relative path, got {item!r} -- see "
+                'docs/config-schema.md "Requires"'
+            )
+        path = item.strip("/")
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
 def _permission_bits(permissions):
     """'rwx'-style string -> the numeric 0-7 mode bits it represents."""
     bits = 0
@@ -277,6 +320,7 @@ def _walk_tree(tree):
                 "samba": samba,
                 "per_user": per_user,
                 "root_path": root_path,
+                "requires": _normalize_requires(node.get("requires"), path),
             }
         )
         for name, child in (node.get("subdirs") or {}).items():
@@ -303,6 +347,70 @@ def _walk_tree(tree):
         _visit(root_node, [name], None, False, name)
 
     return roots, nodes
+
+
+def _validate_requires(nodes):
+    """Check every node's declared `requires` against the whole tree, once,
+    host-independently -- a typo'd path is a config error everywhere, not
+    just on whichever host happens to resolve it into a real mount, so it
+    has to fail the same way on every host rather than going quiet on the
+    ones that don't mount the target.
+
+    Three ways it can be wrong: naming a path no node in the tree defines
+    (a typo, or a path that was renamed out from under it), naming the
+    node itself, or naming a per-user node -- the last because a per-user
+    node has no single mount to depend on, it fans out into one mount per
+    granted user (or one shared mount plus bind mounts), and which of
+    those a dependent would mean is genuinely ambiguous rather than
+    something to guess at.
+
+    Naming a real node that simply isn't a mount (no `rclone.remote`
+    anywhere, e.g. a plain local cache directory) is *not* an error: it's
+    an ordinary directory this same apply creates before any unit starts,
+    so there's nothing to order against and plan_mounts() just drops the
+    dependency. Same for a mount that exists in the tree but not on this
+    particular host."""
+    by_path = {n["path"]: n for n in nodes}
+    for n in nodes:
+        for target in n["requires"]:
+            if target == n["path"]:
+                raise ValueError(
+                    f"stortree: {n['path']!r} lists itself in `requires`"
+                )
+            if target not in by_path:
+                raise ValueError(
+                    f"stortree: {n['path']!r} requires {target!r}, which is not "
+                    "a path anywhere in the tree -- `requires` takes "
+                    "tree-relative paths as written in config.yml, e.g. "
+                    '".bravo-cache"'
+                )
+            if by_path[target]["per_user"]:
+                raise ValueError(
+                    f"stortree: {n['path']!r} requires {target!r}, which is a "
+                    "per-user node -- it resolves to one mount per granted "
+                    "user, not a single mount to depend on"
+                )
+
+    # Ordering cycles: systemd resolves one by dropping an arbitrary
+    # After= and logging it, which turns a config mistake into a silently
+    # unpredictable boot order. Fail the apply instead, naming the loop.
+    state = {}
+
+    def _walk(path, stack):
+        if state.get(path) == "done":
+            return
+        if state.get(path) == "open":
+            loop = stack[stack.index(path):] + [path]
+            raise ValueError(
+                "stortree: `requires` cycle: " + " -> ".join(repr(p) for p in loop)
+            )
+        state[path] = "open"
+        for target in by_path[path]["requires"]:
+            _walk(target, stack + [path])
+        state[path] = "done"
+
+    for n in nodes:
+        _walk(n["path"], [])
 
 
 def _samba_nodes(nodes):
@@ -398,6 +506,8 @@ def resolve(tree, hostname, all_hosts):
     tree = _expand_dotted(tree)
     roots, nodes = _walk_tree(tree)
     roots_by_path = {r["path"]: r for r in roots}
+    _validate_requires(nodes)
+    requires_by_path = {n["path"]: n["requires"] for n in nodes}
 
     server_subtrees = [n for n in nodes if n["host"] == hostname]
 
@@ -453,6 +563,10 @@ def resolve(tree, hostname, all_hosts):
                         "per_user": d["per_user"],
                         "access": d["access"],
                         "args": args,
+                        # The node's own declared dependency, not the
+                        # owning host's business: a peer mounts the same
+                        # path locally and needs the same thing up first.
+                        "requires": d["requires"],
                     }
                 )
 
@@ -487,11 +601,22 @@ def resolve(tree, hostname, all_hosts):
                     "per_user": False,
                     "access": [],
                     "args": args,
+                    "requires": requires_by_path.get(root["path"], []),
                 }
             )
             client_remote = _peer_remote_ref(root["host"], root["path"], root["path"])
+        # A top-level subtree's `requires` applies wherever it's mounted,
+        # its non-owning clients included -- which is the case that
+        # motivated the key at all: the cache-dir a *client* points into
+        # another subtree's mount belongs to that client's own mount of
+        # this subtree, and only the client resolves both ends of it.
         client_mounts.append(
-            {"local_path": root["path"], "remote": client_remote, "args": args}
+            {
+                "local_path": root["path"],
+                "remote": client_remote,
+                "args": args,
+                "requires": requires_by_path.get(root["path"], []),
+            }
         )
 
     peer_dependencies = _dedupe(
@@ -1018,7 +1143,16 @@ def plan_mounts(resolved, group_members=None):
     `access`/`args` (never the owning host's).
 
     Each returned entry: {local_path, remote, args, slug, requires_slug,
-    symlink_target}. `symlink_target` is the real entry's `local_path`
+    requires_mounts, symlink_target}. `requires_mounts` is the node's own
+    declared `requires` (docs/config-schema.md "Requires") resolved
+    against this host's own mounts -- one {local_path, slug} per target
+    that really is a mount here, for the unit template to render a hard
+    dependency on; see the resolution step at the bottom of this function
+    for why a target can legitimately drop out. Unlike `requires_slug`
+    below, nothing about it is derived from the tree's shape -- it's the
+    escape hatch for a dependency path nesting can't express, a sibling
+    top-level subtree's mount being the case it exists for.
+    `symlink_target` is the real entry's `local_path`
     for a per-user bind-mount entry, else None -- a real symlink would be
     a directory entry the *target* directory's own backend has to be
     able to represent, which not every remote backend can (an SMB share,
@@ -1042,7 +1176,7 @@ def plan_mounts(resolved, group_members=None):
     group_members = group_members or {}
     entries = []
 
-    def _expand_per_user(node_path, access, remote_of):
+    def _expand_per_user(node_path, access, remote_of, requires):
         """Shared by the server_subtrees and peer_dependencies loops
         below: resolves one per-user node's %U-templated `node_path`
         against its own `access` into (real entry, [symlink entries]),
@@ -1057,7 +1191,12 @@ def plan_mounts(resolved, group_members=None):
         if not users:
             return None, []
         real_path = per_user_mount_path(node_path, access)
-        real_entry = {"local_path": real_path, "remote": remote_of(real_path), "access": access}
+        real_entry = {
+            "local_path": real_path,
+            "remote": remote_of(real_path),
+            "access": access,
+            "requires": requires,
+        }
         if access.get("owner"):
             return real_entry, []
         symlinks = [
@@ -1067,6 +1206,11 @@ def plan_mounts(resolved, group_members=None):
                 "args": {},
                 "access": {},
                 "symlink_target": real_path,
+                # The node's `requires` belongs to the one real mount
+                # above, not to each bind mount fanning it back out --
+                # a bind already orders after that mount, which in turn
+                # orders after whatever it requires.
+                "requires": [],
             }
             for user in users
         ]
@@ -1079,6 +1223,7 @@ def plan_mounts(resolved, group_members=None):
                 "remote": m["remote"],
                 "args": m["args"],
                 "access": {},
+                "requires": m.get("requires") or [],
             }
         )
 
@@ -1090,11 +1235,12 @@ def plan_mounts(resolved, group_members=None):
                     "remote": n["remote"],
                     "args": n["args"],
                     "access": n["access"],
+                    "requires": n.get("requires") or [],
                 }
             )
             continue
         real_entry, symlinks = _expand_per_user(
-            n["path"], n["access"], lambda _p: n["remote"]
+            n["path"], n["access"], lambda _p: n["remote"], n.get("requires") or []
         )
         if real_entry is not None:
             real_entry["args"] = n["args"]
@@ -1113,6 +1259,7 @@ def plan_mounts(resolved, group_members=None):
                     ),
                     "args": p["args"],
                     "access": p.get("access") or {},
+                    "requires": p.get("requires") or [],
                 }
             )
             continue
@@ -1121,7 +1268,10 @@ def plan_mounts(resolved, group_members=None):
         # (resolve() sets both from the same node path, see peer_dependencies
         # above) -- per_user_mount_path() only needs to run once.
         real_entry, symlinks = _expand_per_user(
-            p["local_path"], access, lambda rp: _peer_remote_ref(p["owning_host"], rp, rp)
+            p["local_path"],
+            access,
+            lambda rp: _peer_remote_ref(p["owning_host"], rp, rp),
+            p.get("requires") or [],
         )
         if real_entry is not None:
             real_entry["args"] = p["args"]
@@ -1147,6 +1297,25 @@ def plan_mounts(resolved, group_members=None):
     for e in entries:
         others = [other for other in mount_entries if other is not e]
         e["requires_slug"] = _nearest_mount_slug(e["local_path"], others)
+
+    # Declared `requires` (_normalize_requires(), validated tree-wide by
+    # _validate_requires()) resolved against *this host's* own mounts:
+    # each target path that really is a mount here becomes a
+    # {local_path, slug} pair the unit template renders an After= +
+    # Requires= + RequiresMountsFor= for. A target that isn't a mount on
+    # this host drops out silently -- it's either a plain local directory
+    # (nothing to order against, this same apply creates it before any
+    # unit starts) or a mount some other host owns and this one doesn't
+    # peer (a per-client opt-out, most often the very cache subtree that
+    # only its own host mounts). The raw declaration doesn't survive into
+    # the entry: everything downstream wants the resolved units.
+    mounts_by_path = {e["local_path"]: e for e in mount_entries}
+    for e in entries:
+        e["requires_mounts"] = [
+            {"local_path": path, "slug": mounts_by_path[path]["slug"]}
+            for path in e.pop("requires", [])
+            if path in mounts_by_path
+        ]
 
     # Shallowest paths first (stable sort -- ties keep their original
     # relative order): stortree_mounts creates every path one directory

@@ -23,8 +23,8 @@ from filter_plugins.stortree import (
     plan_mounts,
     resolve,
     samba_access_tokens,
-    user_container_paths,
     physical_path,
+    user_container_paths,
     user_mount_unit_names,
     user_uids_from_getent,
 )
@@ -213,7 +213,9 @@ def test_subtree_with_no_remote_gets_no_peer_dependency():
     # by stortree_mounts), just no mount and no peer dependency for it.
     tree = {"top": {"host": "h1", "subdirs": {"plain": {"host": "h2"}}}}
     r = resolve(tree, "h2", ["h1", "h2"])
-    assert r["client_mounts"] == [{"local_path": "top", "remote": None, "args": {}}]
+    assert r["client_mounts"] == [
+        {"local_path": "top", "remote": None, "args": {}, "requires": []}
+    ]
     assert not any(p["local_path"] == "top" for p in r["peer_dependencies"])
 
 
@@ -253,6 +255,7 @@ def test_clients_override_acts_as_an_allow_list_when_defaults_are_false():
             "local_path": "private",
             "remote": "peer-h1-private:/srv/stortree/private",
             "args": {"vfs-cache-max-size": "1G"},
+            "requires": [],
         }
     ]
 
@@ -1289,6 +1292,145 @@ def test_user_mount_unit_names_only_covers_containers_with_a_wrapper_mount():
         {"slug": "top-home-jd", "requires_slug": None},
     ]
     assert user_mount_unit_names(containers) == ["stortree-user-mount@tree-home-jd.service"]
+
+
+def _entry(plan, local_path):
+    return next(e for e in plan if e["local_path"] == local_path)
+
+
+def test_requires_orders_a_client_mount_after_a_sibling_cache_subtree():
+    # the case the key exists for: a top-level subtree whose *client*
+    # points its cache-dir into another top-level subtree's mount. No
+    # nesting relationship at all, so requires_slug can't derive it.
+    tree = {
+        "tree": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "requires": [".cache"],
+            "clients": {"h2": {"rclone.args": {"cache-dir": "/srv/stortree/.cache"}}},
+        },
+        ".cache": {
+            "host": "h2",
+            "rclone.remote": "r2:/",
+            "client-defaults": {"rclone": False},
+        },
+    }
+    plan = plan_mounts(resolve(tree, "h2", ["h1", "h2"]))
+    assert _entry(plan, "tree")["requires_mounts"] == [
+        {"local_path": ".cache", "slug": ".cache"}
+    ]
+    # and it really is the mount that isn't nested under it
+    assert _entry(plan, "tree")["requires_slug"] is None
+
+    # h1 owns `tree` and never mounts .cache at all (client-defaults
+    # rclone: false), so the same declaration resolves to nothing there
+    # rather than to a unit that doesn't exist.
+    plan_h1 = plan_mounts(resolve(tree, "h1", ["h1", "h2"]))
+    assert _entry(plan_h1, "tree")["requires_mounts"] == []
+
+
+def test_example_tree_requires_resolves_only_where_the_cache_is_mounted():
+    # the worked example (docs/config-schema.md, config.yml.example):
+    # `tree` requires .bravo-cache, which only storage-node-bravo mounts.
+    by_host = {
+        h: plan_mounts(resolve(EXAMPLE_TREE, h, EXAMPLE_HOSTS)) for h in EXAMPLE_HOSTS
+    }
+    assert _entry(by_host["storage-node-bravo"], "tree")["requires_mounts"] == [
+        {"local_path": ".bravo-cache", "slug": ".bravo\\x2dcache"}
+    ]
+    for host in ("storage-node-alpha", "some-storage-gadget"):
+        assert _entry(by_host[host], "tree")["requires_mounts"] == []
+
+
+def test_requires_accepts_a_bare_string_and_applies_to_a_server_subtree():
+    tree = {
+        "tree": {"host": "h1", "rclone.remote": "r1:/", "requires": ".cache"},
+        ".cache": {"host": "h1", "rclone.remote": "r2:/"},
+    }
+    plan = plan_mounts(resolve(tree, "h1", ["h1"]))
+    assert _entry(plan, "tree")["requires_mounts"] == [
+        {"local_path": ".cache", "slug": ".cache"}
+    ]
+
+
+def test_requires_on_a_plain_local_target_resolves_to_nothing():
+    # a real node, so not a config error -- but no rclone.remote means no
+    # unit to depend on; it's an ordinary directory this same apply
+    # creates before anything starts.
+    tree = {
+        "tree": {"host": "h1", "rclone.remote": "r1:/", "requires": [".cache"]},
+        ".cache": {"host": "h1"},
+    }
+    plan = plan_mounts(resolve(tree, "h1", ["h1"]))
+    assert _entry(plan, "tree")["requires_mounts"] == []
+
+
+def test_requires_reaches_a_nested_node_and_leaves_bind_mounts_alone():
+    # a per-user node can *declare* requires (it lands on the one real
+    # mount); the bind mounts fanning that mount out don't repeat it.
+    tree = {
+        "tree": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "home": {
+                    "samba": {"subpath": PER_USER_PLACEHOLDER},
+                    "user-subdirs": {
+                        "fam": {
+                            "access.group": "Fam",
+                            "requires": [".cache"],
+                        }
+                    },
+                }
+            },
+        },
+        ".cache": {"host": "h1", "rclone.remote": "r2:/"},
+    }
+    plan = plan_mounts(resolve(tree, "h1", ["h1"]), {"Fam": ["ann", "bo"]})
+    real = _entry(plan, "tree/home/.mounts/fam")
+    assert real["requires_mounts"] == [{"local_path": ".cache", "slug": ".cache"}]
+    for user in ("ann", "bo"):
+        assert _entry(plan, f"tree/home/{user}/fam")["requires_mounts"] == []
+
+
+def test_requires_rejects_an_unknown_path():
+    tree = {"tree": {"host": "h1", "rclone.remote": "r1:/", "requires": [".typo"]}}
+    with pytest.raises(ValueError, match="not a path anywhere in the tree"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_requires_rejects_self_and_per_user_targets():
+    with pytest.raises(ValueError, match="lists itself"):
+        resolve({"tree": {"host": "h1", "requires": ["tree"]}}, "h1", ["h1"])
+
+    tree = {
+        "tree": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "requires": ["tree/home/%U/fam"],
+            "subdirs": {
+                "home": {"user-subdirs": {"fam": {"access.group": "Fam"}}},
+            },
+        }
+    }
+    with pytest.raises(ValueError, match="per-user node"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_requires_rejects_a_cycle():
+    tree = {
+        "a": {"host": "h1", "rclone.remote": "r1:/", "requires": ["b"]},
+        "b": {"host": "h1", "rclone.remote": "r2:/", "requires": ["a"]},
+    }
+    with pytest.raises(ValueError, match="`requires` cycle"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_requires_rejects_a_malformed_value():
+    with pytest.raises(ValueError, match="must each be a"):
+        resolve({"tree": {"host": "h1", "requires": [7]}}, "h1", ["h1"])
+    with pytest.raises(ValueError, match="not a mapping"):
+        resolve({"tree": {"host": "h1", "requires": {"path": "x"}}}, "h1", ["h1"])
 
 
 CONTAINERS_FOR_PHYSICAL_PATH = [

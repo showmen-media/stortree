@@ -44,6 +44,9 @@ its own, shaped exactly like any other node below it:
       rclone: false            # optional per-client override of client-defaults.rclone;
                                # see "Per-client mount opt-out" below
 
+  requires: [<path>, ...]      # optional — other subtrees whose mounts must be up
+                               # before this one starts; tree-relative paths, a bare
+                               # string accepted for one. See "Requires" below
   access: {group: <name>, owner: <name>, permissions: <rwx-string>}  # see Access below
                                # — a single object, all three optional; dotted shorthand
                                # (access.group:/access.owner:/access.permissions:) works too
@@ -81,6 +84,9 @@ anywhere else:
 tree:
   host: storage-node-alpha
   rclone.remote: storagebox:/
+
+  requires:
+    - .bravo-cache
 
   client-defaults:
     rclone.args:
@@ -258,6 +264,73 @@ at all. This applies uniformly to a top-level subtree's own peer mount
 and to any Samba descendant nested under it (see "Samba sharing is
 universal" below) — one setting governs everything a non-owning host
 would otherwise reach inside that subtree.
+
+### Requires
+
+`requires` names other paths in the tree whose mounts have to be up
+before this node's own mount starts:
+
+```yaml
+tree:
+  host: storage-node-alpha
+  rclone.remote: storagebox:/
+  requires:
+    - .bravo-cache            # a bare string works too, for a single entry
+```
+
+Almost every dependency in a stortree tree is implied by its *shape*: a
+mount nested inside another mount obviously needs the outer one first,
+and that's derived automatically (spec.md §2, `requires_slug`) without
+anything in config.yml saying so. `requires` exists for the dependency
+nesting can't express — one between **sibling top-level subtrees**,
+which by design have no containment relationship at all.
+
+The case it exists for is a VFS cache. In the example above,
+`storage-node-bravo` mounts `tree` with `cache-dir:
+/srv/stortree/.bravo-cache`, and `.bravo-cache` is its own top-level
+subtree with its own remote-backed mount. Nothing about the tree's shape
+connects the two, so without a declaration systemd starts both units in
+parallel at boot — and if `tree` wins, rclone starts filling a cache
+directory on the local disk that is silently shadowed the moment
+`.bravo-cache` actually mounts over it. Declaring `requires` on `tree`
+makes that ordering real.
+
+This is deliberately *declared* rather than inferred from `cache-dir`
+itself. What depends on what is a fact about your fleet; reverse-engineering
+it out of a path that happens to appear in an rclone argument would be
+guessing, and would silently change behaviour whenever an argument
+changed.
+
+Some details:
+
+- **Paths are tree-relative**, written exactly as they appear at the top
+  level of config.yml (`.bravo-cache`, `tree/backups`) — the same strings
+  used everywhere else in this doc. Leading/trailing `/` are trimmed.
+- **It applies wherever the node is mounted**, including hosts that
+  client-mount it rather than own it. That's what makes the example work:
+  the cache dependency belongs to *bravo's* mount of `tree`, and bravo is
+  a client of `tree`, not its owner.
+- **A target that isn't a mount on this host drops out silently**, with
+  no unit dependency rendered. That covers both a target some other host
+  owns and this one doesn't mount (in the example, `.bravo-cache` is
+  invisible on alpha and on `some-storage-gadget`, so `tree`'s
+  declaration resolves to nothing there) and a target with no
+  `rclone.remote` at all (a plain local directory like `.gcs-cache` —
+  an ordinary directory the same apply creates before any unit starts, so
+  there's nothing to order against).
+- **The dependency is hard, not just ordered** — `After=` *and*
+  `Requires=`. If the required mount is down, the dependent mount does
+  not start. That's the point: a `tree` mount that starts anyway would
+  write its cache to the wrong place, which is the failure the
+  declaration exists to prevent. The trade-off is real and worth knowing:
+  if the cache's own remote is unreachable at boot, the host loses the
+  subtree that depends on it too, until it comes back.
+- **These are config errors**, failing the apply on every host rather
+  than only where they'd bite: naming a path no node in the tree defines
+  (a typo, or a path renamed out from under the declaration), naming the
+  declaring node itself, naming a per-user node (it resolves to one mount
+  per granted user, so there's no single mount to depend on), or forming
+  a cycle.
 
 ### Node inheritance
 

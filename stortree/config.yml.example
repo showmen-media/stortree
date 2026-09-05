@@ -18,6 +18,17 @@ tree:
   host: storage-node-alpha
   rclone.remote: storagebox:/
 
+  # storage-node-bravo's client mount below points its cache-dir into
+  # .bravo-cache, which is a separate top-level subtree and therefore has
+  # no nesting relationship with this one -- nothing about the tree's
+  # shape implies the ordering, so it's declared (docs/config-schema.md
+  # "Requires"). Applies wherever `tree` is mounted, but only resolves to
+  # anything on a host that actually mounts .bravo-cache: on alpha (which
+  # owns `tree`) and on some-storage-gadget (whose cache-dir is an
+  # ordinary local path) it drops out silently.
+  requires:
+    - .bravo-cache
+
   client-defaults:
     rclone.args:
       vfs-cache-mode: full
