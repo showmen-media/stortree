@@ -16,10 +16,25 @@
   # grant, not just per-user ones -- a plain shared node's `access.group`
   # still needs its GID resolved to gid-own its mount (spec.md §6), even
   # though it has no %U-expansion to do.
+  #
+  # `register`-d rather than relying on the resulting
+  # `ansible_facts.getent_group` fact directly: looping the module (one
+  # invocation per group name) means each iteration's own returned
+  # `ansible_facts.getent_group` only contains *that one* group, and
+  # replaces (not merges into) the host's whole fact each time --
+  # Ansible's default fact-merge behaviour, `hash_behaviour: replace`,
+  # applies here same as anywhere else, and nothing in this project's
+  # ansible.cfg overrides it. With more than one group ever needed at
+  # once, only the last loop iteration's group would actually survive in
+  # `ansible_facts.getent_group` by the time anything reads it --
+  # `stortree_merge_getent()` (filter_plugins/stortree.py) rebuilds the
+  # real, complete `{name: fields}` map from this task's own `.results`
+  # instead, sidestepping the clobbered fact entirely.
   ansible.builtin.getent:
     database: group
     key: "{{ item }}"
   loop: "{{ stortree | stortree_needed_groups }}"
+  register: stortree_secrets_group_lookups
   tags: [secrets]
 
 - name: Compute this host's resolved group membership
@@ -28,16 +43,22 @@
   # container's real owner (group-derived ones included, e.g. a
   # group-only grant's members), which needs this fact to exist first.
   ansible.builtin.set_fact:  # noqa: var-naming[no-role-prefix]
-    stortree_group_members: "{{ ansible_facts.getent_group | default({}) | stortree_group_members }}"
+    stortree_group_members: >-
+      {{ stortree_secrets_group_lookups.results
+         | stortree_merge_getent('group')
+         | stortree_group_members }}
   tags: [secrets]
 
 - name: Compute this host's resolved group GIDs
-  # Same getent_group data as above, just the numeric GID instead of
+  # Same merged lookup data as above, just the numeric GID instead of
   # membership -- stortree_mounts needs it to gid-own a remote-backed
   # node's rclone mount when `access` grants a group (spec.md §6), so the
   # kernel can enforce that grant for real.
   ansible.builtin.set_fact:  # noqa: var-naming[no-role-prefix]
-    stortree_group_gids: "{{ ansible_facts.getent_group | default({}) | stortree_group_gids }}"
+    stortree_group_gids: >-
+      {{ stortree_secrets_group_lookups.results
+         | stortree_merge_getent('group')
+         | stortree_group_gids }}
   tags: [secrets]
 
 - name: Look up the UID for every user referenced in an access.owner grant
@@ -49,17 +70,28 @@
   # own owner, group-derived ones included -- stortree_mounts needs their
   # numeric UIDs too, for a wrapper mount's --uid (user_container_paths(),
   # filter_plugins/stortree.py).
+  #
+  # `register`-d for the same reason as the group lookup above -- see
+  # its own comment. This is the task that actually surfaced the bug in
+  # production: sys-configs-style single-owner grants never needed more
+  # than one name looped before user_container_paths() started covering
+  # group-derived container owners too, so this was the first time more
+  # than one name was ever looped here.
   ansible.builtin.getent:
     database: passwd
     key: "{{ item }}"
   loop: "{{ stortree | stortree_needed_users(stortree_group_members) }}"
+  register: stortree_secrets_user_lookups
   tags: [secrets]
 
 - name: Compute this host's resolved user UIDs
   # Same idea as stortree_group_gids, for access.owner instead of
   # access.group.
   ansible.builtin.set_fact:  # noqa: var-naming[no-role-prefix]
-    stortree_user_uids: "{{ ansible_facts.getent_passwd | default({}) | stortree_user_uids }}"
+    stortree_user_uids: >-
+      {{ stortree_secrets_user_lookups.results
+         | stortree_merge_getent('passwd')
+         | stortree_user_uids }}
   tags: [secrets]
 
 - name: Render this host's filtered rclone.conf

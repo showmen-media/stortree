@@ -522,8 +522,12 @@ unit instead adds `--allow-other` back and uid/gid-owns the mount
 directly (`--uid`/`--gid`, resolved from the same `getent passwd`/`getent
 group` lookups `stortree_secrets` already runs for %U-expansion below —
 `stortree_user_uids`/`stortree_group_gids` read the numeric id out of the
-same `ansible_facts.getent_passwd`/`getent_group` data instead of the
-name/member list) and `--dir-perms`/`--file-perms` (both set to the same
+same merged lookup data instead of the name/member list — merged from
+each looped `getent` call's own result via `stortree_merge_getent()`,
+not from `ansible_facts.getent_passwd`/`getent_group` directly, since
+Ansible's own fact-merge behavior replaces rather than accumulates a
+module's returned facts across loop iterations) and `--dir-perms`/
+`--file-perms` (both set to the same
 mode `access_mode()` computed). Real, kernel-enforced access, checked
 against whoever is actually connecting — Samba included, since Samba
 still operates as that real user throughout. `mw-fam` in the running

@@ -674,6 +674,37 @@ def _slug(path):
     return "-".join(_escape_slug_segment(seg) for seg in path.split("/"))
 
 
+def merged_getent_results(loop_results, database):
+    """Reconstruct the `{name: fields}` shape `group_members_from_getent()`/
+    `group_gids_from_getent()`/`user_uids_from_getent()` all expect, from a
+    *looped* `ansible.builtin.getent` task's own `register`-d `.results`
+    list, rather than from `ansible_facts.getent_<database>` directly.
+
+    Looping the module (one invocation per needed name, `key: "{{ item
+    }}"`) rather than passing every name in one call means each
+    iteration's own returned `ansible_facts.getent_<database>` only ever
+    contains *that one* name -- and Ansible's default fact-merge
+    behaviour for a module's `ansible_facts` is a plain replace, not a
+    recursive merge (`hash_behaviour` defaults to `replace`, and nothing
+    in this project's `ansible.cfg` overrides it), so each iteration's
+    result *replaces* the host's whole `getent_<database>` fact rather
+    than adding to it. With more than one name ever needed at once, only
+    the *last* loop iteration's single entry survives by the time a
+    later task reads `ansible_facts.getent_<database>` -- confirmed
+    against a live deployment (4 real per-user container owners
+    resolved, only the alphabetically-last one's UID actually ended up
+    in `stortree_user_uids`, the rest raising `stortree_user_uids[owner]`
+    as a missing key). Rebuilding the merged dict here, from each loop
+    iteration's own raw result instead of the clobbered shared fact,
+    sidesteps the whole problem without needing `ansible.cfg` changed
+    fleet-wide (which would affect every other fact-merge in the
+    playbook, not just this one)."""
+    merged = {}
+    for result in loop_results:
+        merged.update((result.get("ansible_facts") or {}).get(f"getent_{database}") or {})
+    return merged
+
+
 def group_members_from_getent(getent_group):
     """Convert Ansible's `ansible_facts.getent_group` (as populated by
     looping the `ansible.builtin.getent` module over every group name
@@ -1205,6 +1236,7 @@ class FilterModule(object):
         return {
             "stortree_resolve": resolve,
             "stortree_filter_rclone_conf": filter_rclone_conf,
+            "stortree_merge_getent": merged_getent_results,
             "stortree_group_members": group_members_from_getent,
             "stortree_group_gids": group_gids_from_getent,
             "stortree_user_uids": user_uids_from_getent,

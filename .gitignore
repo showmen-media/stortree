@@ -19,3 +19,6 @@ collections/
 # Molecule / Ansible run artifacts
 .molecule/
 *.retry
+
+
+*.log

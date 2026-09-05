@@ -15,6 +15,7 @@ from filter_plugins.stortree import (
     filter_rclone_conf,
     group_gids_from_getent,
     group_members_from_getent,
+    merged_getent_results,
     mount_unit_names,
     needed_groups,
     needed_users,
@@ -692,6 +693,40 @@ def test_user_uids_from_getent_parses_numeric_uid():
     # node's mount (spec.md §6).
     getent_passwd = {"jd": ["x", "2101", "2101", "", "/home/jd", "/bin/bash"]}
     assert user_uids_from_getent(getent_passwd) == {"jd": 2101}
+
+
+def test_merged_getent_results_accumulates_across_loop_iterations():
+    # each loop iteration of a looped ansible.builtin.getent task returns
+    # its own single-name ansible_facts.getent_<database> -- confirmed in
+    # production that Ansible's default fact-merge behaviour replaces
+    # (not merges into) the host's whole fact each time, so only the last
+    # iteration's name would survive in ansible_facts.getent_passwd
+    # itself. merged_getent_results() rebuilds the full map from each
+    # iteration's own raw result instead.
+    loop_results = [
+        {"ansible_facts": {"getent_passwd": {"jd": ["x", "2101", "2101", "", "/home/jd", "/bin/bash"]}}},
+        {"ansible_facts": {"getent_passwd": {"mike": ["x", "2102", "2102", "", "/home/mike", "/bin/bash"]}}},
+        {"ansible_facts": {"getent_passwd": {"dana": ["x", "2103", "2103", "", "/home/dana", "/bin/bash"]}}},
+    ]
+    merged = merged_getent_results(loop_results, "passwd")
+    assert merged == {
+        "jd": ["x", "2101", "2101", "", "/home/jd", "/bin/bash"],
+        "mike": ["x", "2102", "2102", "", "/home/mike", "/bin/bash"],
+        "dana": ["x", "2103", "2103", "", "/home/dana", "/bin/bash"],
+    }
+    assert user_uids_from_getent(merged) == {"jd": 2101, "mike": 2102, "dana": 2103}
+
+
+def test_merged_getent_results_handles_missing_or_empty_ansible_facts():
+    # a failed loop iteration (e.g. fail_key on a missing name) may carry
+    # no ansible_facts at all -- shouldn't blow up the merge, just
+    # contribute nothing for that iteration.
+    loop_results = [
+        {"ansible_facts": {"getent_group": {"g1": ["x", "2001", "a,b"]}}},
+        {"failed": True},
+        {"ansible_facts": {}},
+    ]
+    assert merged_getent_results(loop_results, "group") == {"g1": ["x", "2001", "a,b"]}
 
 
 def test_needed_users_covers_server_subtrees_and_peer_dependencies():
