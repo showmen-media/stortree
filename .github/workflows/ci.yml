@@ -1,0 +1,133 @@
+---
+# Everything docs/plan.md "What's verified" says was run by hand, run on
+# every push instead. Deliberately does *not* include `molecule test`:
+# that needs privileged systemd-in-Docker containers plus throwaway
+# LDAP/sftp ones, takes minutes rather than seconds, and has never been
+# run anywhere yet -- it lives in molecule.yml below, on manual dispatch,
+# so a first green run is a decision someone makes rather than something
+# that silently gates every push before it has ever passed.
+
+name: CI
+
+"on":
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Keep Ansible's own noise out of the logs; a real failure still
+  # surfaces through the exit code.
+  ANSIBLE_FORCE_COLOR: "1"
+  PY_COLORS: "1"
+
+jobs:
+  unit:
+    name: pytest (ansible-core ${{ matrix.ansible }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The range requirements.txt allows. tests/conftest.py renders
+        # the roles' templates through ansible-core's own filters, tests
+        # and AnsibleUndefined, so a change to those internals between
+        # supported versions is a real break, not a test-harness detail.
+        ansible: ["2.16", "2.17"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        # Only what the tests import -- deliberately not the whole of
+        # requirements.txt, so pinning ansible-core here can't fight
+        # molecule's and ansible-lint's own version constraints.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ansible-core~=${{ matrix.ansible }}.0" pytest pytest-cov PyYAML
+
+      - name: Run the test suite
+        # Coverage config (branch coverage + the fail_under floor) lives
+        # in pyproject.toml.
+        run: pytest --cov --cov-report=term-missing
+
+  lint:
+    name: ansible-lint + yamllint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install collections
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: yamllint
+        # --strict so a warning can't quietly accumulate into the norm.
+        run: yamllint --strict .
+
+      - name: ansible-lint
+        # Skips and their rationale are in .ansible-lint.
+        run: ansible-lint
+
+  playbooks:
+    name: playbook syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install collections
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Set up config the way README.md tells an operator to
+        # The real files are gitignored, so this also checks that the
+        # documented "copy the .example files" setup path actually
+        # produces a working checkout -- an example that's gone stale or
+        # missing fails here rather than on someone's first run.
+        run: |
+          cp inventory/hosts.yml.example inventory/hosts.yml
+          cp stortree/config.yml.example stortree/config.yml
+          cp stortree/ldap.yml.example stortree/ldap.yml
+          cp stortree/rclone.conf.example stortree/rclone.conf
+
+      - name: Syntax-check both playbooks
+        run: |
+          ansible-playbook playbooks/site.yml --syntax-check
+          ansible-playbook playbooks/status.yml --syntax-check
+
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        # pam-smbpass-sync.sh runs inside the PAM stack on every
+        # authentication, as root, with a plaintext password on stdin.
+        # Small, but not a place for a quoting mistake.
+        run: |
+          shellcheck --shell=sh roles/stortree_pam_smbpass/files/pam-smbpass-sync.sh
