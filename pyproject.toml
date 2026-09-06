@@ -1,0 +1,35 @@
+# Tooling config only -- stortree is an Ansible project, not a Python
+# package, and nothing here is meant to be pip-installed. The pure
+# functions in filter_plugins/stortree.py are imported directly by
+# tests/ (see tests/conftest.py), which is why there's no [project]
+# table or build backend.
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+# -q keeps the default run short; --strict-markers/--strict-config turn
+# a typo'd marker or an unknown ini key into an error instead of a
+# silently ignored line.
+addopts = "-q --strict-markers --strict-config"
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["filter_plugins"]
+# Branch coverage, not just line: resolve() and plan_mounts() are dense
+# with `if`/`continue` paths where a line runs but one of its two
+# outcomes never does -- exactly the kind of gap statement coverage
+# hides.
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+# The suite covers every statement and every branch of
+# filter_plugins/stortree.py today, so the floor is where the ceiling
+# is: a new branch has to arrive with the test that exercises it.
+# Raise-or-hold only -- never lower this to make a red run green.
+fail_under = 100
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+]

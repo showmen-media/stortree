@@ -1511,3 +1511,324 @@ def test_plan_mounts_orders_entries_shallowest_first():
     plan = plan_mounts(r, {"Michael Whitfield Family": ["mike"]})
     depths = [e["local_path"].count("/") for e in plan]
     assert depths == sorted(depths)
+
+
+# -- paths nothing above reaches -----------------------------------------
+#
+# Branches that had no test at all -- error paths, opt-out interactions,
+# and the shapes the worked example happens never to produce. Grouped
+# here rather than scattered above because what they have in common is
+# how they were found (a branch-coverage run), not what they're about.
+
+
+def test_plan_mounts_peer_sources_a_plain_samba_descendant_it_does_not_own():
+    # A samba node whose descendant is a plain, non-per-user subtree
+    # owned by another host: this host has to peer-mount it to serve a
+    # complete share, exactly as it would a per-user one. The worked
+    # example only ever produces per-user descendants, so nothing else
+    # covers the plain case.
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "share": {
+                    "samba": {"subpath": None},
+                    "subdirs": {"leaf": {"host": "h2", "rclone.remote": "r2:/leaf"}},
+                }
+            },
+        }
+    }
+    r = resolve(tree, "h1", ["h1", "h2"])
+    (peer,) = r["peer_dependencies"]
+    assert peer["samba_node"] == "top/share"
+    assert peer["per_user"] is False
+
+    leaf = by_path(
+        [{"path": e["local_path"], **e} for e in plan_mounts(r, {})],
+        "top/share/leaf",
+    )
+    assert leaf["remote"] == (
+        "peer-h2-top-share-leaf:/srv/stortree/top/share/leaf"
+    )
+    assert leaf["symlink_target"] is None
+
+
+def test_client_opt_out_beats_universal_samba_sharing():
+    # Samba sharing is universal, but `client-defaults.rclone: false`
+    # still stops a non-owning host from mounting anything of that
+    # subtree -- so it ends up exporting the share with nothing behind
+    # it. Worth pinning: the two rules pull in opposite directions and
+    # the resolution isn't obvious from either one's own docs.
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "client-defaults": {"rclone": False},
+            "subdirs": {
+                "share": {
+                    "samba": {"subpath": None},
+                    "subdirs": {"leaf": {"host": "h2", "rclone.remote": "r2:/leaf"}},
+                }
+            },
+        }
+    }
+    r = resolve(tree, "h3", ["h1", "h2", "h3"])
+    assert len(r["samba_shares"]) == 1
+    assert r["peer_dependencies"] == []
+    assert r["client_mounts"] == []
+
+
+def test_plan_mounts_rejects_two_entries_that_resolve_to_one_unit_slug():
+    # Slugs are systemd unit instance names, so two entries sharing one
+    # means a single unit file rendered twice, with whichever entry the
+    # loop reaches last silently winning. _escape_slug_segment() makes
+    # the encoding injective, so two *different* paths can't collide
+    # (test_plan_mounts_slug_distinguishes_hyphen_from_nesting) -- what
+    # this guard actually catches is the same path planned twice, which
+    # is a resolve() bug rather than a config one. Kept anyway: it's a
+    # cheap assertion at exactly the point the damage would be done.
+    duplicate = {
+        "path": "top/leaf",
+        "host": "h1",
+        "remote": "r:/",
+        "args": {},
+        "access": {},
+        "per_user": False,
+        "requires": [],
+    }
+    resolved = {
+        "server_subtrees": [duplicate, dict(duplicate, remote="other:/")],
+        "client_mounts": [],
+        "samba_shares": [],
+        "peer_dependencies": [],
+    }
+    with pytest.raises(ValueError, match="resolve to systemd unit slug"):
+        plan_mounts(resolved, {})
+
+
+def test_slug_encoding_is_injective_so_no_two_paths_can_collide():
+    # The property the guard above can lean on: "-" inside a segment is
+    # escaped, "/" is the only thing that becomes a literal "-", and the
+    # escape character itself is escaped too, so decoding is unambiguous.
+    assert _slug("a-b") == "a\\x2db"
+    assert _slug("a/b") == "a-b"
+    assert _slug("a\\x2db") != _slug("a-b")
+
+
+def test_slug_of_the_tree_root_is_the_reserved_root_name():
+    # A root-level client mount's local_path is the empty string, which
+    # can't be a systemd instance name.
+    assert _slug("") == "root"
+    assert _slug("tree") == "tree"
+
+
+def test_a_node_can_mix_the_dotted_and_nested_rclone_forms():
+    # `rclone.remote:` alongside `rclone.args:` on the same node -- two
+    # dotted keys expanding to the same parent, which only works if the
+    # expansion merges rather than the second overwriting the first.
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "rclone.args": {"vfs-cache-mode": "full"},
+        }
+    }
+    (subtree,) = resolve(tree, "h1", ["h1"])["server_subtrees"]
+    assert subtree["remote"] == "r1:/"
+    assert subtree["args"] == {"vfs-cache-mode": "full"}
+
+
+def test_a_three_segment_dotted_key_is_not_expanded_all_the_way_down():
+    # Current behavior, pinned deliberately: expansion splits on the
+    # *last* dot only (the rule that keeps a literal `.cache.subdirs`
+    # intact, docs/config-schema.md "A dotted-path map key"), so
+    # `rclone.args.vfs-cache-mode:` becomes a key literally named
+    # "rclone.args" -- which nothing ever reads. The arg is silently
+    # dropped, with no error and no mount difference to notice it by.
+    # Every documented shorthand has exactly one dot, so this is outside
+    # the schema; it's pinned here because it's an easy thing to write
+    # by analogy and an invisible thing to get wrong.
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "rclone.args.vfs-cache-mode": "full",
+            "rclone": {"args": {"dir-cache-time": "5m"}},
+        }
+    }
+    (subtree,) = resolve(tree, "h1", ["h1"])["server_subtrees"]
+    assert subtree["args"] == {"dir-cache-time": "5m"}
+
+
+def test_needed_users_covers_a_peer_dependencys_owner_grant():
+    # stortree_secrets calls needed_users() before `getent group` has
+    # run, so group_members is None there -- an owner grant on a peer
+    # dependency is the one thing it can still resolve, and the host
+    # needs that user to exist to own the peer-sourced path.
+    resolved = {
+        "server_subtrees": [],
+        "peer_dependencies": [
+            {
+                "owning_host": "h2",
+                "local_path": "top/home/jd/sys-configs",
+                "access": {"owner": "jd", "permissions": "rwx"},
+            },
+            {"owning_host": "h2", "local_path": "top/other", "access": {}},
+            {"owning_host": "h2", "local_path": "top/none"},
+        ],
+    }
+    assert needed_users(resolved) == ["jd"]
+
+
+def test_filter_rclone_conf_keeps_a_client_mounts_own_direct_remote():
+    # A client mount is usually peer-sourced, but a host named under
+    # `clients:` for a subtree it doesn't own can still end up with a
+    # direct third-party remote -- that section has to survive the
+    # filter, or the mount starts with no credentials for it.
+    conf = "[direct]\ntype = sftp\n\n[unrelated]\ntype = s3\n"
+    resolved = {
+        "server_subtrees": [],
+        "client_mounts": [{"local_path": "top", "remote": "direct:/", "args": {}}],
+        "samba_shares": [],
+        "peer_dependencies": [],
+    }
+    out = filter_rclone_conf(conf, resolved)
+    assert "[direct]" in out
+    assert "[unrelated]" not in out
+
+
+def test_filter_rclone_conf_ignores_entries_with_no_remote_at_all():
+    # A plain-directory entry has remote None; _remote_section() has to
+    # return None for it rather than blowing up or inventing a section.
+    conf = "[only]\ntype = sftp\n"
+    resolved = {
+        "server_subtrees": [{"local_path": "top", "remote": None}],
+        "client_mounts": [{"local_path": "top/x", "remote": None}],
+        "samba_shares": [{"descendants": [{"path": "top/x", "remote": None}]}],
+        "peer_dependencies": [],
+    }
+    out = filter_rclone_conf(conf, resolved)
+    assert "[only]" not in out
+    assert out.strip() == ""
+
+
+def test_filter_rclone_conf_drops_a_per_user_peer_nobody_is_granted():
+    # A group-only per-user peer whose group has no members on this host
+    # resolves to no real mount, so it must not get an sftp section
+    # either -- an unused section is a peer credential handed to a host
+    # with no reason to hold it.
+    conf = "[base]\ntype = sftp\n"
+    resolved = {
+        "server_subtrees": [],
+        "client_mounts": [],
+        "samba_shares": [],
+        "peer_dependencies": [
+            {
+                "owning_host": "h2",
+                "local_path": "top/home/%U/media",
+                "remote_path": "top/home/%U/media",
+                "per_user": True,
+                "access": {"group": "Nobody Here", "permissions": "rwx"},
+            }
+        ],
+    }
+    assert "peer-h2" not in filter_rclone_conf(conf, resolved, group_members={})
+    # ... and does get one as soon as the group has a member.
+    granted = filter_rclone_conf(
+        conf, resolved, group_members={"Nobody Here": ["someone"]}
+    )
+    assert "peer-h2" in granted
+
+
+def test_access_mode_write_only_grant_sets_only_the_write_bit():
+    # _permission_bits' r/x branches, neither of which any grant in the
+    # worked example leaves out.
+    mode = access_mode({"group": "g", "permissions": "w"})
+    assert mode[2] == "2"
+
+
+def test_access_mode_read_write_without_execute_leaves_the_traverse_bit_off():
+    mode = access_mode({"group": "g", "permissions": "rw"})
+    assert mode[2] == "6"
+
+
+def test_samba_block_must_be_non_empty_to_export_a_share():
+    # Current behavior, pinned deliberately rather than by accident: a
+    # node whose `samba:` block is empty or bare (`samba:` alone parses
+    # as None) is NOT exported, because _samba_nodes() tests the block
+    # for truthiness rather than presence. docs/config-schema.md says "a
+    # `samba:` block marks a node for export" without saying the block
+    # has to contain anything, so a bare `samba:` meaning "share this
+    # with defaults" is a fair reading of the schema that silently gets
+    # no share. If that reading is the intended one, this is the test to
+    # change -- and _samba_nodes() the one line to change with it.
+    for block in ({}, None):
+        tree = {"top": {"host": "h1", "rclone.remote": "r:/", "samba": block}}
+        assert resolve(tree, "h1", ["h1", "h2"])["samba_shares"] == []
+
+    tree = {"top": {"host": "h1", "rclone.remote": "r:/", "samba": {"subpath": None}}}
+    assert len(resolve(tree, "h1", ["h1", "h2"])["samba_shares"]) == 1
+
+
+def test_client_opt_out_also_withholds_peer_trust_from_the_serving_side():
+    # The mirror of test_client_opt_out_beats_universal_samba_sharing,
+    # seen from the host that owns the data: if no peer will ever mount
+    # it, this host must not list them in peer_served_by either --
+    # that's what stortree_peer_trust turns into authorized_keys, and an
+    # entry here is real SSH access granted for a mount that can't
+    # happen.
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "client-defaults": {"rclone": False},
+            "subdirs": {
+                "share": {
+                    "samba": {"subpath": None},
+                    "subdirs": {"leaf": {"host": "h2", "rclone.remote": "r2:/leaf"}},
+                }
+            },
+        }
+    }
+    assert resolve(tree, "h2", ["h1", "h2", "h3"])["peer_served_by"] == []
+
+    # Without the opt-out, both other hosts are served.
+    tree["top"].pop("client-defaults")
+    served = resolve(tree, "h2", ["h1", "h2", "h3"])["peer_served_by"]
+    assert {p["serving_host"] for p in served} == {"h1", "h3"}
+
+
+def test_requires_keeps_every_entry_of_a_multi_element_list():
+    # The worked example only ever declares one, so nothing else walks
+    # this loop more than once -- or exercises its dedupe.
+    tree = {
+        "a": {"host": "h1", "rclone.remote": "ra:/"},
+        "b": {"host": "h1", "rclone.remote": "rb:/"},
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r:/",
+            "requires": ["a", "/b/", "a"],
+        },
+    }
+    (subtree,) = [
+        s
+        for s in resolve(tree, "h1", ["h1"])["server_subtrees"]
+        if s["path"] == "top"
+    ]
+    assert subtree["requires"] == ["a", "b"]
+
+
+def test_group_gids_from_getent_skips_an_entry_the_directory_had_no_answer_for():
+    # `getent group` over a name SSSD can't resolve comes back as an
+    # empty/short field list rather than an error, and a KeyError here
+    # would take down the whole play for one missing group.
+    assert group_gids_from_getent(
+        {"real": ["x", "20001", ""], "missing": [""], "null-gid": ["x", None]}
+    ) == {"real": 20001}
+
+
+def test_user_uids_from_getent_skips_an_entry_the_directory_had_no_answer_for():
+    assert user_uids_from_getent(
+        {"jd": ["x", "10001", "10001"], "ghost": [""], "null-uid": ["x", None]}
+    ) == {"jd": 10001}

@@ -1,3 +1,4 @@
+---
 # The worked example from docs/config-schema.md, verbatim. Every name
 # here -- hosts, groups, the `jd` user -- is fictional.
 #

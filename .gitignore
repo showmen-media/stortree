@@ -14,6 +14,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .cache/
+.coverage
+.coverage.*
+htmlcov/
 collections/
 
 # Molecule / Ansible run artifacts

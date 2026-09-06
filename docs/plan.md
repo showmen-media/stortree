@@ -138,20 +138,50 @@ implementation:
 Docker on the machine this was built on is in daily use for unrelated
 services, so `molecule test`/`molecule converge` (which needs privileged,
 systemd-in-Docker containers plus throwaway LDAP/sftp containers, §9) was
-deliberately **not** run here. What was run and passed:
+deliberately **not** run here. Everything else now runs on every push
+via `.github/workflows/ci.yml`, rather than by hand:
 
-- `pytest tests/` — `resolve()`/`filter_rclone_conf()` unit tests,
-  including the mutual-peer-dependency, client-only-host, and
-  unnamed-inventory-host cases §1 calls out explicitly.
+- `pytest` — three layers, all pure and hostless:
+  - `resolve()`/`filter_rclone_conf()` and the rest of
+    `filter_plugins/stortree.py`, including the mutual-peer-dependency,
+    client-only-host, and unnamed-inventory-host cases §1 calls out
+    explicitly. Statement *and* branch coverage of that module is at
+    100%, enforced by a `fail_under` floor in `pyproject.toml`.
+  - the `FilterModule` mapping itself (`tests/test_filters.py`) — that
+    every name a role pipes through is registered, and vice versa. A
+    typo there breaks every playbook while leaving the resolution tests
+    green, which is exactly what it used to do.
+  - the roles' Jinja templates (`tests/test_templates.py`) — the three
+    systemd unit templates, `smb.conf.j2` and `sssd.conf.j2`, rendered
+    through ansible-core's own filters/tests/`AnsibleUndefined` against
+    real `plan_mounts()`/`user_container_paths()` output. This is the
+    layer where a wrong `PartOf=` or a missing `--uid` becomes a mount
+    that silently serves the wrong thing, and it previously had no
+    coverage outside the unrun Molecule scenario.
+  - drift guards (`tests/test_repo_consistency.py`) — the worked example
+    exists in three copies (unit fixture, `stortree/config.yml.example`,
+    Molecule fixture) and `molecule/full-tree/converge.yml` claims to be
+    1:1 with `playbooks/site.yml`; both are now checked rather than
+    maintained by hand, along with the repo-hygiene rule above.
 - `ansible-playbook playbooks/site.yml --syntax-check` and the same for
-  `status.yml`, against the `*.example` config.
-- `ansible-lint` / `yamllint` over `roles/` and `playbooks/`.
+  `status.yml`, run against config copied from the `*.example` files by
+  the same commands README.md gives an operator — so a stale example
+  fails CI rather than someone's first run.
+- `ansible-lint` (clean at the `production` profile) and `yamllint
+  --strict` over the whole repo. Both were run by hand at the time this
+  section was first written and had since drifted red; the skips that
+  remain are listed with their rationale in `.ansible-lint`.
+- `shellcheck` over `pam-smbpass-sync.sh`, which runs as root inside the
+  PAM stack with a plaintext password on stdin.
 
-Not run: `molecule test` for any role, or the `full-tree` scenario. The
-scenario files exist and are believed correct but are unexercised —
-before trusting this against real hosts, run at least the `full-tree`
-scenario (`cd molecule/full-tree && molecule test`, or per-role via `cd
-roles/<role> && molecule test`) somewhere Docker capacity isn't shared
-with other workloads, then a staging pass (`ansible-playbook site.yml
---check --diff` against real hosts, then a real apply) per spec.md §9's
-own caveat about what Molecule-in-Docker does and doesn't prove.
+Still not run: `molecule test` for any role, or the `full-tree`
+scenario. The scenario files exist, are checked for internal consistency
+by `tests/test_repo_consistency.py`, and are believed correct, but
+remain unexercised — before trusting this against real hosts, run at
+least the `full-tree` scenario (`cd molecule/full-tree && molecule
+test`, the manually dispatched `.github/workflows/molecule.yml`, or
+per-role via `cd roles/<role> && molecule test`) somewhere Docker
+capacity isn't shared with other workloads, then a staging pass
+(`ansible-playbook site.yml --check --diff` against real hosts, then a
+real apply) per spec.md §9's own caveat about what Molecule-in-Docker
+does and doesn't prove.

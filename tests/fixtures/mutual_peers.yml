@@ -1,3 +1,4 @@
+---
 # Minimal tree exercising a mutual peer dependency: host-a and host-b
 # each own one piece of the same samba-shared node that the other needs.
 # `shared` is a top-level subtree (this file's only one) -- its own key

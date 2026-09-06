@@ -6,5 +6,27 @@
 #   stortree_root/user/group in stortree_common, ...) rather than
 #   role-private variables -- that's the point of the shared contract
 #   described in docs/spec.md §1, not an oversight.
+#
+# - ignore-errors: the directory-creation tasks in stortree_mounts run
+#   against paths that may sit under an already-mounted-but-unreachable
+#   rclone mount, where root itself gets EACCES and there is nothing to
+#   correct until that mount is replaced later in the same run (see that
+#   file's header comment and stortree_path_masked()). The suggested
+#   `failed_when` can't express this: the condition isn't a recognizable
+#   message but "this path is currently behind a FUSE mount presenting
+#   an ownership this host can't see through", which is exactly what the
+#   task would have to succeed at to evaluate. Failing the play there
+#   would abort every *later* task, including the ones that fix it.
+#
+# - no-handler: the three "Restart any ... whose unit file actually
+#   changed" tasks in stortree_mounts loop over a `register`ed template
+#   result and restart only the units whose own file re-rendered. A
+#   handler is notified once for the whole loop and has no access to
+#   which iterations changed, so the handler form would restart every
+#   resolved mount on any change -- disrupting open file handles on
+#   unrelated mounts, which is the specific thing these tasks are
+#   scoped to avoid.
 skip_list:
   - var-naming[no-role-prefix]
+  - ignore-errors
+  - no-handler

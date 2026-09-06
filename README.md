@@ -140,6 +140,33 @@ Then `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 && .venv/bin/ansible-galaxy collection install -r requirements.yml`. See
 [docs/runbook.md](docs/runbook.md) for day-to-day operator commands.
 
+## Tests
+
+Everything except the Molecule scenario runs in seconds on a checkout,
+with no Docker and no hosts to talk to, and runs on every push via
+[GitHub Actions](.github/workflows/ci.yml):
+
+```
+pytest                       # resolution, filters, and rendered templates
+pytest --cov                 # ... with the coverage floor enforced
+yamllint --strict .          # YAML style
+ansible-lint                 # role/playbook lint (skips justified in .ansible-lint)
+ansible-playbook playbooks/site.yml --syntax-check
+```
+
+`pytest` covers three layers: the pure resolution functions in
+`filter_plugins/stortree.py`, the `FilterModule` mapping that exposes
+them to plays, and the roles' Jinja templates, rendered through
+ansible-core's own filters against real `resolve()` output so a systemd
+unit or `smb.conf` can be asserted on without a host to apply it to.
+
+The multi-host Molecule scenario is the one thing that isn't automatic
+— it needs privileged systemd-in-Docker containers and has never been
+run. It has its own manually dispatched workflow
+([.github/workflows/molecule.yml](.github/workflows/molecule.yml)), or
+run it locally with `cd molecule/full-tree && molecule test`. See
+[docs/plan.md](docs/plan.md) "What's verified".
+
 ## Docs
 
 - [docs/spec.md](docs/spec.md) — architecture, role/playbook layout, and

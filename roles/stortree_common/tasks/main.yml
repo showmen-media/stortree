@@ -36,7 +36,9 @@
     stortree_gid: "{{ stortree_group_created.gid }}"
   tags: [common]
 
-- name: Ensure the stortree service account has a home directory (peer_trust's authorized_keys lives under {{ stortree_home }}/.ssh)
+- name: Ensure the stortree service account has a home directory
+  # stortree_peer_trust puts the peer authorized_keys under
+  # {{ stortree_home }}/.ssh, so this has to exist before it runs.
   ansible.builtin.file:
     path: "{{ stortree_home }}"
     state: directory

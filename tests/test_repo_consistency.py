@@ -1,0 +1,183 @@
+"""Guards against the copies of a thing drifting apart.
+
+Three separate things in this repo are documented as being copies of, or
+1:1 with, something else -- the worked example config (three copies),
+the Molecule converge playbook (says it's 1:1 with playbooks/site.yml),
+and the Molecule fleet list (must match that scenario's own platforms).
+Each is currently kept in sync by hand, and drift in any of them is
+silent: the tests keep passing against a stale fixture, or the scenario
+resolves a different tree than the playbook it claims to mirror.
+
+Also here: the repo-hygiene rule from docs/plan.md that no real config
+ever gets committed, which is worth a test precisely because it's the
+kind of mistake you only make once.
+"""
+
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+
+from conftest import EXAMPLE_HOSTS, REPO_ROOT
+from filter_plugins.stortree import plan_mounts, resolve
+
+# The three copies of docs/config-schema.md's worked example: what the
+# unit tests resolve, what an operator copies to start from, and what
+# the Molecule scenario applies.
+EXAMPLE_COPIES = [
+    Path("tests/fixtures/example_tree.yml"),
+    Path("stortree/config.yml.example"),
+    Path("molecule/fixtures/stortree/config.yml"),
+]
+
+SITE_PLAYBOOK = REPO_ROOT / "playbooks/site.yml"
+FULL_TREE = REPO_ROOT / "molecule/full-tree"
+
+
+def load_yaml(relative_path):
+    return yaml.safe_load((REPO_ROOT / relative_path).read_text())
+
+
+# -- the worked example, in triplicate ------------------------------------
+
+
+@pytest.mark.parametrize("copy", EXAMPLE_COPIES[1:], ids=lambda p: str(p))
+def test_every_copy_of_the_worked_example_parses_the_same(copy):
+    # Compared as parsed data, not bytes: a differing comment or a
+    # leading `---` is fine, a differing tree is not. tests/fixtures is
+    # the reference, since it's what the unit tests actually assert on.
+    assert load_yaml(copy) == load_yaml(EXAMPLE_COPIES[0])
+
+
+def test_the_shipped_example_resolves_for_every_host_in_its_fleet():
+    # The file an operator copies to stortree/config.yml has to at least
+    # resolve. Cheap end-to-end smoke test of the real artifact rather
+    # than of the fixture standing in for it.
+    tree = load_yaml("stortree/config.yml.example")
+    for host in EXAMPLE_HOSTS:
+        resolved = resolve(tree, host, EXAMPLE_HOSTS)
+        assert set(resolved) == {
+            "server_subtrees",
+            "client_mounts",
+            "samba_shares",
+            "peer_dependencies",
+            "peer_served_by",
+        }
+        # Samba sharing is universal, so every host exports the one
+        # samba-configured node whether or not it owns any of it.
+        assert len(resolved["samba_shares"]) == 1
+
+
+def test_the_shipped_example_resolves_for_a_host_it_never_mentions():
+    # spec.md §1 calls this out explicitly: a host in the inventory but
+    # absent from config.yml still participates.
+    tree = load_yaml("stortree/config.yml.example")
+    fleet = EXAMPLE_HOSTS + ["a-host-config-never-heard-of"]
+    resolved = resolve(tree, "a-host-config-never-heard-of", fleet)
+    assert resolved["server_subtrees"] == []
+    assert resolved["samba_shares"] != []
+    assert resolved["peer_dependencies"] != []
+
+
+def test_the_shipped_example_plans_mounts_without_a_slug_collision():
+    # plan_mounts() raises on two paths that collide into one systemd
+    # unit name. Nothing else runs the *shipped* example through it.
+    tree = load_yaml("stortree/config.yml.example")
+    members = {
+        "Whitfield Family & Friends": ["jd", "mw"],
+        "Michael Whitfield Family": ["mw"],
+        "Media Production": ["jd"],
+    }
+    for host in EXAMPLE_HOSTS:
+        assert plan_mounts(resolve(tree, host, EXAMPLE_HOSTS), members)
+
+
+# -- Molecule scenario vs. the playbook it mirrors -------------------------
+
+
+def play_roles(playbook_path):
+    (play,) = yaml.safe_load(playbook_path.read_text())
+    return play["roles"]
+
+
+def test_the_molecule_converge_applies_the_same_roles_as_site_yml():
+    # molecule/full-tree/converge.yml's own header says it's 1:1 with
+    # playbooks/site.yml. A role added to one and not the other means
+    # the scenario stops testing the thing it exists to test -- in the
+    # same order, since these roles depend on each other's facts.
+    assert play_roles(FULL_TREE / "converge.yml") == play_roles(SITE_PLAYBOOK)
+
+
+def test_the_molecule_fleet_matches_the_scenarios_own_platforms():
+    # stortree_all_hosts is what resolve() treats as the fleet. If a
+    # platform is added to molecule.yml and not here, every host
+    # resolves as though it didn't exist -- no peer dependency on it, no
+    # share of its subtree -- and the scenario passes anyway.
+    molecule = yaml.safe_load((FULL_TREE / "molecule.yml").read_text())
+    (converge,) = yaml.safe_load((FULL_TREE / "converge.yml").read_text())
+
+    real_hosts = [
+        p["name"] for p in molecule["platforms"] if "mocks" not in p.get("groups", [])
+    ]
+    assert converge["vars"]["stortree_all_hosts"] == real_hosts
+    assert converge["hosts"].split(",") == real_hosts
+
+
+def test_the_molecule_verify_targets_the_same_hosts_it_converges():
+    (converge,) = yaml.safe_load((FULL_TREE / "converge.yml").read_text())
+    (verify,) = yaml.safe_load((FULL_TREE / "verify.yml").read_text())
+    assert verify["hosts"] == converge["hosts"]
+
+
+def test_every_role_site_yml_applies_exists_and_has_tasks():
+    for role in play_roles(SITE_PLAYBOOK):
+        assert (REPO_ROOT / "roles" / role / "tasks" / "main.yml").is_file(), role
+        assert (REPO_ROOT / "roles" / role / "meta" / "main.yml").is_file(), role
+
+
+def test_no_role_on_disk_is_silently_never_applied():
+    # A role directory nothing applies is either dead code or a role
+    # someone forgot to wire into site.yml -- both worth noticing.
+    on_disk = {p.name for p in (REPO_ROOT / "roles").iterdir() if p.is_dir()}
+    assert on_disk == set(play_roles(SITE_PLAYBOOK))
+
+
+# -- repo hygiene (docs/plan.md) ------------------------------------------
+
+
+def test_no_real_site_config_is_tracked_in_git():
+    # These hold real hostnames, topology and credentials. .gitignore
+    # covers them; this checks the ignore rules actually held, which
+    # `git add -f` or a rule edit can quietly undo.
+    tracked = subprocess.run(
+        ["git", "ls-files"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    forbidden = {
+        "stortree/config.yml",
+        "stortree/ldap.yml",
+        "stortree/rclone.conf",
+        "stortree/sshd_config",
+        "inventory/hosts.yml",
+    }
+    assert forbidden.isdisjoint(tracked)
+
+
+def test_every_gitignored_site_config_ships_an_example_to_copy():
+    # The setup path in README.md is "copy the .example file" -- which
+    # only works if there is one.
+    for name in ("config.yml", "ldap.yml", "rclone.conf"):
+        assert (REPO_ROOT / "stortree" / f"{name}.example").is_file(), name
+    assert (REPO_ROOT / "inventory" / "hosts.yml.example").is_file()
+
+
+def test_the_example_ldap_config_has_the_keys_sssd_conf_j2_reads():
+    # sssd.conf.j2 dereferences these unconditionally; an example
+    # missing one renders a broken sssd.conf on an operator's first run.
+    ldap = load_yaml("stortree/ldap.yml.example")
+    assert set(ldap["server"]) >= {"url", "base_dn", "bind_dn", "bind_password"}
+    assert set(ldap["posix"]) >= {"uid_attr", "gid_attr"}
