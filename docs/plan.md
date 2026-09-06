@@ -98,6 +98,35 @@ implementation:
    stacking its own real ownership on top exactly as it already stacked
    on the outer mount before the wrapper existed (spec.md §6).
 
+5. **What a key the schema doesn't define should do**, and **what
+   counts as a `samba:` block.** Neither is stated anywhere. Both were
+   resolved the same way — silently ignoring input is the worst
+   available option for this particular program — after finding that
+   `resolve()` read the keys it recognized and discarded everything
+   else. Resolved to: `_validate_node()` in
+   `filter_plugins/stortree.py` rejects any key the schema doesn't
+   define, at the node level and inside `rclone:`/`access:`/`samba:`/
+   `client-defaults:`/`clients:`, naming the node and suggesting the
+   near match (docs/config-schema.md "Unknown keys are an error"). The
+   argument is the failure direction: every typo tested resolved to
+   something plausible and wrong, and several of them wrong in the
+   direction of *more* access or *more* peer trust than was written —
+   a misspelled `client-defaults` re-enables a subtree on every host
+   in the fleet and provisions the SSH trust for it, a misspelled
+   `access.group` drops the grant and leaves the path at its
+   permissive default. Failing at `resolve()` costs a run; the
+   alternative costs a silently wrong deployment nobody looks at
+   again. This subsumes the three-segment dotted key
+   (`rclone.args.vfs-cache-mode:`), which expands to a literal
+   `rclone.args` key under the documented last-dot rule and used to be
+   dropped without trace. `samba:` was then the same question one
+   level down: `_normalize_samba()` treats the key's *presence* as the
+   marker, so bare `samba:`, `samba: {}` and `samba: true` all mean
+   "share with the defaults" and only `samba: false` opts out. All
+   three used to mean the opposite — the first two resolved to no
+   share at all, and `samba: true` crashed `resolve()` outright with an
+   `AttributeError` from inside the share-building loop.
+
 ## Phased build plan
 
 0. Repo skeleton: `.gitignore`, `requirements.txt`/`requirements.yml`,

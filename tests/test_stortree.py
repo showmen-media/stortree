@@ -1639,26 +1639,23 @@ def test_a_node_can_mix_the_dotted_and_nested_rclone_forms():
     assert subtree["args"] == {"vfs-cache-mode": "full"}
 
 
-def test_a_three_segment_dotted_key_is_not_expanded_all_the_way_down():
-    # Current behavior, pinned deliberately: expansion splits on the
-    # *last* dot only (the rule that keeps a literal `.cache.subdirs`
-    # intact, docs/config-schema.md "A dotted-path map key"), so
-    # `rclone.args.vfs-cache-mode:` becomes a key literally named
-    # "rclone.args" -- which nothing ever reads. The arg is silently
-    # dropped, with no error and no mount difference to notice it by.
-    # Every documented shorthand has exactly one dot, so this is outside
-    # the schema; it's pinned here because it's an easy thing to write
-    # by analogy and an invisible thing to get wrong.
+def test_a_three_segment_dotted_key_is_rejected_rather_than_dropped():
+    # Dot expansion splits on the *last* dot only -- the rule that keeps
+    # a literal `.cache.subdirs` intact (docs/config-schema.md "A dotted
+    # -path map key") -- so `rclone.args.vfs-cache-mode:` expands to a
+    # key literally named "rclone.args", which is not in the schema.
+    # That used to be read as "not a key I know" and silently dropped,
+    # losing the arg with no error and no mount difference to notice it
+    # by. Now it names itself.
     tree = {
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
             "rclone.args.vfs-cache-mode": "full",
-            "rclone": {"args": {"dir-cache-time": "5m"}},
         }
     }
-    (subtree,) = resolve(tree, "h1", ["h1"])["server_subtrees"]
-    assert subtree["args"] == {"dir-cache-time": "5m"}
+    with pytest.raises(ValueError, match="unknown key 'rclone.args'"):
+        resolve(tree, "h1", ["h1"])
 
 
 def test_needed_users_covers_a_peer_dependencys_owner_grant():
@@ -1753,22 +1750,44 @@ def test_access_mode_read_write_without_execute_leaves_the_traverse_bit_off():
     assert mode[2] == "6"
 
 
-def test_samba_block_must_be_non_empty_to_export_a_share():
-    # Current behavior, pinned deliberately rather than by accident: a
-    # node whose `samba:` block is empty or bare (`samba:` alone parses
-    # as None) is NOT exported, because _samba_nodes() tests the block
-    # for truthiness rather than presence. docs/config-schema.md says "a
-    # `samba:` block marks a node for export" without saying the block
-    # has to contain anything, so a bare `samba:` meaning "share this
-    # with defaults" is a fair reading of the schema that silently gets
-    # no share. If that reading is the intended one, this is the test to
-    # change -- and _samba_nodes() the one line to change with it.
-    for block in ({}, None):
+def test_a_samba_block_marks_a_node_for_export_however_it_is_written():
+    # Presence, not truthiness. `samba:` written bare parses as None,
+    # and `samba: {}` and `samba: true` are the other two ways to say
+    # "share this with the defaults" -- all three used to mean the
+    # opposite: the first two resolved to no share at all, silently, and
+    # `samba: true` crashed resolve() with an AttributeError from deep
+    # inside the share-building loop.
+    for block in ({}, None, True, {"subpath": "%U"}):
         tree = {"top": {"host": "h1", "rclone.remote": "r:/", "samba": block}}
-        assert resolve(tree, "h1", ["h1", "h2"])["samba_shares"] == []
+        (share,) = resolve(tree, "h1", ["h1", "h2"])["samba_shares"]
+        assert share["node_path"] == "top"
 
-    tree = {"top": {"host": "h1", "rclone.remote": "r:/", "samba": {"subpath": None}}}
-    assert len(resolve(tree, "h1", ["h1", "h2"])["samba_shares"]) == 1
+
+def test_a_node_with_no_samba_key_is_not_exported():
+    tree = {"top": {"host": "h1", "rclone.remote": "r:/"}}
+    assert resolve(tree, "h1", ["h1", "h2"])["samba_shares"] == []
+
+
+def test_samba_false_is_the_one_way_to_opt_a_node_back_out():
+    # The only falsy value that ever plausibly meant "don't share this",
+    # as opposed to "share it with nothing configured".
+    tree = {"top": {"host": "h1", "rclone.remote": "r:/", "samba": False}}
+    assert resolve(tree, "h1", ["h1", "h2"])["samba_shares"] == []
+
+
+def test_a_samba_block_that_is_neither_a_mapping_nor_a_flag_is_rejected():
+    tree = {"top": {"host": "h1", "rclone.remote": "r:/", "samba": "yes"}}
+    with pytest.raises(ValueError, match="`samba` must be a mapping"):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_a_bare_samba_block_shares_the_whole_node_with_no_subpath():
+    # The end-to-end shape of the defaults case: no subpath, so the
+    # share serves the node path itself rather than a %U template.
+    tree = {"top": {"host": "h1", "rclone.remote": "r:/", "samba": None}}
+    (share,) = resolve(tree, "h1", ["h1", "h2"])["samba_shares"]
+    assert share["subpath"] is None
+    assert share["local_path"] == "top"
 
 
 def test_client_opt_out_also_withholds_peer_trust_from_the_serving_side():
@@ -1832,3 +1851,164 @@ def test_user_uids_from_getent_skips_an_entry_the_directory_had_no_answer_for():
     assert user_uids_from_getent(
         {"jd": ["x", "10001", "10001"], "ghost": [""], "null-uid": ["x", None]}
     ) == {"jd": 10001}
+
+
+
+# -- schema validation ----------------------------------------------------
+#
+# Every one of these used to resolve without complaint, into something
+# plausible and wrong. They're grouped by what the typo costs, because
+# that's the argument for validating at all: none of them announce
+# themselves at apply time.
+
+
+def test_a_misspelled_rclone_remote_is_rejected_not_left_unmounted():
+    # Cost: the node resolves with remote None and becomes a plain
+    # directory. The mount never happens, and the share on top of it
+    # serves an empty local path.
+    tree = {"top": {"host": "h1", "rclone": {"remte": "r1:/"}}}
+    with pytest.raises(ValueError, match="unknown `rclone` key 'remte'"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_a_misspelled_client_defaults_is_rejected_not_silently_ignored():
+    # Cost: `client-defaults.rclone: false` is how a subtree is kept off
+    # every non-owning host. Misspell the block and every host in the
+    # fleet peer-mounts it instead -- with the SSH trust to match.
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "client_defaults": {"rclone": False},
+        }
+    }
+    with pytest.raises(ValueError, match="unknown key 'client_defaults'"):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_a_misspelled_access_principal_is_rejected_not_dropped():
+    # Cost: _normalize_access() returns {} for a grant naming neither
+    # `group` nor `owner`, so the restriction vanishes and the path
+    # keeps the permissive default -- the failure direction that matters
+    # for something whose whole job is access control.
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "access": {"gorup": "Media Production", "permissions": "rx"},
+        }
+    }
+    with pytest.raises(ValueError, match="unknown `access` key 'gorup'"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_a_misspelled_subdirs_is_rejected_not_dropped():
+    # Cost: the entire subtree under it disappears from the resolved
+    # tree, on every host.
+    tree = {"top": {"host": "h1", "rclone.remote": "r1:/", "subdir": {"leaf": {}}}}
+    with pytest.raises(ValueError, match="unknown key 'subdir'"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_a_misspelled_samba_subpath_is_rejected():
+    # Cost: the share exports the node root instead of the per-user
+    # subpath, so every connecting user sees everyone else's folder.
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "samba": {"sub-path": "%U"},
+        }
+    }
+    with pytest.raises(ValueError, match="unknown `samba` key 'sub-path'"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_an_unknown_key_inside_a_per_client_override_is_rejected():
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "clients": {"h2": {"rclone": {"arguments": {"dir-cache-time": "5m"}}}},
+        }
+    }
+    with pytest.raises(
+        ValueError, match=r"unknown `clients\.h2\.rclone` key 'arguments'"
+    ):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_an_unknown_key_inside_client_defaults_is_rejected():
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "client-defaults": {"rclone": False, "extra": 1},
+        }
+    }
+    with pytest.raises(ValueError, match="unknown `client-defaults` key 'extra'"):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_validation_reaches_arbitrarily_deep_into_the_tree():
+    # _visit() validates every node it walks, not just top-level ones.
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "a": {"subdirs": {"b": {"user-subdirs": {"c": {"hsot": "h2"}}}}}
+            },
+        }
+    }
+    with pytest.raises(ValueError, match=r"'top/a/b/%U/c' has unknown key 'hsot'"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_an_unknown_key_error_suggests_the_key_it_is_closest_to():
+    # The whole point of failing here rather than at apply time is that
+    # the message says what to fix.
+    tree = {"top": {"host": "h1", "rclone.remote": "r1:/", "sambaa": {}}}
+    with pytest.raises(ValueError, match=r"did you mean 'samba'\?"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_an_unknown_key_with_no_near_match_still_lists_what_is_allowed():
+    tree = {"top": {"host": "h1", "rclone.remote": "r1:/", "zzzzzz": {}}}
+    with pytest.raises(ValueError, match="expected one of: access, client-defaults"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_subdirs_written_as_a_list_names_the_node_it_is_on():
+    # Without the check this surfaces as a bare AttributeError from
+    # inside the walk, with nothing saying which node it came from.
+    tree = {"top": {"host": "h1", "rclone.remote": "r1:/", "subdirs": ["a", "b"]}}
+    with pytest.raises(ValueError, match="`subdirs` must be a mapping, got list"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_a_node_that_is_not_a_mapping_at_all_names_itself():
+    tree = {"top": {"host": "h1", "rclone.remote": "r1:/", "subdirs": {"leaf": 42}}}
+    with pytest.raises(ValueError, match="'top/leaf' must be a mapping"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_an_empty_or_null_node_is_still_perfectly_valid():
+    # `backups: {}` in the worked example, and the `child or {}` path in
+    # _walk_tree for a subdir written with nothing under it.
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {"empty": {}, "null": None},
+        }
+    }
+    paths = {s["path"] for s in resolve(tree, "h1", ["h1"])["server_subtrees"]}
+    assert {"top/empty", "top/null"} <= paths
+
+
+def test_every_key_the_worked_example_uses_passes_validation():
+    # The guard against the whitelist itself being wrong: the schema's
+    # own worked example has to resolve on every host.
+    for host in EXAMPLE_HOSTS:
+        assert resolve(EXAMPLE_TREE, host, EXAMPLE_HOSTS)

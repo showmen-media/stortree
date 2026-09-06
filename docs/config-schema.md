@@ -50,8 +50,11 @@ its own, shaped exactly like any other node below it:
   access: {group: <name>, owner: <name>, permissions: <rwx-string>}  # see Access below
                                # — a single object, all three optional; dotted shorthand
                                # (access.group:/access.owner:/access.permissions:) works too
-  samba:
-    subpath: "<template>"     # e.g. "%U" for per-connecting-user substitution
+  samba:                       # presence marks this node for export — write it bare
+                               # (or `samba: true`/`samba: {}`) to share with the
+                               # defaults, `samba: false` to opt back out
+    subpath: "<template>"     # optional — e.g. "%U" for per-connecting-user
+                               # substitution; omit to share the node itself
                                # — every participating host exposes this node
                                # as a share, not just its resolved owner; see
                                # "Samba sharing is universal" below
@@ -525,7 +528,11 @@ host" for the operator-facing side of this.
 
 ### Samba sharing is universal
 
-A `samba:` block marks a node for export as an SMB share. That export is
+A `samba:` block marks a node for export as an SMB share. It's the key's
+*presence* that marks it, not what's under it: `samba:` written bare,
+`samba: {}` and `samba: true` all mean "share this with the defaults"
+(no `subpath`, so the share serves the node itself). Only an explicit
+`samba: false` opts a node back out. That export is
 not limited to the node's own resolved `host` (or that host's usual peer
 dependencies, spec.md §1) — **every host in the Ansible inventory**
 exposes the share, including a host that owns no subtree of its own and
@@ -539,6 +546,32 @@ restricted to hosts that already serve some other part of the tree.
 There's no "designated Samba host": if a node has a `samba:` block, every
 inventory host — server, client-only, or entirely unnamed in
 `config.yml` — ends up serving it.
+
+### Unknown keys are an error
+
+Every key in a node is either one this schema defines or a mistake, and
+`resolve()` treats it as the latter: an unrecognized key anywhere in the
+tree — at the node level, or inside `rclone:`, `access:`, `samba:`,
+`client-defaults:` or a `clients:` entry — fails the run, naming the node
+it's on and, where there's a near match, the key it's probably meant to
+be.
+
+This matters more here than the usual argument for strictness, because
+the schema has no key whose absence is loud. A misspelled
+`rclone.remote` leaves the node a plain directory and the share on top
+of it serving an empty path; a misspelled `client-defaults` re-enables a
+subtree that was meant to stay off every other host, and provisions the
+SSH trust to go with it; a misspelled `subdirs` drops a whole subtree; a
+misspelled `access.group` drops the grant and leaves the path at its
+permissive default. All four resolve to something plausible, and none of
+them announce themselves at apply time.
+
+One consequence worth knowing: dotted shorthand splits on the *last* dot
+only (see below), so a three-segment key like
+`rclone.args.vfs-cache-mode:` expands to a key literally named
+`rclone.args`, which is not in the schema and is therefore rejected.
+Write it as `rclone.args: {vfs-cache-mode: ...}` or as a nested
+`rclone:` block.
 
 ### A dotted-path map key
 

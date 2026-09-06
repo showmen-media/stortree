@@ -24,6 +24,7 @@ Two Jinja filters are exposed to plays via FilterModule at the bottom:
 from __future__ import annotations
 
 import configparser
+import difflib
 import io
 import re
 
@@ -116,6 +117,101 @@ def _expand_dotted(obj):
     return obj
 
 
+# Every key the schema defines, by the block it belongs to
+# (docs/config-schema.md "Top-level subtrees"). _validate_node() below
+# rejects anything else rather than reading the keys it recognizes and
+# discarding the rest -- which is what used to happen, and which turns
+# an ordinary typo into a silent, wrong-but-plausible resolution: an
+# `rclone.remte:` leaves the node a plain directory with no mount, a
+# `client_defaults:` quietly re-enables a subtree its author meant to
+# keep off every other host (and provisions the SSH trust to go with
+# it), a misspelled `subdirs:` drops a whole subtree, and a misspelled
+# `access.group` drops a grant and leaves the path world-readable.
+# None of those announce themselves at apply time.
+_NODE_KEYS = frozenset(
+    {
+        "host",
+        "rclone",
+        "access",
+        "samba",
+        "requires",
+        "subdirs",
+        "user-subdirs",
+        "client-defaults",
+        "clients",
+    }
+)
+_RCLONE_KEYS = frozenset({"remote", "args"})
+_ACCESS_KEYS = frozenset({"group", "owner", "permissions"})
+_SAMBA_KEYS = frozenset({"subpath"})
+# A client-defaults block, or one entry of `clients`, carries only
+# `rclone` -- either `false` or a `{args: ...}` mapping.
+_CLIENT_BLOCK_KEYS = frozenset({"rclone"})
+_CLIENT_RCLONE_KEYS = frozenset({"args"})
+
+
+def _reject_unknown_keys(mapping, allowed, block, node_path):
+    """Raise on any key of `mapping` the schema doesn't define. A
+    non-mapping is left alone: it's either absent, or a shape error that
+    the block's own normalizer reports better than this can."""
+    if not isinstance(mapping, dict):
+        return
+    unknown = sorted(str(k) for k in mapping if k not in allowed)
+    if not unknown:
+        return
+    where = f"unknown `{block}` key" if block else "unknown key"
+    near = difflib.get_close_matches(unknown[0], sorted(allowed), n=1, cutoff=0.6)
+    hint = f" (did you mean {near[0]!r}?)" if near else ""
+    raise ValueError(
+        f"stortree: {node_path!r} has {where} {unknown[0]!r}{hint} -- expected "
+        f"one of: {', '.join(sorted(allowed))}. See docs/config-schema.md"
+    )
+
+
+def _require_mapping(value, block, node_path):
+    """`subdirs`/`user-subdirs`/`clients` are maps of name -> node. A
+    list there (the shape you get from writing them as a YAML sequence)
+    otherwise surfaces as a bare AttributeError from inside the walk,
+    with nothing naming the node it came from."""
+    if value is not None and not isinstance(value, dict):
+        raise ValueError(
+            f"stortree: {node_path!r}'s `{block}` must be a mapping, got "
+            f"{type(value).__name__} -- see docs/config-schema.md"
+        )
+
+
+def _validate_node(node, node_path):
+    """Reject anything in this node the schema doesn't define, before
+    any of it is read."""
+    if not isinstance(node, dict):
+        raise ValueError(
+            f"stortree: {node_path!r} must be a mapping of node settings, got "
+            f"{type(node).__name__} -- see docs/config-schema.md"
+        )
+    _reject_unknown_keys(node, _NODE_KEYS, "", node_path)
+    _reject_unknown_keys(node.get("rclone"), _RCLONE_KEYS, "rclone", node_path)
+    _reject_unknown_keys(node.get("access"), _ACCESS_KEYS, "access", node_path)
+    _reject_unknown_keys(node.get("samba"), _SAMBA_KEYS, "samba", node_path)
+
+    for block in ("subdirs", "user-subdirs", "clients"):
+        _require_mapping(node.get(block), block, node_path)
+
+    client_blocks = [("client-defaults", node.get("client-defaults"))]
+    client_blocks += [
+        (f"clients.{name}", entry)
+        for name, entry in (node.get("clients") or {}).items()
+    ]
+    for name, entry in client_blocks:
+        _reject_unknown_keys(entry, _CLIENT_BLOCK_KEYS, name, node_path)
+        if isinstance(entry, dict):
+            _reject_unknown_keys(
+                entry.get("rclone"),
+                _CLIENT_RCLONE_KEYS,
+                f"{name}.rclone",
+                node_path,
+            )
+
+
 def _normalize_access(raw):
     """Normalize `access` into a single {group?, owner?, permissions,
     permissions_explicit} dict -- never a list (docs/config-schema.md
@@ -146,6 +242,35 @@ def _normalize_access(raw):
     entry["permissions_explicit"] = "permissions" in entry
     entry.setdefault("permissions", DEFAULT_ACCESS_PERMISSIONS)
     return entry
+
+
+def _normalize_samba(node, node_path):
+    """Normalize a node's `samba` into either None (not shared) or the
+    share's own settings dict (docs/config-schema.md "Samba sharing is
+    universal").
+
+    Presence, not truthiness, is what marks a node for export: `samba:`
+    written bare (which YAML parses as None), `samba: {}`, and
+    `samba: true` all mean "share this with the default settings", and
+    all three used to mean the opposite -- the first two by silently
+    resolving to no share at all, the third by crashing resolve() with
+    an AttributeError further downstream. Only an explicit
+    `samba: false` opts a node back out, which is the one falsy value
+    that ever plausibly meant it."""
+    if "samba" not in node:
+        return None
+    raw = node["samba"]
+    if raw is False:
+        return None
+    if raw is None or raw is True or raw == {}:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"stortree: {node_path!r}'s `samba` must be a mapping of share "
+            f"settings (or bare/true for the defaults, false to opt out), got "
+            f"{raw!r} -- see docs/config-schema.md \"Samba sharing is universal\""
+        )
+    return raw
 
 
 def _normalize_requires(raw, node_path):
@@ -304,12 +429,13 @@ def _walk_tree(tree):
     nodes = []
 
     def _visit(node, path_parts, host, per_user, root_path):
+        path = "/".join(path_parts)
+        _validate_node(node, path)
         h = node.get("host", host)
         r = (node.get("rclone") or {}).get("remote")
         args = (node.get("rclone") or {}).get("args") or {}
         access = _normalize_access(node.get("access"))
-        samba = node.get("samba")
-        path = "/".join(path_parts)
+        samba = _normalize_samba(node, path)
         nodes.append(
             {
                 "path": path,
@@ -414,7 +540,7 @@ def _validate_requires(nodes):
 
 
 def _samba_nodes(nodes):
-    return [n for n in nodes if n.get("samba")]
+    return [n for n in nodes if n["samba"] is not None]
 
 
 def _descendants_of(samba_node, nodes):
@@ -1442,7 +1568,6 @@ class FilterModule(object):
             "stortree_group_members": group_members_from_getent,
             "stortree_group_gids": group_gids_from_getent,
             "stortree_user_uids": user_uids_from_getent,
-            "stortree_access_users": access_grant_usernames,
             "stortree_access_owner": access_owner,
             "stortree_access_group": access_group,
             "stortree_access_mode": access_mode,
