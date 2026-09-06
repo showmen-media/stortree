@@ -46,7 +46,7 @@
           - "== {{ inventory_hostname }} =="
           - "server subtrees owned: {{ stortree.server_subtrees | map(attribute='path') | list }}"
           - "client mount: {{ 'yes' if stortree.client_mounts else 'no' }}"
-          - "samba shares exported: {{ stortree.samba_shares | map(attribute='node_path') | list }}"
+          - "samba shares exported: {{ stortree.samba_shares | map(attribute='name') | list }}"
           - "peer dependencies: {{ stortree.peer_dependencies | length }}"
           - "peer served by: {{ stortree.peer_served_by | map(attribute='serving_host') | unique | list }}"
           - "mount units: {{ stortree_status_mounts.stdout_lines }}"

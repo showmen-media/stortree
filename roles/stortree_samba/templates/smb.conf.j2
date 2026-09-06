@@ -12,7 +12,12 @@ inherit permissions = yes
 passdb backend = tdbsam
 
 {% for share in stortree.samba_shares %}
-[{{ share.node_path | regex_replace('[^A-Za-z0-9_-]', '_') }}]
+{# The section header is the name clients mount. resolve()
+   settles it -- the node's own `samba.name` where it sets one,
+   otherwise its path folded into a legal name -- and rejects two
+   nodes landing on the same one (config-schema.md "Share
+   names"). #}
+[{{ share.name }}]
    path = {{ stortree_root }}/{{ share.node_path }}{{ '/' ~ share.subpath if share.subpath else '' }}
    read only = no
    {# stortree_samba_access_tokens (filter_plugins/stortree.py) quotes

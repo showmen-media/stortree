@@ -477,9 +477,32 @@ def smb_conf(render, resolved):
 
 
 def test_smb_conf_share_name_is_sanitized_from_the_node_path(smb_conf):
-    # "tree/home" isn't a legal share name; the slash has to go.
+    # "tree/home" isn't a legal share name; the slash has to go. The
+    # fold happens in resolve() now, but this is still the name the
+    # worked example's one share ends up exported under.
     assert "[tree_home]" in smb_conf
     assert "[tree/home]" not in smb_conf
+
+
+def test_smb_conf_section_header_is_the_resolved_share_name(render):
+    # `samba.name` reaches the stanza header, and nothing else: the path
+    # is still the node's real one (docs/config-schema.md "Share names").
+    rendered = render(
+        SMB_CONF,
+        stortree={
+            "samba_shares": [
+                {
+                    "node_path": "tree/home",
+                    "name": "home",
+                    "subpath": "%U",
+                    "access": [{"group": "ops", "permissions": "rwx"}],
+                }
+            ]
+        },
+    )
+    assert "[home]" in rendered
+    assert "[tree_home]" not in rendered
+    assert "path = /srv/stortree/tree/home/%U" in rendered
 
 
 def test_smb_conf_share_path_appends_the_subpath_template(smb_conf):
@@ -538,6 +561,7 @@ def test_smb_conf_share_without_a_subpath_uses_the_node_path_bare(render):
             "samba_shares": [
                 {
                     "node_path": "tree/backups",
+                    "name": "tree_backups",
                     "subpath": None,
                     "access": [{"group": "ops", "permissions": "rwx"}],
                 }

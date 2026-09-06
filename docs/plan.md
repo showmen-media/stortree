@@ -127,6 +127,25 @@ implementation:
    share at all, and `samba: true` crashed `resolve()` outright with an
    `AttributeError` from inside the share-building loop.
 
+6. **What a Samba share is called.** spec.md §4 describes the stanza's
+   contents and never names it, and config-schema.md had no key for it
+   — the name was an implementation detail of `smb.conf.j2`, which
+   folded the node path into a section header inline. Resolved to: the
+   fold stays the default (nothing an existing tree exports changes
+   name), an optional `samba.name` overrides it per node, and both now
+   resolve in `_share_name()`/`_normalize_samba()`
+   (`filter_plugins/stortree.py`) so the name is a resolved fact rather
+   than something the template invents — which is also what lets
+   `_validate_share_names()` reject two nodes claiming one name, a
+   collision `smb.conf` otherwise resolves by keeping the first stanza
+   and dropping the second. An operator-set name is validated against
+   the same alphabet the fold produces rather than being sanitized
+   silently (a name is typed into a mount command, so one that wouldn't
+   survive the fold is a mistake, not something to rewrite behind their
+   back), and `global`/`homes`/`printers` are rejected as reserved:
+   `[global]` in particular would merge into the generated global block
+   and rewrite fleet-wide settings instead of adding a share.
+
 ## Phased build plan
 
 0. Repo skeleton: `.gitignore`, `requirements.txt`/`requirements.yml`,

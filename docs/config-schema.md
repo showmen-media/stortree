@@ -58,6 +58,10 @@ its own, shaped exactly like any other node below it:
                                # — every participating host exposes this node
                                # as a share, not just its resolved owner; see
                                # "Samba sharing is universal" below
+    name: "<share-name>"      # optional — the share's name in smb.conf, i.e. what
+                               # clients mount as //<host>/<name>; defaults to the
+                               # node's path with everything outside [A-Za-z0-9_-]
+                               # folded to `_` (`tree/home` → `tree_home`)
   subdirs: {...}               # recurse — this and everything under it works exactly the
                                # same as it does at the top level, just nested
   user-subdirs: {...}          # recurse — see note below
@@ -546,6 +550,40 @@ restricted to hosts that already serve some other part of the tree.
 There's no "designated Samba host": if a node has a `samba:` block, every
 inventory host — server, client-only, or entirely unnamed in
 `config.yml` — ends up serving it.
+
+#### Share names
+
+The share's name — its `smb.conf` section header, and what a client
+mounts as `//<host>/<name>` — is derived from the node's path by default,
+with every character outside `A-Za-z0-9_-` folded to `_`: `tree/home` is
+exported as `tree_home`. `samba.name` overrides that, on the node
+carrying the `samba:` block:
+
+```yaml
+tree:
+  subdirs:
+    home:
+      samba:
+        name: home
+        subpath: "%U"
+```
+
+An explicit name is held to that same alphabet rather than sanitized
+silently — a name is what operators type into a mount command, so a
+`samba.name` that wouldn't survive the fold is a mistake worth reporting
+rather than quietly rewriting — and the three names `smb.conf` gives its
+own meaning (`global`, `homes`, `printers`) are rejected outright: a
+share named `global` would merge into the generated `[global]` block and
+rewrite fleet-wide settings instead of adding a share.
+
+Names have to be unique across the tree, however they were arrived at:
+two nodes landing on one name — two `samba.name`s written the same, or
+two paths folding together (`tree/a b` and `tree/a_b`) — fail the run,
+because `smb.conf` would otherwise keep the first stanza and drop the
+second, leaving part of the tree silently unreachable over SMB. The name
+changes nothing else: the share's path, its `valid users`/`write list`,
+and the peer mounts behind it are all still derived from the node's real
+path.
 
 ### Unknown keys are an error
 

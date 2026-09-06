@@ -412,7 +412,11 @@ since Samba sharing is universal, means every host gets a stanza for
 every such node in the tree, not only the ones whose subtrees it happens
 to own: path, subpath templates (`%U` for the `home` per-user pattern),
 and `valid users`/`write list` derived from the resolved `access` rules
-once those are mapped to real POSIX groups/users (§5, §6). A host
+once those are mapped to real POSIX groups/users (§5, §6). The stanza's
+name is the node's own `samba.name` where it sets one, and otherwise the
+node path folded into a legal share name (`tree/home` → `tree_home`);
+either way `resolve()` settles it, and rejects two nodes claiming the
+same one (config-schema.md "Share names"). A host
 assembles the node's local path the same way whether it's the resolved
 owner or sourcing peer data (§1/§3) — Samba itself never needs to know
 which. Sets `nt acl support = yes` (still lets a Windows client view the

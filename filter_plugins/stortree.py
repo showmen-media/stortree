@@ -143,7 +143,7 @@ _NODE_KEYS = frozenset(
 )
 _RCLONE_KEYS = frozenset({"remote", "args"})
 _ACCESS_KEYS = frozenset({"group", "owner", "permissions"})
-_SAMBA_KEYS = frozenset({"subpath"})
+_SAMBA_KEYS = frozenset({"subpath", "name"})
 # A client-defaults block, or one entry of `clients`, carries only
 # `rclone` -- either `false` or a `{args: ...}` mapping.
 _CLIENT_BLOCK_KEYS = frozenset({"rclone"})
@@ -244,10 +244,51 @@ def _normalize_access(raw):
     return entry
 
 
+# A share name is an smb.conf section header and the name a client
+# mounts (`//host/<name>`), neither of which can carry a path separator
+# -- so a name derived from the node path folds everything outside this
+# alphabet to `_` ("tree/home" -> "tree_home"), and an operator-set
+# `samba.name` is held to the same alphabet rather than sanitized behind
+# their back (docs/config-schema.md "Share names", docs/plan.md "Open
+# interpretation calls" #6).
+_SHARE_NAME_ILLEGAL = re.compile(r"[^A-Za-z0-9_-]")
+# smb.conf sections with a meaning of their own: a share named `global`
+# would merge into the [global] block the template emits above the
+# shares, silently rewriting fleet-wide settings instead of adding a
+# share.
+_RESERVED_SHARE_NAMES = frozenset({"global", "homes", "printers"})
+
+
+def _share_name(raw, node_path):
+    """The share's name in smb.conf: `samba.name` where the node sets
+    one, otherwise the node path folded into a legal name."""
+    if raw is None:
+        return _SHARE_NAME_ILLEGAL.sub("_", node_path)
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(
+            f"stortree: {node_path!r}'s `samba.name` must be a non-empty "
+            f"string, got {raw!r} -- see docs/config-schema.md \"Share names\""
+        )
+    if _SHARE_NAME_ILLEGAL.search(raw):
+        raise ValueError(
+            f"stortree: {node_path!r}'s `samba.name` {raw!r} may contain only "
+            f"letters, digits, `-` and `_` -- it's an smb.conf section header "
+            f"and the name clients mount. See docs/config-schema.md "
+            f"\"Share names\""
+        )
+    if raw.lower() in _RESERVED_SHARE_NAMES:
+        raise ValueError(
+            f"stortree: {node_path!r}'s `samba.name` {raw!r} is a reserved "
+            f"smb.conf section name ({', '.join(sorted(_RESERVED_SHARE_NAMES))}) "
+            f"-- see docs/config-schema.md \"Share names\""
+        )
+    return raw
+
+
 def _normalize_samba(node, node_path):
     """Normalize a node's `samba` into either None (not shared) or the
-    share's own settings dict (docs/config-schema.md "Samba sharing is
-    universal").
+    share's own settings dict, with its resolved share `name` filled in
+    (docs/config-schema.md "Samba sharing is universal").
 
     Presence, not truthiness, is what marks a node for export: `samba:`
     written bare (which YAML parses as None), `samba: {}`, and
@@ -262,15 +303,19 @@ def _normalize_samba(node, node_path):
     raw = node["samba"]
     if raw is False:
         return None
-    if raw is None or raw is True or raw == {}:
-        return {}
+    if raw is None or raw is True:
+        raw = {}
     if not isinstance(raw, dict):
         raise ValueError(
             f"stortree: {node_path!r}'s `samba` must be a mapping of share "
             f"settings (or bare/true for the defaults, false to opt out), got "
             f"{raw!r} -- see docs/config-schema.md \"Samba sharing is universal\""
         )
-    return raw
+    # A copy: the caller's own config dict is not this function's to
+    # write a resolved default back into.
+    samba = dict(raw)
+    samba["name"] = _share_name(samba.get("name"), node_path)
+    return samba
 
 
 def _normalize_requires(raw, node_path):
@@ -543,6 +588,26 @@ def _samba_nodes(nodes):
     return [n for n in nodes if n["samba"] is not None]
 
 
+def _validate_share_names(samba_nodes):
+    """Two shares can't answer to one name: smb.conf keeps the first
+    stanza and drops the second, so half the tree is quietly unreachable
+    over SMB. Reachable both by two `samba.name`s written the same and
+    by two node paths folding onto one derived name (`a/b c` and
+    `a/b_c`), which is why this checks resolved names rather than what
+    the config wrote."""
+    by_name = {}
+    for n in samba_nodes:
+        name = n["samba"]["name"]
+        clash = by_name.get(name)
+        if clash is not None:
+            raise ValueError(
+                f"stortree: {clash!r} and {n['path']!r} both export the Samba "
+                f"share name {name!r} -- set a distinct `samba.name` on one of "
+                f"them. See docs/config-schema.md \"Share names\""
+            )
+        by_name[name] = n["path"]
+
+
 def _descendants_of(samba_node, nodes):
     prefix = samba_node["path"] + "/"
     return [samba_node] + [n for n in nodes if n["path"].startswith(prefix)]
@@ -638,6 +703,7 @@ def resolve(tree, hostname, all_hosts):
     server_subtrees = [n for n in nodes if n["host"] == hostname]
 
     samba_nodes = _samba_nodes(nodes)
+    _validate_share_names(samba_nodes)
     samba_shares = []
     peer_dependencies = []
 
@@ -659,6 +725,7 @@ def resolve(tree, hostname, all_hosts):
             {
                 "node_path": s["path"],
                 "local_path": s["path"],
+                "name": s["samba"]["name"],
                 "subpath": (s.get("samba") or {}).get("subpath"),
                 "access": access_union,
                 "descendants": [

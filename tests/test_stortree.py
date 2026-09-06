@@ -1790,6 +1790,83 @@ def test_a_bare_samba_block_shares_the_whole_node_with_no_subpath():
     assert share["local_path"] == "top"
 
 
+def test_a_share_name_defaults_to_the_node_path_folded_into_a_legal_name():
+    # "tree/home" is not a legal smb.conf section header; the fold is
+    # what the template used to do inline (docs/config-schema.md "Share
+    # names").
+    tree = {"tree": {"host": "h1", "subdirs": {"home": {"samba": None}}}}
+    (share,) = resolve(tree, "h1", ["h1", "h2"])["samba_shares"]
+    assert share["name"] == "tree_home"
+    # The name is the only thing it changes -- the path is still real.
+    assert share["node_path"] == "tree/home"
+
+
+def test_samba_name_overrides_the_derived_share_name():
+    tree = {
+        "tree": {
+            "host": "h1",
+            "subdirs": {"home": {"samba": {"name": "home", "subpath": "%U"}}},
+        }
+    }
+    (share,) = resolve(tree, "h1", ["h1", "h2"])["samba_shares"]
+    assert share["name"] == "home"
+    assert share["node_path"] == "tree/home"
+    assert share["subpath"] == "%U"
+
+
+def test_samba_name_does_not_leak_back_into_the_callers_config():
+    # resolve() fills in a default name; the operator's own dict is not
+    # its to write that into.
+    samba = {"subpath": "%U"}
+    tree = {"top": {"host": "h1", "samba": samba}}
+    resolve(tree, "h1", ["h1", "h2"])
+    assert samba == {"subpath": "%U"}
+
+
+def test_a_samba_name_outside_the_legal_alphabet_is_rejected():
+    # Sanitizing it silently would mean the name an operator typed here
+    # is not the name they have to type into a mount command.
+    tree = {"top": {"host": "h1", "samba": {"name": "home/shared"}}}
+    with pytest.raises(ValueError, match="may contain only"):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_an_empty_or_non_string_samba_name_is_rejected():
+    for name in ("", 7, ["home"]):
+        tree = {"top": {"host": "h1", "samba": {"name": name}}}
+        with pytest.raises(ValueError, match="must be a non-empty string"):
+            resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_a_reserved_smb_conf_section_name_is_rejected():
+    # [global] is the killer: it would merge into the generated global
+    # block and rewrite fleet-wide settings rather than add a share.
+    for name in ("global", "Homes", "printers"):
+        tree = {"top": {"host": "h1", "samba": {"name": name}}}
+        with pytest.raises(ValueError, match="reserved"):
+            resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_two_shares_claiming_one_name_are_rejected():
+    tree = {
+        "a": {"host": "h1", "samba": {"name": "media"}},
+        "b": {"host": "h1", "samba": {"name": "media"}},
+    }
+    with pytest.raises(ValueError, match="both export the Samba share name"):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_two_node_paths_folding_onto_one_name_are_rejected_too():
+    # Reachable without anyone writing a `samba.name` at all: a space
+    # folds to `_`, which the sibling next to it already spells.
+    tree = {
+        "a b": {"host": "h1", "samba": None},
+        "a_b": {"host": "h1", "samba": None},
+    }
+    with pytest.raises(ValueError, match="both export the Samba share name"):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
 def test_client_opt_out_also_withholds_peer_trust_from_the_serving_side():
     # The mirror of test_client_opt_out_beats_universal_samba_sharing,
     # seen from the host that owns the data: if no peer will ever mount
