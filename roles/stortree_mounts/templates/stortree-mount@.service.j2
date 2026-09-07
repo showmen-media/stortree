@@ -56,14 +56,40 @@ Type=notify
 User={{ stortree_user }}
 Group={{ stortree_group }}
 {% set access = entry.access | default({}) %}
-{% set granted = access.owner is defined or access.group is defined %}
 {% set has_nested_children = entry.slug in stortree_mounts_parent_slugs %}
 {% set mount_path = (stortree_root ~ '/' ~ entry.local_path) if entry.local_path else stortree_root %}
 ExecStart=/usr/bin/rclone mount {{ entry.remote }} {{ mount_path }} \
 {% for k, v in entry.args.items() %}
   --{{ k }}{{ ' ' ~ (v | string) if (v is not sameas true) else '' }} \
 {% endfor %}
-{% if granted or has_nested_children %}
+{#
+--allow-other and the two perms flags are unconditional, not gated on
+the entry having an `access` grant of its own: with neither `owner` nor
+`group` granted, stortree_access_mode() returns the same plain 0751
+default an ungranted *local* directory already gets (access_mode() in
+filter_plugins/stortree.py), and the flags below then present exactly
+that -- stortree:stortree 0751, since with no `owner`/`group` to pin
+them, --uid/--gid fall through to the mounting process's own, which is
+unconditionally stortree (User= above). Nothing is widened by this:
+`other` gets the same traversal-only bit, never read, that every
+ungranted path in the tree already carries.
+
+What it does buy is root. Without --allow-other, FUSE restricts a mount
+to the mounting user alone, so root -- Ansible itself on the next
+apply, an operator with a shell -- cannot so much as stat() the
+mountpoint, and rclone's own --allow-root (libfuse's documented way to
+widen a private mount to "mounting user and root") is silently ignored
+by the rclone build this fleet runs ("Ignoring --allow-root. Support
+has been removed upstream"). An ungranted mount was therefore
+*permanently* invisible to root, which stortree_mounts' own probe task
+then reported as a masked mount on every single apply, forever -- see
+docs/runbook.md "A masked mount", which describes masking as the
+transient state it is for a granted mount (one apply re-renders the
+unit, the next sees through it) and could never become for an ungranted
+one. A VFS-cache subtree (docs/config-schema.md's `.bravo-cache`
+pattern) is exactly that case: no grant is meaningful on a cache, so
+before this it masked itself permanently by construction.
+#}
   --allow-other \
   --dir-perms {{ access | stortree_access_mode }} \
   --file-perms {{ access | stortree_access_mode }} \
@@ -76,7 +102,6 @@ ExecStart=/usr/bin/rclone mount {{ entry.remote }} {{ mount_path }} \
   --gid {{ stortree_group_gids[access.group] }} \
 {% elif has_nested_children %}
   --gid {{ stortree_gid }} \
-{% endif %}
 {% endif %}
   --config {{ stortree_etc }}/rclone.conf
 ExecStop=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do mountpoint -q "{{ mount_path }}" || exit 0; /bin/fusermount -uz "{{ mount_path }}" || exit 0; done'

@@ -96,31 +96,45 @@
 # actually visible once mounted is entirely the bound-in target's own
 # enforcement, unaffected by this directory's own ownership once
 # something's mounted over it). A
-# remote-backed node's mount additionally omits --allow-other unless
-# `access` grants an owner and/or group (rendered unconditionally below,
-# from the same three filters, so the two always agree): with neither
-# granted, FUSE restricts a mount to the mounting user (stortree) alone
-# -- no other local process, including root, an SSH session from an
-# LDAP-authenticated user, or Ansible itself on a later apply, can reach
-# it at all. That "including root" is not a theoretical edge case here:
-# rclone's own `--allow-root` (the documented way to widen a private
-# mount to "mounting user and root", the same relationship a plain local
-# directory's default owner/group already gives root implicitly) is
-# silently ignored by the rclone build this fleet runs ("Ignoring
-# --allow-root. Support has been removed upstream", rclone logs this on
-# every mount attempt) -- there is no flag this file can render that
-# gets root into an ungranted mount, ever, and every task below that
-# touches an already-resolved path has to assume that going in: probe
-# whether root can actually reach a remote-backed entry's own
-# mountpoint before touching it (below -- a direct `stat`, not
-# `ansible_facts.mounts`, which silently drops some of this fleet's own
-# mounts from its list regardless of how reachable they are, see the
-# probe task's own comment) rather than let a live one's own
-# EEXIST/permission errors surface as a task failure the way they used
-# to. With a grant,
-# the template instead uid/gid-owns the mount directly (--uid/--gid,
-# --dir-perms, --file-perms from the same mode) and adds --allow-other
-# back -- real kernel-enforced access, checked against whoever's
+# remote-backed node's mount renders --allow-other and --dir-perms/
+# --file-perms unconditionally, from the same three filters as the
+# plain-directory case above, so the two always agree: an *ungranted*
+# mount presents the same stortree:stortree 0751 an ungranted local
+# directory does (--uid/--gid fall through to the mounting process's
+# own, which is unconditionally stortree), a granted one presents its
+# grant. `other` gets the same traversal-only bit either way, never
+# read.
+#
+# That unconditional --allow-other is what keeps root able to reach a
+# mountpoint at all, and it has to come from this flag or nowhere:
+# without it FUSE restricts a mount to the mounting user (stortree)
+# alone -- no other local process, including root, an SSH session from
+# an LDAP-authenticated user, or Ansible itself on a later apply, can
+# reach it -- and rclone's own `--allow-root` (the documented way to
+# widen a private mount to "mounting user and root", the same
+# relationship a plain local directory's default owner/group already
+# gives root implicitly) is silently ignored by the rclone build this
+# fleet runs ("Ignoring --allow-root. Support has been removed
+# upstream", rclone logs this on every mount attempt). An ungranted
+# mount used to be gated the same way a granted one is, which made it
+# permanently unreachable to root by construction -- and a VFS-cache
+# subtree (docs/config-schema.md's `.bravo-cache` pattern) is exactly
+# that shape, since no `access` grant is meaningful on a cache: it
+# masked itself on every apply, forever, with no later apply able to
+# widen a grant that was never meant to exist. A mount can still be
+# masked *transiently* -- a host running a unit rendered before this
+# change keeps its old, private mount until something restarts it (this
+# file's own render/restart tasks, one apply later) -- so every task
+# below that touches an already-resolved path still probes whether root
+# can actually reach a remote-backed entry's own mountpoint before
+# touching it (below -- a direct `stat`, not `ansible_facts.mounts`,
+# which silently drops some of this fleet's own mounts from its list
+# regardless of how reachable they are, see the probe task's own
+# comment) rather than let a live one's own EEXIST/permission errors
+# surface as a task failure the way they used to. With a grant,
+# the template additionally uid/gid-owns the mount directly (--uid/--gid
+# from the grant rather than the mounting account)
+# -- real kernel-enforced access, checked against whoever's
 # actually connecting (smbd included, which runs as the real
 # authenticated user, not a fixed service account, so this is enforced
 # for Samba the same way it is for direct SSH). This is exactly what
@@ -141,19 +155,20 @@
   tags: [mounts]
 
 - name: Allow FUSE mounts to grant access beyond the mounting user
-  # A precondition for --allow-other (a granted mount, `access`
-  # owner/group, rendered below) -- libfuse's own fusermount refuses the
-  # option outright ("fusermount: option allow_other only allowed if
-  # 'user_allow_other' is set in /etc/fuse.conf") from a non-root
-  # mounting process (stortree, always -- User= in the unit template)
-  # without this. Ahead of every other task below -- an already-running
-  # mount that needed it would otherwise have started without it (rclone
-  # doesn't retry a rejected mount option, it just fails outright,
-  # spec.md's "Enable and start every resolved mount" task's own failure
-  # mode) before this file ever got the chance to fix that up. Doesn't
-  # help an *ungranted* mount reach any wider than the mounting user
-  # itself -- see this file's header comment for why --allow-root can't
-  # do for that mount what this does for a granted one's --allow-other.
+  # A precondition for --allow-other, which every mount below now
+  # renders (granted or not, this file's header comment) -- libfuse's
+  # own fusermount refuses the option outright ("fusermount: option
+  # allow_other only allowed if 'user_allow_other' is set in
+  # /etc/fuse.conf") from a non-root mounting process (stortree, always
+  # -- User= in the unit template) without this. Ahead of every other
+  # task below -- an already-running mount that needed it would
+  # otherwise have started without it (rclone doesn't retry a rejected
+  # mount option, it just fails outright, spec.md's "Enable and start
+  # every resolved mount" task's own failure mode) before this file ever
+  # got the chance to fix that up. Now load-bearing for *every* mount
+  # rather than only granted ones, so a host that somehow lost this line
+  # would fail to mount anything at all rather than quietly falling back
+  # to a private mount.
   ansible.builtin.lineinfile:
     path: /etc/fuse.conf
     regexp: '^#?\s*user_allow_other\s*$'
@@ -208,8 +223,10 @@
   # this host's own) -- neither is reliably `stortree` from this host's
   # point of view, and fusermount refuses ("bad mount point ...
   # Permission denied") the moment it isn't. The template forces
-  # --uid/--gid/--allow-other for exactly the mounts in this set, on top
-  # of (never instead of) whatever their own `access` grant already adds.
+  # --uid/--gid for exactly the mounts in this set, on top of (never
+  # instead of) whatever their own `access` grant already pins.
+  # (--allow-other is no longer part of this set's job -- every mount
+  # renders it now, granted or not, this file's header comment.)
   ansible.builtin.set_fact:
     stortree_mounts_parent_slugs: >-
       {{ stortree_mounts_plan
@@ -311,8 +328,9 @@
   # manage this path right now -- without caring how the mount reports
   # its own device string: it fails (`ignore_errors` below is what lets
   # that become a signal instead of aborting the run) exactly when a
-  # mount sits there that this host's root can't reach (an ungranted
-  # mount, this file's header comment; `ansible.builtin.stat`'s own
+  # mount sits there that this host's root can't reach (a mount still
+  # running a unit rendered before --allow-other became unconditional,
+  # this file's header comment; `ansible.builtin.stat`'s own
   # source only treats ENOENT specially -- anything else, permission
   # denied included, surfaces as the task failing outright), while
   # succeeding cleanly (`stat.exists: false`) for a path nothing's ever
@@ -430,8 +448,7 @@
   # underneath a masked ancestor (`stortree_path_masked()`, checked
   # against `stortree_masked_mount_paths`): an already-running,
   # unreachable mount has nothing left for this task to verify or
-  # correct for its own path (an ungranted mount is unreachable to root
-  # permanently, this file's header comment), and root can't create
+  # correct for its own path, and root can't create
   # anything nested inside it either -- attempting either used to fail
   # outright (a masked entry's own path with "Permission denied", or a
   # path nested underneath one with "File exists", Ansible's recursive

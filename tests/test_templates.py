@@ -273,12 +273,20 @@ def test_mount_unit_forces_stortree_ownership_on_a_mount_others_nest_inside(
     assert "--gid 900 \\" in unit  # stortree_gid
 
 
-def test_mount_unit_leaves_an_ungranted_leaf_mount_alone(
+def test_mount_unit_ungranted_leaf_mount_still_presents_the_plain_default(
     render, mount_plans, containers, parent_slugs
 ):
     # The complement of the test above: no grant *and* nothing nested
-    # inside means no --uid/--gid/--allow-other at all, so the mount
-    # just presents whatever its backend reports.
+    # inside still gets --allow-other and the plain 0751 default, so the
+    # mount presents exactly what an ungranted *local* directory does
+    # (stortree:stortree 0751) instead of whatever its backend happens to
+    # report. Without it the mount is private to the mounting user and
+    # permanently invisible to root -- a masked mount on every apply
+    # forever, since no later apply can widen a grant that was never
+    # meant to exist (the template's own comment; docs/spec.md §6).
+    # --uid/--gid stay unrendered here: with nothing to pin them to, the
+    # mounting process's own stortree:stortree is already the answer, and
+    # only a mount others nest inside forces them explicitly.
     entry = dict(
         entry_for(mount_plans[ALPHA], "tree"),
         local_path="tree/backups-mirror",
@@ -291,10 +299,11 @@ def test_mount_unit_leaves_an_ungranted_leaf_mount_alone(
         entry=entry,
         **mount_vars(mount_plans, containers, parent_slugs, ALPHA),
     )
-    assert "--allow-other" not in unit
+    assert "--allow-other \\" in unit
+    assert "--dir-perms 0751 \\" in unit
+    assert "--file-perms 0751 \\" in unit
     assert "--uid" not in unit
     assert "--gid" not in unit
-    assert "--dir-perms" not in unit
 
 
 def test_mount_unit_stop_is_tolerant_of_an_already_gone_mountpoint(

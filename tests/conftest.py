@@ -152,7 +152,8 @@ def containers(resolved, mount_plans):
 def parent_slugs(mount_plans):
     """{hostname: stortree_mounts_parent_slugs} -- the set
     roles/stortree_mounts/tasks/main.yml derives to decide which mounts
-    must force --uid/--gid/--allow-other regardless of their own grant."""
+    must force --uid/--gid regardless of their own grant (--allow-other
+    is unconditional for every mount)."""
     return {
         h: sorted({e["requires_slug"] for e in plan if e["requires_slug"]})
         for h, plan in mount_plans.items()

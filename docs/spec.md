@@ -545,29 +545,45 @@ differently-scoped descendant grant.
 For a plain local directory, that's `ansible.builtin.file`'s
 `owner`/`group`/`mode` — real, standard Unix ownership, no `acl` package
 needed at all. For a remote-backed node, `stortree_mounts` renders the
-same three values into the rclone unit instead: with neither `owner` nor
-`group` granted, the unit omits `--allow-other`, so FUSE restricts the
-mount to the mounting user (`stortree`) alone — no SSH session or local
-process reaches it, root included, and nothing overrides that for Samba
-either (`smbd` still runs as the real authenticated user, unchanged from
-stock behavior). Root's exclusion here isn't a gap to close: rclone's
-own `--allow-root` (libfuse's documented way to widen a private mount to
-"the mounting user and root") is silently ignored by the rclone build
-this fleet runs ("Ignoring --allow-root. Support has been removed
-upstream", logged on every mount attempt) — there is no flag that gets
-root into an ungranted mount, full stop, so `stortree_common` and
-`stortree_mounts` both treat that as permanent: neither ever tries to
-manage a path once a direct probe shows root can't reach it (a `stat`,
-not `ansible_facts.mounts` — Ansible's own mount-fact gathering silently
-drops any mount whose device string doesn't happen to contain "/",
-which some of this fleet's own rclone mounts hit in practice), rather
-than assume root access it structurally cannot have.
-`--allow-other` (the granted-mount case just below) additionally
+same three values into the rclone unit instead, and renders
+`--allow-other`/`--dir-perms`/`--file-perms` for *every* mount rather
+than only granted ones: with neither `owner` nor `group` granted, the
+mount presents exactly what an ungranted local directory already does —
+`stortree:stortree` `0751`, since `--uid`/`--gid` have nothing to pin
+them to and fall through to the mounting process's own, which is
+unconditionally `stortree`. `other` gets the same traversal-only bit
+there that it gets everywhere else, never read, so nothing is world-
+readable that wasn't before; what the flag buys is root.
+
+Omitting `--allow-other` is what used to cost it. FUSE then restricts
+the mount to the mounting user alone — no SSH session or local process
+reaches it, root included — and rclone's own `--allow-root` (libfuse's
+documented way to widen a private mount to "the mounting user and
+root") is silently ignored by the rclone build this fleet runs
+("Ignoring --allow-root. Support has been removed upstream", logged on
+every mount attempt), so there is no *narrower* flag that gets root in.
+An ungranted mount was therefore unreachable to root permanently, by
+construction — and a VFS-cache subtree (docs/config-schema.md's
+`.bravo-cache`) is exactly that shape, since no `access` grant is
+meaningful on a cache: it reported itself as a masked mount on every
+single apply, forever, with no later apply able to widen a grant that
+was never meant to exist.
+
+Masking is now only ever transient — a host keeps whatever unit it was
+last started with, so a mount rendered before this stays private until
+something restarts it, one apply later. `stortree_common` and
+`stortree_mounts` both still handle it the same way meanwhile: neither
+tries to manage a path once a direct probe shows root can't reach it (a
+`stat`, not `ansible_facts.mounts` — Ansible's own mount-fact gathering
+silently drops any mount whose device string doesn't happen to contain
+"/", which some of this fleet's own rclone mounts hit in practice),
+rather than assume root access it doesn't currently have.
+`--allow-other` additionally
 requires `user_allow_other` in `/etc/fuse.conf` (`stortree_mounts`
 ensures it's set before rendering or restarting any unit) — libfuse
 refuses the option outright from a non-root mounting process without it.
 With `owner` and/or `group` granted, the
-unit instead adds `--allow-other` back and uid/gid-owns the mount
+unit additionally uid/gid-owns the mount
 directly (`--uid`/`--gid`, resolved from the same `getent passwd`/`getent
 group` lookups `stortree_secrets` already runs for %U-expansion below —
 `stortree_user_uids`/`stortree_group_gids` read the numeric id out of the
@@ -575,9 +591,10 @@ same merged lookup data instead of the name/member list — merged from
 each looped `getent` call's own result via `stortree_merge_getent()`,
 not from `ansible_facts.getent_passwd`/`getent_group` directly, since
 Ansible's own fact-merge behavior replaces rather than accumulates a
-module's returned facts across loop iterations) and `--dir-perms`/
-`--file-perms` (both set to the same
-mode `access_mode()` computed). Real, kernel-enforced access, checked
+module's returned facts across loop iterations), on top of the
+`--dir-perms`/`--file-perms` every mount already carries — both set to
+the same mode `access_mode()` computed, which is the grant's own here
+rather than the plain default. Real, kernel-enforced access, checked
 against whoever is actually connecting — Samba included, since Samba
 still operates as that real user throughout. `mw-fam` in the running
 example (`access.group`) is exactly this case.

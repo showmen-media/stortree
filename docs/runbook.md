@@ -95,7 +95,19 @@ A top-level subtree's own mount can end up active but unreachable to
 root -- e.g. after upgrading to a `stortree-mount@.service.j2` that
 changed access flags, a host that already had that mount active from
 before the upgrade keeps running the old, more restrictive unit until
-something restarts it. `stortree_mounts` detects this itself (a direct
+something restarts it. That upgrade window is the *only* way to get
+here now: every mount renders `--allow-other` since the change that
+made it unconditional (docs/spec.md §6), so a live mount is reachable
+to root whether or not it carries an `access` grant. Before that, a
+grantless mount -- a VFS-cache subtree especially, where no grant is
+ever meaningful -- masked itself permanently and reported it on every
+single apply; if you are staring at a `Permission denied` probe line
+that has survived many applies in a row, check that the host's
+`/etc/systemd/system/stortree-mount@<slug>.service` actually has
+`--allow-other` in its `ExecStart` and that the running process picked
+it up (`systemctl show -p ExecStart stortree-mount@<slug>.service`
+against `ps`), rather than assuming the mount is transiently masked.
+`stortree_mounts` detects masking itself (a direct
 `stat` probe against every remote-backed entry's own mountpoint, not
 `ansible_facts.mounts`) and skips every task that would otherwise try to
 touch that path or anything nested under it, rather than fail outright
