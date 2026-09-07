@@ -102,11 +102,14 @@ filter directly:
   `access` rules. A node with no `rclone.remote` of its own resolves with
   no remote at all — it's a plain directory that has to exist, not a
   separate rclone mount; §2 covers what that means for mount planning.
-- **Client mounts** — one per top-level subtree in `config.yml` (every
-  key at the file's own top level, config-schema.md "Top-level
+- **Client mounts** — normally one per top-level subtree in `config.yml`
+  (every key at the file's own top level, config-schema.md "Top-level
   subtrees") that this host doesn't own: a peer-sftp mount sourced from
   the host that actually owns it (that subtree's own `host:`) rather
-  than the subtree's own third-party `rclone.remote`. This is the same
+  than the subtree's own third-party `rclone.remote`. Where a subtree is
+  opted out for this host but something inside it isn't, the mount lands
+  on the nodes inside it instead — see the nested `client-defaults`/
+  `clients` rule below. This is the same
   peer-sourcing rule §1 already applies to any samba descendant a host
   doesn't own, just generalized to every top-level subtree instead of
   being funneled through one shared tree root — there's no single
@@ -126,7 +129,19 @@ filter directly:
   host by default — out of mounting it at all (config-schema.md
   "Per-client mount opt-out"); this is the mechanism a subtree with no
   business being visible past its own owning host (e.g. a per-host
-  VFS-cache backing store) uses to stay local-only. A subtree with no
+  VFS-cache backing store) uses to stay local-only. Both keys are
+  ordinary node keys rather than a top-level-subtree privilege: a node
+  at any depth can carry its own, refining (or reversing) what its
+  ancestors set for that host, for itself and everything under it
+  (config-schema.md "At any depth"). Where every ancestor of a node is
+  opted out and the node itself isn't, there's no ancestor mount left to
+  reach it through, so the client mount lands at that node's own path,
+  peer-sourced from its own resolved owner — the shallowest enabled node
+  of each branch, which for a tree that writes these keys only at the
+  top level is always the top-level subtree itself, exactly as before.
+  Either kind of block may also carry an `access` object, replacing the
+  node's own grant on every host that only holds a copy of it
+  (config-schema.md "Client-side access", §6). A subtree with no
   `rclone.remote` of its own has nothing to peer for — the client still
   gets its local directory created, just no mount and no peer dependency
   for it. Unlike a samba peer dependency, this one implies no Samba
@@ -225,9 +240,14 @@ rather than tree inheritance:
 - **Client-mount role**: `client-defaults.rclone.args` sets the defaults
   applied to every peer that mounts this host's remote, then
   `clients.<host>.rclone.args` merges its own overrides on top for that
-  specific peer. This is the one intentional merge chain, exactly two
-  levels deep (defaults, then a single per-client override) — later
-  entries win on key conflicts.
+  specific peer. This is the one intentional merge chain — later entries
+  win on key conflicts — and the one place args accumulate down the tree
+  rather than being read off a single node: a `client-defaults`/`clients`
+  block on a nested node contributes on top of whatever its ancestors'
+  blocks already set for that host, nearest and most specific winning
+  (config-schema.md "At any depth"). It stays a client-side merge chain
+  and nothing more; a node's own `rclone.args`, below, are untouched by
+  it.
 - **Server role**: a subdir node's `rclone.remote`/`rclone.args` are used
   exactly as set on that node, full stop — never merged with, substituted
   from, or inherited from any ancestor or descendant subdir's `rclone`. A
@@ -510,6 +530,15 @@ ever given a list). A plain local node (no `rclone.remote` of its own)
 gets the same treatment for a simpler reason: consistency, not
 necessity — it could carry a real POSIX ACL, but there's no reason for
 its enforcement to work differently from a remote-backed sibling's.
+
+A node's own `access` is what its owning host enforces, and it's what
+every other host enforces on its own copy too, unless a
+`client-defaults`/`clients` block on that node (or an ancestor) hands
+that host a different grant to apply instead — one `access` object in,
+one out, nothing below this point can tell which of the two it came from
+(config-schema.md "Client-side access"; `resolve()` settles it, and the
+Samba share's own `valid users`/`write list` deliberately stay on the
+node's tree-wide grant either way).
 
 `stortree_mounts` applies `access` directly, for every resolved path —
 mount point or plain directory alike — via three pure filters
@@ -829,9 +858,10 @@ tree:
 
 Every host that doesn't own every top-level subtree in `config.yml` is
 the *serving* side of at least one peer dependency unconditionally now —
-its own top-level-subtree client mounts (§1), one per top-level subtree
-it doesn't own and isn't opted out of (config-schema.md "Per-client mount
-opt-out") — so this provisions on every `ansible-playbook` run for the
+its own client mounts (§1), one per top-level subtree it doesn't own and
+isn't opted out of — or, where a nested `client-defaults`/`clients` block
+opts something back in below an opted-out subtree, one per such node
+(config-schema.md "Per-client mount opt-out") — so this provisions on every `ansible-playbook` run for the
 whole fleet, not only where a `samba:` block is in play. Because Samba
 sharing is universal
 (§1) on top of that, the set of hosts needing this provisioned can extend

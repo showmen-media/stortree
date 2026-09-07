@@ -144,9 +144,12 @@ _NODE_KEYS = frozenset(
 _RCLONE_KEYS = frozenset({"remote", "args"})
 _ACCESS_KEYS = frozenset({"group", "owner", "permissions"})
 _SAMBA_KEYS = frozenset({"subpath", "name"})
-# A client-defaults block, or one entry of `clients`, carries only
-# `rclone` -- either `false` or a `{args: ...}` mapping.
-_CLIENT_BLOCK_KEYS = frozenset({"rclone"})
+# A client-defaults block, or one entry of `clients`, carries `rclone`
+# (either `false` or a `{args: ...}` mapping) and/or `access` (the same
+# {group?, owner?, permissions?} object a node itself takes, replacing
+# the node's own grant for this client's copy -- docs/config-schema.md
+# "Client-side access").
+_CLIENT_BLOCK_KEYS = frozenset({"rclone", "access"})
 _CLIENT_RCLONE_KEYS = frozenset({"args"})
 
 
@@ -210,6 +213,15 @@ def _validate_node(node, node_path):
                 f"{name}.rclone",
                 node_path,
             )
+            # A client block's `access` is the same object a node's own
+            # `access` is, held to the same keys -- a typo here drops a
+            # client-side grant exactly as silently as one on the node.
+            _reject_unknown_keys(
+                entry.get("access"),
+                _ACCESS_KEYS,
+                f"{name}.access",
+                node_path,
+            )
 
 
 def _normalize_access(raw):
@@ -231,10 +243,11 @@ def _normalize_access(raw):
     nested underneath this node still reachable, see access_mode())."""
     if raw is None:
         raw = {}
-    if isinstance(raw, list):
+    if not isinstance(raw, dict):
+        kind = "a list" if isinstance(raw, list) else f"{raw!r}"
         raise ValueError(
             "access must be a single object ({group?, owner?, permissions?}), "
-            "not a list -- see docs/config-schema.md \"Access\""
+            f"not {kind} -- see docs/config-schema.md \"Access\""
         )
     entry = dict(raw)
     if not (entry.get("group") or entry.get("owner")):
@@ -451,19 +464,37 @@ def _walk_tree(tree):
     top-level subtree's mount up first, unlike when everything hung off
     one shared root).
 
-    Returns (roots, nodes). `roots` is one entry per top-level subtree:
-    {path, host, remote, node} (`node` is that subtree's own raw dict --
-    resolve() reads its client-defaults/clients straight off it).
-    `nodes` is a flat list of every node in the whole forest, top-level
-    entries included (unlike the old single root, a top-level entry
-    *is* an ordinary mountable node now -- see resolve()) -- each also
-    carries `root_path`, the top-level entry it's nested under, so
-    resolve() can look up the right root's client-defaults/clients for
-    an arbitrarily-deep descendant (e.g. a samba share several levels
-    under a top-level subtree). `host` inherits down the tree; `rclone`
-    -- both `remote` and `args` -- never inherits (spec.md §1): a node
-    with no `rclone.remote` of its own resolves to `remote: None`,
-    regardless of what any ancestor sets.
+    Returns (roots, nodes, client_chains, children). `roots` is the
+    path of each top-level subtree, in config order (each is also an
+    ordinary entry in `nodes`). `nodes` is a flat list of
+    every node in the whole forest, top-level entries included (unlike
+    the old single root, a top-level entry *is* an ordinary mountable
+    node now -- see resolve()) -- each also carries `root_path`, the
+    top-level entry it's nested under. `host` inherits down the tree;
+    `rclone` -- both `remote` and `args` -- never inherits (spec.md §1):
+    a node with no `rclone.remote` of its own resolves to
+    `remote: None`, regardless of what any ancestor sets.
+
+    `children` is {path: [child path, ...]} -- the tree's own shape,
+    kept explicitly rather than re-derived from path prefixes downstream,
+    since a `user-subdirs` child sits two path segments below its parent
+    (the `%U` placeholder, then its own name) while a `subdirs` child
+    sits one, so "how many `/` deeper" doesn't tell them apart.
+
+    `client_chains` is {path: [client block, ...]} -- for every node,
+    the `client-defaults`/`clients` blocks found on it and on each of
+    its ancestors, ordered shallowest-first, which is what
+    _client_policy() below resolves into one host's effective policy for
+    that node. A chain rather than a single block because
+    `client-defaults`/`clients` apply at any depth, not only on the
+    top-level subtree (docs/config-schema.md "Per-client mount
+    opt-out"): a nested node's own block refines whatever its ancestors
+    set for the same host, and a node that sets none of its own just
+    inherits its nearest ancestor's policy unchanged -- which is exactly
+    what every node used to get from its top-level subtree, back when
+    that was the only level read at all. Only nodes that actually carry
+    a block contribute an entry, so the common chain is short (usually
+    one, often none).
 
     A node that resolves with `remote: None` isn't a separate mounted
     subtree -- see docs/config-schema.md "Node inheritance" for what that
@@ -472,10 +503,18 @@ def _walk_tree(tree):
     """
     roots = []
     nodes = []
+    client_chains = {}
+    children = {}
 
-    def _visit(node, path_parts, host, per_user, root_path):
+    def _visit(node, path_parts, host, per_user, root_path, client_chain, parent_path):
         path = "/".join(path_parts)
         _validate_node(node, path)
+        children[path] = []
+        if parent_path is not None:
+            children[parent_path].append(path)
+        if "client-defaults" in node or "clients" in node:
+            client_chain = client_chain + [node]
+        client_chains[path] = client_chain
         h = node.get("host", host)
         r = (node.get("rclone") or {}).get("remote")
         args = (node.get("rclone") or {}).get("args") or {}
@@ -495,7 +534,15 @@ def _walk_tree(tree):
             }
         )
         for name, child in (node.get("subdirs") or {}).items():
-            _visit(child or {}, path_parts + [name], h, per_user, root_path)
+            _visit(
+                child or {},
+                path_parts + [name],
+                h,
+                per_user,
+                root_path,
+                client_chain,
+                path,
+            )
         for name, child in (node.get("user-subdirs") or {}).items():
             _visit(
                 child or {},
@@ -503,21 +550,15 @@ def _walk_tree(tree):
                 h,
                 True,
                 root_path,
+                client_chain,
+                path,
             )
 
     for name, root_node in tree.items():
-        root_node = root_node or {}
-        roots.append(
-            {
-                "path": name,
-                "host": root_node.get("host"),
-                "remote": (root_node.get("rclone") or {}).get("remote"),
-                "node": root_node,
-            }
-        )
-        _visit(root_node, [name], None, False, name)
+        _visit(root_node or {}, [name], None, False, name, [], None)
+        roots.append(name)
 
-    return roots, nodes
+    return roots, nodes, client_chains, children
 
 
 def _validate_requires(nodes):
@@ -668,24 +709,68 @@ def _rclone_args(setting):
     return dict(setting.get("args") or {}) if isinstance(setting, dict) else {}
 
 
-def _root_client_policy(root_node, hostname):
-    """(enabled, args) describing how `hostname` -- when it doesn't own
-    this top-level subtree -- peer-mounts it, from the subtree's own
-    `client-defaults`/`clients.<hostname>` (docs/config-schema.md
-    "Per-client mount opt-out"). An explicit `clients.<hostname>.rclone`
-    always wins over `client-defaults.rclone`: an allow-list when
-    defaults are disabled (only explicitly-truthy clients mount it), a
-    deny-list otherwise (every non-owning host mounts it except the ones
-    explicitly disabled). With neither set anywhere, every non-owning
-    host mounts it -- unchanged from before this existed. `args` merges
-    client-defaults under the per-client override, same precedence as
-    always."""
-    defaults_setting = _rclone_setting(root_node.get("client-defaults"))
-    client_setting = _rclone_setting((root_node.get("clients") or {}).get(hostname))
-    effective = client_setting if client_setting is not _UNSET else defaults_setting
-    enabled = effective is not False
-    args = _deep_merge(_rclone_args(defaults_setting), _rclone_args(client_setting))
-    return enabled, args
+def _client_policy(chain, hostname):
+    """(enabled, args, access) describing how `hostname` -- when it
+    doesn't own this node -- gets its own copy of it, resolved from
+    `chain`: every `client-defaults`/`clients` block on the node and its
+    ancestors, shallowest-first (_walk_tree()'s `client_chains`).
+
+    Two axes of precedence, and they compose the same way at every level
+    (docs/config-schema.md "Per-client mount opt-out"):
+
+    - Within one node, an explicit `clients.<hostname>` beats that same
+      node's `client-defaults`.
+    - Across nodes, a nearer (deeper) node beats a more distant ancestor
+      -- which is what lets a subdirectory refine, or reverse, whatever
+      its top-level subtree set for the same host. A node with no block
+      of its own contributes nothing and simply inherits, so a tree that
+      only ever writes `client-defaults`/`clients` on its top-level
+      subtrees resolves exactly as it did when that was the only level
+      read at all.
+
+    `enabled` follows the nearest explicit `rclone` setting found under
+    those two rules -- an allow-list where the inherited default is
+    disabled (only explicitly-truthy entries mount it), a deny-list
+    where it isn't (everyone mounts it but the explicitly disabled).
+    "Explicitly truthy" includes an args-bearing `rclone: {args: {...}}`
+    with no boolean in sight, at any level: writing client-side mount
+    args for a node is taken to mean clients are meant to have it, the
+    same reading that makes the one-node allow-list idiom
+    (`client-defaults.rclone: false` plus `clients.<h>.rclone.args`)
+    work at all.
+
+    `args` merges the other way round -- every level contributes, and
+    the ones that win conflicts are the nearest and the most specific:
+    client-defaults first, then `clients.<hostname>`, shallowest node to
+    deepest.
+
+    `access` does *not* merge: the nearest, most specific block that
+    sets one replaces the node's own grant wholesale for this host's
+    copy (docs/config-schema.md "Client-side access"), rather than
+    layering a partial override over it -- half a grant is not a grant,
+    and an `access` that inherited a `group` from one place and
+    `permissions` from another would be hard to read off the config at
+    all. `_UNSET` when no block in the chain sets one, which is the
+    signal to keep the node's own `access` untouched (as against an
+    explicit `access:` with nothing in it, which deliberately drops the
+    node's grant on this host)."""
+    enabled = True
+    args = {}
+    access = _UNSET
+    for node in chain:
+        defaults = node.get("client-defaults")
+        entry = (node.get("clients") or {}).get(hostname)
+        defaults_setting = _rclone_setting(defaults)
+        client_setting = _rclone_setting(entry)
+        effective = client_setting if client_setting is not _UNSET else defaults_setting
+        if effective is not _UNSET:
+            enabled = effective is not False
+        _deep_merge(args, _rclone_args(defaults_setting))
+        _deep_merge(args, _rclone_args(client_setting))
+        for container in (defaults, entry):
+            if isinstance(container, dict) and "access" in container:
+                access = container["access"]
+    return enabled, args, access
 
 
 def resolve(tree, hostname, all_hosts):
@@ -695,12 +780,57 @@ def resolve(tree, hostname, all_hosts):
     as a full participant -- config-schema.md "Every inventory host
     participates")."""
     tree = _expand_dotted(tree)
-    roots, nodes = _walk_tree(tree)
-    roots_by_path = {r["path"]: r for r in roots}
+    roots, nodes, client_chains, children = _walk_tree(tree)
     _validate_requires(nodes)
     requires_by_path = {n["path"]: n["requires"] for n in nodes}
+    nodes_by_path = {n["path"]: n for n in nodes}
 
     server_subtrees = [n for n in nodes if n["host"] == hostname]
+
+    def _client_mount_targets(root_path, host):
+        """Every node under top-level subtree `root_path` that `host`
+        client-mounts in its own right, as (node, args, access) --
+        normally just the subtree itself, exactly as when `roots` were
+        the only level a client policy could be written at.
+
+        The subtree's own node comes first and, when its policy is
+        enabled, it is the only one: one peer-sftp mount of the owning
+        host's copy already presents everything nested inside it, so
+        nothing below it needs (or could be given) a separate mount of
+        its own -- and by the same token a `rclone: false` written on a
+        node *underneath* an enabled ancestor can't carve a hole out of
+        that ancestor's mount. It only governs the mounts that node gets
+        in its own right, which here means none.
+
+        The descent is what a disabled ancestor makes meaningful: with
+        the subtree itself opted out for this host, each of its children
+        is asked the same question independently, so a single node deep
+        in an otherwise host-local subtree can be handed to a client on
+        its own (`client-defaults.rclone: false` at the top,
+        `clients.<host>.rclone` on just that node -- the allow-list
+        idiom, one level down). Two nodes are never descended into:
+        one this host already owns (it serves that subtree itself,
+        rather than mounting anyone's copy of it -- same rule the
+        top-level loop always applied) and a `user-subdirs` node,
+        whose path is still `%U`-templated and fans out into one mount
+        per granted user rather than the single mount a client_mounts
+        entry describes; a per-user node reaches a non-owning host
+        through the Samba peer-dependency path instead, which resolves
+        that fan-out (plan_mounts()).
+        """
+        targets = []
+        stack = [root_path]
+        while stack:
+            path = stack.pop(0)
+            node = nodes_by_path[path]
+            if node["host"] == host or node["per_user"]:
+                continue
+            enabled, args, access = _client_policy(client_chains[path], host)
+            if enabled:
+                targets.append((node, args, access))
+                continue
+            stack.extend(children[path])
+        return targets
 
     samba_nodes = _samba_nodes(nodes)
     _validate_share_names(samba_nodes)
@@ -709,7 +839,6 @@ def resolve(tree, hostname, all_hosts):
 
     for s in samba_nodes:
         descendants = _descendants_of(s, nodes)
-        root_node = (roots_by_path.get(s["root_path"]) or {}).get("node") or {}
 
         # Each descendant carries at most one access grant now (never a
         # list, see _normalize_access()) -- the union across descendants
@@ -744,7 +873,14 @@ def resolve(tree, hostname, all_hosts):
 
         for d in descendants:
             if d["host"] != hostname and _has_own_content(d, nodes):
-                enabled, args = _root_client_policy(root_node, hostname)
+                # The descendant's own chain, not just its top-level
+                # subtree's: a `client-defaults`/`clients` block written
+                # on an intermediate node -- or on this descendant
+                # itself -- governs this host's copy of exactly this
+                # path, without touching its siblings (_client_policy()).
+                enabled, args, access = _client_policy(
+                    client_chains[d["path"]], hostname
+                )
                 if not enabled:
                     continue
                 peer_dependencies.append(
@@ -754,7 +890,19 @@ def resolve(tree, hostname, all_hosts):
                         "remote_path": d["path"],
                         "samba_node": s["path"],
                         "per_user": d["per_user"],
-                        "access": d["access"],
+                        # A client-side `access` replaces the node's own
+                        # for this host's copy only -- the enforcement
+                        # this host actually applies to it (rclone's
+                        # --uid/--gid/--dir-perms, and the directory's
+                        # own ownership/mode where it isn't a mount).
+                        # The share's own `valid users` above is
+                        # deliberately left alone: it stays the node's
+                        # tree-wide grant, identical on every host.
+                        "access": (
+                            d["access"]
+                            if access is _UNSET
+                            else _normalize_access(access)
+                        ),
                         "args": args,
                         # The node's own declared dependency, not the
                         # owning host's business: a peer mounts the same
@@ -776,41 +924,69 @@ def resolve(tree, hostname, all_hosts):
     # `clients.<hostname>.rclone` (docs/config-schema.md "Per-client
     # mount opt-out") can suppress this entirely for a subtree that has
     # no business being visible outside its own owning host.
+    #
+    # A path the Samba loop above already peer-sources needs no client
+    # mount of its own: it's the same mount, of the same path, from the
+    # same owning host, resolved through the same client policy -- and
+    # planning it twice is a hard error downstream (plan_mounts() sees
+    # two entries claiming one systemd unit slug). Reachable without any
+    # nested client block at all, by a top-level subtree that carries
+    # `samba:` itself and has no children to delegate its content to
+    # (_has_own_content()); the descent below just widens the ways in.
+    # The Samba entry is the one to keep: identical args, and it carries
+    # the node's own `access` grant rather than only what a client block
+    # granted.
+    samba_sourced_paths = {p["local_path"] for p in peer_dependencies}
+
     client_mounts = []
-    for root in roots:
-        if hostname == root["host"]:
-            continue
-        enabled, args = _root_client_policy(root["node"], hostname)
-        if not enabled:
-            continue
-        client_remote = None
-        if root["remote"]:
-            peer_dependencies.append(
+    for root_path in roots:
+        for node, args, access in _client_mount_targets(root_path, hostname):
+            path = node["path"]
+            if path in samba_sourced_paths:
+                continue
+            # `{}` rather than the node's own `access` when no client
+            # block sets one: a client mount has never carried the
+            # node's tree-wide grant (it's the owning host that enforces
+            # that, and a peer mount of its copy reports whatever that
+            # host already applied), and a client policy that says
+            # nothing about access shouldn't start.
+            access = {} if access is _UNSET else _normalize_access(access)
+            client_remote = None
+            if node["remote"]:
+                peer_dependencies.append(
+                    {
+                        "owning_host": node["host"],
+                        "local_path": path,
+                        "remote_path": path,
+                        "samba_node": None,
+                        "per_user": False,
+                        "access": access,
+                        "args": args,
+                        "requires": requires_by_path.get(path, []),
+                    }
+                )
+                client_remote = _peer_remote_ref(node["host"], path, path)
+            # A node's `requires` applies wherever it's mounted, its
+            # non-owning clients included -- which is the case that
+            # motivated the key at all: the cache-dir a *client* points
+            # into another subtree's mount belongs to that client's own
+            # mount of this subtree, and only the client resolves both
+            # ends of it.
+            client_mounts.append(
                 {
-                    "owning_host": root["host"],
-                    "local_path": root["path"],
-                    "remote_path": root["path"],
-                    "samba_node": None,
-                    "per_user": False,
-                    "access": [],
+                    "local_path": path,
+                    "remote": client_remote,
                     "args": args,
-                    "requires": requires_by_path.get(root["path"], []),
+                    # This host's own copy carries whatever the client
+                    # policy grants it, and nothing otherwise
+                    # (docs/config-schema.md "Client-side access") --
+                    # the enforcement this host applies to its own copy:
+                    # rclone's --uid/--gid/--dir-perms/--file-perms here,
+                    # since a client mount always has a remote.
+                    "access": access,
+                    "requires": requires_by_path.get(path, []),
                 }
             )
-            client_remote = _peer_remote_ref(root["host"], root["path"], root["path"])
-        # A top-level subtree's `requires` applies wherever it's mounted,
-        # its non-owning clients included -- which is the case that
-        # motivated the key at all: the cache-dir a *client* points into
-        # another subtree's mount belongs to that client's own mount of
-        # this subtree, and only the client resolves both ends of it.
-        client_mounts.append(
-            {
-                "local_path": root["path"],
-                "remote": client_remote,
-                "args": args,
-                "requires": requires_by_path.get(root["path"], []),
-            }
-        )
 
     peer_dependencies = _dedupe(
         peer_dependencies, lambda p: (p["owning_host"], p["local_path"])
@@ -820,23 +996,30 @@ def resolve(tree, hostname, all_hosts):
     for other in all_hosts:
         if other == hostname:
             continue
-        for root in roots:
-            if hostname == root["host"] and root["remote"]:
-                enabled, _args = _root_client_policy(root["node"], other)
-                if enabled:
+        # The mirror of the two loops above, asked from the other side:
+        # whatever `other` would client-mount or peer-source from this
+        # host is what this host has to serve it -- resolved through the
+        # same _client_mount_targets()/_client_policy() this host used
+        # for its own copy, so a nested opt-out (or opt-in) is honored
+        # identically at both ends and the sftp trust provisioned by
+        # stortree_peer_trust matches the mounts that actually get made.
+        for root_path in roots:
+            for node, _args, _access in _client_mount_targets(root_path, other):
+                if node["host"] == hostname and node["remote"]:
                     peer_served_by.append(
                         {
                             "serving_host": other,
-                            "local_path": root["path"],
+                            "local_path": node["path"],
                             "samba_node": None,
                             "per_user": False,
                         }
                     )
         for s in samba_nodes:
-            root_node = (roots_by_path.get(s["root_path"]) or {}).get("node") or {}
             for d in _descendants_of(s, nodes):
                 if d["host"] == hostname and _has_own_content(d, nodes):
-                    enabled, _args = _root_client_policy(root_node, other)
+                    enabled, _args, _access = _client_policy(
+                        client_chains[d["path"]], other
+                    )
                     if enabled:
                         peer_served_by.append(
                             {
@@ -1129,22 +1312,24 @@ def needed_groups(resolved):
     `group_gids_from_getent()`'s result can gid-own a remote-backed
     node's mount (spec.md §6) -- covers every node, not just per-user
     ones, since a plain shared (non-%U) node can be gid-owned by its
-    `access.group` too, same as a per-user one. Covers both
-    `server_subtrees` (this host's own nodes) and `peer_dependencies` (a
-    samba descendant sourced from a peer, or the root client mount --
-    which never carries `access`, so contributes nothing here) -- the two
-    are computed once, together, by `stortree_facts` so every later role
-    (`stortree_mounts`, `stortree_secrets`) shares one lookup and one
-    consistent group_members/group_gids map, rather than each
-    recomputing its own scope of it (and risking one missing a scope the
-    others cover)."""
+    `access.group` too, same as a per-user one. Covers all three scopes
+    a resolved `access` can turn up in: `server_subtrees` (this host's
+    own nodes), `peer_dependencies` (a samba descendant sourced from a
+    peer) and `client_mounts` (this host's own copy of a subtree it
+    doesn't own -- which carries a grant only when a `client-defaults`/
+    `clients.<hostname>` block gave it one, docs/config-schema.md
+    "Client-side access"). All computed once, together, by
+    `stortree_facts` so every later role (`stortree_mounts`,
+    `stortree_secrets`) shares one lookup and one consistent
+    group_members/group_gids map, rather than each recomputing its own
+    scope of it (and risking one missing a scope the others cover)."""
     groups = set()
-    for n in resolved.get("server_subtrees", []):
-        g = (n.get("access") or {}).get("group")
-        if g:
-            groups.add(g)
-    for p in resolved.get("peer_dependencies", []):
-        g = (p.get("access") or {}).get("group")
+    for entry in (
+        resolved.get("server_subtrees", [])
+        + resolved.get("peer_dependencies", [])
+        + resolved.get("client_mounts", [])
+    ):
+        g = (entry.get("access") or {}).get("group")
         if g:
             groups.add(g)
     return sorted(groups)
@@ -1164,12 +1349,12 @@ def needed_users(resolved, group_members=None):
     own first use in stortree_secrets, ahead of the `getent group`
     lookup that produces `group_members` in the first place)."""
     users = set()
-    for n in resolved.get("server_subtrees", []):
-        u = (n.get("access") or {}).get("owner")
-        if u:
-            users.add(u)
-    for p in resolved.get("peer_dependencies", []):
-        u = (p.get("access") or {}).get("owner")
+    for entry in (
+        resolved.get("server_subtrees", [])
+        + resolved.get("peer_dependencies", [])
+        + resolved.get("client_mounts", [])
+    ):
+        u = (entry.get("access") or {}).get("owner")
         if u:
             users.add(u)
     if group_members is not None:
@@ -1415,7 +1600,11 @@ def plan_mounts(resolved, group_members=None):
                 "local_path": m["local_path"],
                 "remote": m["remote"],
                 "args": m["args"],
-                "access": {},
+                # Whatever this host's own client policy granted for its
+                # copy, `{}` (the plain ungranted default) otherwise --
+                # never per-user, so there's no %U fan-out to resolve
+                # here the way the two loops below have to.
+                "access": m.get("access") or {},
                 "requires": m.get("requires") or [],
             }
         )
