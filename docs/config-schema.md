@@ -849,7 +849,31 @@ nothing to translate between the two. Lives on the control node as the
 master copy with every remote's credentials, encrypted at rest with
 `ansible-vault` (`ansible-vault encrypt stortree/rclone.conf`) the same
 way as `ldap.yml`. A host only ever receives the filtered sections it's
-resolved to need (see spec.md §3), never the whole file.
+resolved to need (see spec.md §3), never the whole file. "Resolved to
+need" means the remotes that host *mounts with itself*: the ones behind
+subtrees it owns, plus any a `clients:` block hands it directly. A remote
+behind a subtree it doesn't own never reaches it, even though it exports
+that subtree over Samba — it peer-sources the owning host instead.
+
+### Peer section names
+
+Alongside the filtered real sections, each host's rendered `rclone.conf`
+gets one synthesized `sftp` section per peer dependency, named
+`peer-<owning host>-<path with "/" replaced by "-">` — e.g.
+`[peer-storage-node-alpha-tree-home-jd-sys-configs]`. Nothing in
+`config.yml` sets these names; they're derived, and they're what a mount
+unit's `ExecStart` references, so they're worth recognizing when reading
+a rendered file.
+
+Because that flattening is lossy, two entries can in principle land on
+one name — a hostname containing `-`, or a path segment containing one,
+can reconstruct another entry's name. Where both belong to the *same*
+owning host that's harmless (the section carries only that host's
+address and key, and each mount's real path travels in its own
+`remote:path` reference). Where they belong to *different* hosts it
+would silently point one mount at the wrong machine, so rendering the
+host's `rclone.conf` fails outright and names both paths — rename one of
+them, the same remedy as a duplicate `samba.name` (see "Share names").
 
 ```ini
 [storagebox]

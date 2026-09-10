@@ -2013,11 +2013,32 @@ def test_slug_encoding_is_injective_so_no_two_paths_can_collide():
     assert _slug("a\\x2db") != _slug("a-b")
 
 
-def test_slug_of_the_tree_root_is_the_reserved_root_name():
-    # A root-level client mount's local_path is the empty string, which
-    # can't be a systemd instance name.
-    assert _slug("") == "root"
+def test_slug_of_a_single_segment_path_is_that_segment():
     assert _slug("tree") == "tree"
+
+
+def test_no_resolved_path_is_ever_empty():
+    # _slug(), _peer_section_name() and _peer_remote_ref() all used to
+    # carry a special case for `local_path == ""` -- the one shared tree
+    # root's own client mount, back when a single root existed. Every
+    # path now starts at a named top-level subtree (_walk_tree()), so
+    # there is no empty path left to special-case. This is the guard on
+    # that: reintroduce one and the removed branches become live again,
+    # silently, as a systemd instance name and an INI section name that
+    # are both just their prefix.
+    members = {
+        "Whitfield Family & Friends": ["jd", "mw"],
+        "Michael Whitfield Family": ["mw"],
+        "Media Production": ["jd"],
+    }
+    for host in EXAMPLE_HOSTS:
+        resolved = resolve(EXAMPLE_TREE, host, EXAMPLE_HOSTS)
+        for scope in ("server_subtrees", "client_mounts", "peer_dependencies"):
+            for entry in resolved[scope]:
+                assert entry.get("path") or entry.get("local_path"), (host, scope)
+        for entry in plan_mounts(resolved, members):
+            assert entry["local_path"], (host, entry)
+            assert entry["slug"], (host, entry)
 
 
 def test_a_node_can_mix_the_dotted_and_nested_rclone_forms():
@@ -2105,6 +2126,164 @@ def test_filter_rclone_conf_ignores_entries_with_no_remote_at_all():
     out = filter_rclone_conf(conf, resolved)
     assert "[only]" not in out
     assert out.strip() == ""
+
+
+def test_filter_rclone_conf_never_ships_a_samba_descendants_third_party_remote():
+    # Samba sharing is universal, so `samba_shares` names every share in
+    # the whole tree on every host -- descendants included, owned by
+    # whoever. Reading remotes out of it hands each host the credentials
+    # for every remote referenced anywhere under a share: nodes it
+    # doesn't own, doesn't peer, and here has been explicitly opted out
+    # of. spec.md §3 promises the opposite ("other remotes stay off it
+    # entirely"), and h3 below is exactly its worked example -- a host
+    # with no subtree of its own at all.
+    tree = {
+        "tree": {
+            "host": "h1",
+            "samba": {},
+            "subdirs": {
+                "private": {
+                    "host": "h2",
+                    "rclone.remote": "secret-remote:/",
+                    "client-defaults": {"rclone": False},
+                }
+            },
+        }
+    }
+    conf = "[secret-remote]\ntype = sftp\nuser = u\npass = s3cret\n"
+    fleet = ["h1", "h2", "h3"]
+
+    # h2 owns it, so it keeps the credentials it actually mounts with.
+    assert "[secret-remote]" in filter_rclone_conf(conf, resolve(tree, "h2", fleet))
+    # h1 owns the share but not this descendant; h3 owns nothing at all.
+    # Both are opted out of mounting it, so neither has any use for it.
+    for host in ("h1", "h3"):
+        out = filter_rclone_conf(conf, resolve(tree, host, fleet))
+        assert "[secret-remote]" not in out, host
+        assert "s3cret" not in out, host
+
+
+def test_filter_rclone_conf_keeps_a_remote_for_a_samba_node_this_host_owns():
+    # The other side of the rule above: dropping `samba_shares` from the
+    # scan must not cost a host a section it really does mount, which it
+    # doesn't -- resolve() puts every node this host owns in
+    # `server_subtrees`, whether or not it also carries `samba:`.
+    tree = {
+        "tree": {
+            "host": "h1",
+            "samba": {},
+            "rclone.remote": "mine:/",
+            "subdirs": {
+                "sub": {"host": "h1", "rclone.remote": "mine-nested:/", "samba": {}}
+            },
+        }
+    }
+    conf = "[mine]\ntype = sftp\n\n[mine-nested]\ntype = sftp\n"
+    out = filter_rclone_conf(conf, resolve(tree, "h1", ["h1", "h2"]))
+    assert "[mine]" in out
+    assert "[mine-nested]" in out
+
+
+def test_filter_rclone_conf_rejects_two_hosts_claiming_one_peer_section():
+    # `peer-<host>-<flattened path>` is readable rather than injectively
+    # escaped (an rclone remote name can't hold _slug()'s \\xHH escapes),
+    # so two entries can land on one name. Same-host collisions are
+    # harmless -- see _check_peer_section_clash() -- but two *different*
+    # owning hosts on one name means the second write replaces the
+    # first's address, and a mount silently sources its data from the
+    # wrong machine. Here "storage" + "node/alpha/tree" and
+    # "storage-node-alpha" + "tree" both flatten to
+    # peer-storage-node-alpha-tree.
+    resolved = {
+        "server_subtrees": [],
+        "client_mounts": [],
+        "samba_shares": [],
+        "peer_dependencies": [
+            {
+                "owning_host": "storage",
+                "local_path": "node/alpha/tree",
+                "remote_path": "node/alpha/tree",
+                "per_user": False,
+            },
+            {
+                "owning_host": "storage-node-alpha",
+                "local_path": "tree",
+                "remote_path": "tree",
+                "per_user": False,
+            },
+        ],
+    }
+    with pytest.raises(ValueError) as excinfo:
+        filter_rclone_conf("", resolved)
+    message = str(excinfo.value)
+    assert "peer-storage-node-alpha-tree" in message
+    assert "node/alpha/tree" in message
+    assert "rename one of them" in message
+
+
+def test_filter_rclone_conf_allows_one_host_claiming_a_section_twice():
+    # The same collision within a single owning host is not an error: the
+    # section body is a function of the owning host alone (its address,
+    # user, key file), and each mount carries its own real path in its
+    # `remote:path` reference rather than in the section. Rejecting this
+    # would fail a config that works.
+    resolved = {
+        "server_subtrees": [],
+        "client_mounts": [],
+        "samba_shares": [],
+        "peer_dependencies": [
+            {
+                "owning_host": "h1",
+                "local_path": "a/b",
+                "remote_path": "a/b",
+                "per_user": False,
+            },
+            {
+                "owning_host": "h1",
+                "local_path": "a-b",
+                "remote_path": "a-b",
+                "per_user": False,
+            },
+        ],
+    }
+    out = filter_rclone_conf("", resolved, {"h1": {"ansible_host": "10.0.0.1"}})
+    assert out.count("[peer-h1-a-b]") == 1
+    assert "host = 10.0.0.1" in out
+
+
+def test_an_overridden_stortree_root_reaches_every_generated_path():
+    # stortree_root is a role variable an operator can override; it ends
+    # up baked into a peer mount's `remote:path` reference and into a
+    # synthesized section's own `path`. Hardcoding it in the plugin meant
+    # an override produced silently wrong paths in exactly the artifacts
+    # nobody watches being generated.
+    # No `samba:` here: a samba node is peer-sourced by the share loop
+    # instead, which deliberately suppresses the separate client mount.
+    tree = {"tree": {"host": "h1", "rclone.remote": "r:/"}}
+    resolved = resolve(tree, "h2", ["h1", "h2"], "/data/stortree")
+    (client,) = resolved["client_mounts"]
+    assert client["remote"] == "peer-h1-tree:/data/stortree/tree"
+
+    (entry,) = [e for e in plan_mounts(resolved, {}, "/data/stortree") if e["remote"]]
+    assert entry["remote"] == "peer-h1-tree:/data/stortree/tree"
+
+    out = filter_rclone_conf("", resolved, {}, {}, "/data/stortree", "/opt/st")
+    assert "path = /data/stortree/tree" in out
+    assert "key_file = /opt/st/peer_ssh_key" in out
+    assert "/srv/stortree" not in out
+
+
+def test_the_path_defaults_still_apply_when_no_root_is_passed():
+    # Every existing caller that passes neither keeps the documented
+    # /srv/stortree and /etc/stortree, so the new arguments are additive.
+    # No `samba:` here: a samba node is peer-sourced by the share loop
+    # instead, which deliberately suppresses the separate client mount.
+    tree = {"tree": {"host": "h1", "rclone.remote": "r:/"}}
+    resolved = resolve(tree, "h2", ["h1", "h2"])
+    assert resolved["client_mounts"][0]["remote"] == "peer-h1-tree:/srv/stortree/tree"
+    out = filter_rclone_conf("", resolved)
+    assert "path = /srv/stortree/tree" in out
+    assert "key_file = /etc/stortree/peer_ssh_key" in out
 
 
 def test_filter_rclone_conf_drops_a_per_user_peer_nobody_is_granted():

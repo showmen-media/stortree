@@ -1,4 +1,17 @@
 ---
+# The fixed mount root on every managed host -- every path in the
+# resolved tree hangs off this one. It lives here, rather than with the
+# service account in roles/stortree_common/defaults/main.yml, because
+# stortree_resolve() below needs it (a client mount of a subtree this
+# host doesn't own resolves to a peer reference with the owning host's
+# absolute path baked in) and stortree_facts is the one role every play
+# applies -- playbooks/status.yml applies it alone, where another role's
+# defaults would not be in scope. Overriding it in inventory/group_vars
+# beats this either way; kept in step with
+# filter_plugins/stortree.py's own DEFAULT_STORTREE_ROOT fallback by a
+# drift guard in tests/test_repo_consistency.py.
+stortree_root: /srv/stortree
+
 # Paths on the control node, relative to the playbook. Override if your
 # stortree/ checkout lives somewhere else (spec.md "Config layout").
 stortree_repo_root: "{{ playbook_dir }}/.."

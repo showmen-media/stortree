@@ -57,7 +57,7 @@ User={{ stortree_user }}
 Group={{ stortree_group }}
 {% set access = entry.access | default({}) %}
 {% set has_nested_children = entry.slug in stortree_mounts_parent_slugs %}
-{% set mount_path = (stortree_root ~ '/' ~ entry.local_path) if entry.local_path else stortree_root %}
+{% set mount_path = stortree_root ~ '/' ~ entry.local_path %}
 ExecStart=/usr/bin/rclone mount {{ entry.remote }} {{ mount_path }} \
 {% for k, v in entry.args.items() %}
   --{{ k }}{{ ' ' ~ (v | string) if (v is not sameas true) else '' }} \

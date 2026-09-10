@@ -1,5 +1,10 @@
 ---
-stortree_root: /srv/stortree
+# `stortree_root` is deliberately NOT here: it lives in
+# roles/stortree_facts/defaults/main.yml, because stortree_resolve()
+# itself needs it and playbooks/status.yml applies stortree_facts with
+# no other role in the play, where this file's defaults aren't in scope.
+# Every play applies stortree_facts, so one definition there reaches
+# everything; the reverse isn't true.
 stortree_etc: /etc/stortree
 stortree_home: /home/stortree
 stortree_user: stortree

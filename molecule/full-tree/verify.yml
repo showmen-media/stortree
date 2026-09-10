@@ -33,7 +33,9 @@
       # docs/config-schema.md "Node inheritance") has none to check.
       ansible.builtin.command:  # noqa: command-instead-of-module
         cmd: systemctl is-active "stortree-mount@{{ item.slug }}.service"
-      loop: "{{ stortree | stortree_plan_mounts({}) | selectattr('remote') | list }}"
+      loop: >-
+        {{ stortree | stortree_plan_mounts({}, stortree_root)
+           | selectattr('remote') | list }}
       loop_control:
         label: "{{ item.local_path or '(root)' }}"
       changed_when: false

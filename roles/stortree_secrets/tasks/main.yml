@@ -98,7 +98,8 @@
   ansible.builtin.copy:
     content: >-
       {{ lookup('file', stortree_rclone_conf_path)
-         | stortree_filter_rclone_conf(stortree, hostvars, stortree_group_members) }}
+         | stortree_filter_rclone_conf(stortree, hostvars, stortree_group_members,
+                                       stortree_root, stortree_etc) }}
     dest: "{{ stortree_etc }}/rclone.conf"
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"

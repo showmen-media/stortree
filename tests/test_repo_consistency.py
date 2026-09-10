@@ -10,9 +10,11 @@ resolves a different tree than the playbook it claims to mirror.
 
 Also here: the repo-hygiene rule from docs/plan.md that no real config
 ever gets committed, which is worth a test precisely because it's the
-kind of mistake you only make once.
+kind of mistake you only make once, and the handful of paths the filter
+plugin has to spell the same way the roles do.
 """
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -20,7 +22,13 @@ import pytest
 import yaml
 
 from conftest import EXAMPLE_HOSTS, REPO_ROOT
-from filter_plugins.stortree import plan_mounts, resolve
+from filter_plugins.stortree import (
+    DEFAULT_STORTREE_ETC,
+    DEFAULT_STORTREE_ROOT,
+    PEER_SSH_KEY_NAME,
+    plan_mounts,
+    resolve,
+)
 
 # The three copies of docs/config-schema.md's worked example: what the
 # unit tests resolve, what an operator copies to start from, and what
@@ -181,3 +189,68 @@ def test_the_example_ldap_config_has_the_keys_sssd_conf_j2_reads():
     ldap = load_yaml("stortree/ldap.yml.example")
     assert set(ldap["server"]) >= {"url", "base_dn", "bind_dn", "bind_password"}
     assert set(ldap["posix"]) >= {"uid_attr", "gid_attr"}
+
+
+# -- filter-plugin fallbacks vs. the role defaults they mirror -------------
+
+
+def role_defaults(role):
+    return load_yaml(Path("roles") / role / "defaults" / "main.yml")
+
+
+def test_the_plugins_path_fallbacks_match_the_role_defaults():
+    # The roles pass `stortree_root`/`stortree_etc` into stortree_resolve,
+    # stortree_plan_mounts and stortree_filter_rclone_conf, so an override
+    # reaches every generated path. These module-level constants are only
+    # the fallback for a call that passes neither -- every unit test here,
+    # and any use of the module outside a play. If they drift from the
+    # role defaults, the tests assert one set of paths while a real run
+    # produces another, which is exactly the gap that makes a fallback
+    # worth having a guard on at all.
+    assert role_defaults("stortree_facts")["stortree_root"] == DEFAULT_STORTREE_ROOT
+    assert role_defaults("stortree_common")["stortree_etc"] == DEFAULT_STORTREE_ETC
+
+
+def test_stortree_root_has_exactly_one_definition():
+    # It lives in stortree_facts, not stortree_common, because
+    # playbooks/status.yml applies stortree_facts with no other role in
+    # the play -- see that defaults file's own comment. Defining it in
+    # both would work by accident (the values agree) right up until one
+    # of them was edited.
+    defining = [
+        role.name
+        for role in sorted((REPO_ROOT / "roles").iterdir())
+        if role.is_dir()
+        and (role / "defaults" / "main.yml").is_file()
+        and "stortree_root" in (role_defaults(role.name) or {})
+    ]
+    assert defining == ["stortree_facts"]
+
+
+def test_every_play_that_resolves_the_tree_applies_stortree_facts():
+    # The single definition above only reaches everything because
+    # stortree_facts is in every play. A play that resolved the tree
+    # without it would hit an undefined `stortree_root` at the first
+    # stortree_resolve call.
+    playbooks = [SITE_PLAYBOOK, REPO_ROOT / "playbooks/status.yml"]
+    playbooks += sorted((REPO_ROOT / "roles").glob("*/molecule/*/converge.yml"))
+    playbooks += sorted((REPO_ROOT / "molecule").glob("*/converge.yml"))
+    for playbook in playbooks:
+        roles = play_roles(playbook)
+        assert roles[0] == "stortree_facts", playbook
+
+
+def test_the_peer_ssh_key_name_matches_what_stortree_peer_trust_writes():
+    # filter_rclone_conf() writes `key_file = {stortree_etc}/{name}` into
+    # every synthesized sftp section; stortree_peer_trust is what actually
+    # creates the keypair at that path. A rename on either side alone
+    # leaves every peer mount authenticating with a key file that isn't
+    # there.
+    tasks = (
+        REPO_ROOT / "roles" / "stortree_peer_trust" / "tasks" / "main.yml"
+    ).read_text()
+    referenced = {
+        name.removesuffix(".pub")
+        for name in re.findall(r"\{\{ stortree_etc \}\}/([\w.]+)", tasks)
+    }
+    assert referenced == {PEER_SSH_KEY_NAME}

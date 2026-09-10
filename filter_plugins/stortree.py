@@ -7,18 +7,22 @@ docs/spec.md §1 for the design this implements, and docs/plan.md
 "Open interpretation calls" for the handful of judgment calls made where
 the spec leaves something implicit.
 
-Two Jinja filters are exposed to plays via FilterModule at the bottom:
+Everything here is exposed to plays as a Jinja filter via FilterModule at
+the bottom (see that mapping for the full list, and
+tests/test_filters.py, which checks it against what the roles actually
+pipe through). The two entry points the rest build on:
 
 - stortree_resolve(tree, hostname, all_hosts) -- everything a given host
-  must do: server subtrees it owns, its client mount of the tree root
-  (if any -- peer-sourced from the resolved root host, not the root's
-  own third-party remote), every Samba share in the tree (Samba sharing
-  is universal), and its peer dependencies/peer_served_by for cross-host
-  sourcing.
+  must do: server subtrees it owns, its own client mount of each
+  top-level subtree it doesn't own (peer-sourced from that subtree's
+  owning host, not from the subtree's own third-party remote), every
+  Samba share in the tree (Samba sharing is universal), and its peer
+  dependencies/peer_served_by for cross-host sourcing.
 - stortree_filter_rclone_conf(rclone_conf_text, resolved, hostvars) --
-  the master rclone.conf INI filtered down to only the sections a host's
-  resolved facts actually reference, plus synthesized sftp sections for
-  its peer dependencies.
+  the master rclone.conf INI filtered down to only the sections this host
+  mounts with itself, plus synthesized sftp sections for its peer
+  dependencies. Everything else -- including remotes behind Samba shares
+  it exports but doesn't own -- stays off the host entirely (spec.md §3).
 """
 
 from __future__ import annotations
@@ -67,9 +71,28 @@ SHARED_MOUNT_SEGMENT = ".mounts"
 # apart from real per-user segment names.
 STORTREE_USER_PREFIX = "stortree-user-"
 
-# Convention used by stortree_peer_trust/stortree_secrets: where a
-# serving host's SSH keypair for peer sftp mounts lives.
-PEER_SSH_KEY_PATH = "/etc/stortree/peer_ssh_key"
+# Fallbacks for the two paths the roles own as overridable variables:
+# `stortree_root` (roles/stortree_facts/defaults/main.yml), the mount
+# root every resolved path hangs off, and `stortree_etc`
+# (roles/stortree_common/defaults/main.yml), the per-host state
+# directory. Both reach this module as arguments -- `resolve()`,
+# `plan_mounts()` and `filter_rclone_conf()` each take the one(s) they
+# need, and the roles pass the live variable -- because both end up
+# baked into strings that leave this module for good: an absolute path
+# inside a peer mount's own `remote:path` reference, and the `key_file`
+# of a synthesized sftp section. Hardcoding them here instead would mean
+# an operator who overrode either default got a silently wrong path in
+# exactly the artifacts they can't see being generated. These constants
+# are only the defaults for a direct call that doesn't pass one (the
+# tests, and any use outside a running play); a drift guard in
+# tests/test_repo_consistency.py holds them to the role defaults they
+# mirror.
+DEFAULT_STORTREE_ROOT = "/srv/stortree"
+DEFAULT_STORTREE_ETC = "/etc/stortree"
+
+# Convention used by stortree_peer_trust/stortree_secrets: the name of a
+# serving host's SSH keypair for peer sftp mounts, inside `stortree_etc`.
+PEER_SSH_KEY_NAME = "peer_ssh_key"
 
 
 def _deep_merge(dst, src):
@@ -773,12 +796,18 @@ def _client_policy(chain, hostname):
     return enabled, args, access
 
 
-def resolve(tree, hostname, all_hosts):
+def resolve(tree, hostname, all_hosts, stortree_root=DEFAULT_STORTREE_ROOT):
     """Resolve everything host `hostname` must do, given the parsed
     contents of config.yml (`tree`) and the full inventory host list
     (`all_hosts`, so a host with no mention in config.yml still resolves
     as a full participant -- config-schema.md "Every inventory host
-    participates")."""
+    participates").
+
+    `stortree_root` is the fleet's mount root (the role variable of the
+    same name). It's needed here, rather than only where mounts are
+    rendered, because a client mount of a subtree this host doesn't own
+    resolves to a peer `remote:path` reference with the owning host's
+    absolute path already baked into it (_peer_remote_ref())."""
     tree = _expand_dotted(tree)
     roots, nodes, client_chains, children = _walk_tree(tree)
     _validate_requires(nodes)
@@ -965,7 +994,9 @@ def resolve(tree, hostname, all_hosts):
                         "requires": requires_by_path.get(path, []),
                     }
                 )
-                client_remote = _peer_remote_ref(node["host"], path, path)
+                client_remote = _peer_remote_ref(
+                    node["host"], path, path, stortree_root
+                )
             # A node's `requires` applies wherever it's mounted, its
             # non-owning clients included -- which is the case that
             # motivated the key at all: the cache-dir a *client* points
@@ -1049,14 +1080,65 @@ def _remote_section(remote_spec):
 
 
 def _peer_section_name(owning_host, local_path):
-    # Empty local_path is the tree root's own reserved slug (matches
-    # _slug()'s "root" convention below) -- the one peer dependency that
-    # isn't a nodes() descendant, synthesized for client_mounts instead.
-    slug = local_path.replace("/", "-").replace("%", "pct") or "root"
+    """The rclone.conf section name for one peer sftp mount.
+
+    Deliberately *not* `_slug()`'s injective escaping, even though this
+    flattens paths the same lossy way `_slug()` was fixed for (nested
+    `a/b` and a literal segment `a-b` both land on `a-b`, and the
+    `peer-<host>-<path>` join is ambiguous the same way when a hostname
+    contains "-"): an rclone remote name may only hold letters, digits,
+    `_`, `-`, `.` and space, so the `\\xHH` escapes `_slug()` uses aren't
+    available here, and the readable alternatives all mangle every name
+    in the common case. This string is one an operator reads directly out
+    of a rendered rclone.conf when a peer mount misbehaves, so it stays
+    readable and the residual ambiguity is *detected* instead -- see
+    _check_peer_section_clash(), and plan_mounts()' own uniqueness check
+    for the same trade made once already on systemd unit slugs."""
+    slug = local_path.replace("/", "-").replace("%", "pct")
     return f"peer-{owning_host}-{slug}"
 
 
-def _peer_remote_ref(owning_host, local_path, remote_path):
+def _check_peer_section_clash(claimed, section_name, peer, local_path):
+    """Raise if `section_name` is already claimed by a peer dependency on
+    a *different* owning host (`claimed` maps section name -> (owning
+    host, local path) for everything written so far).
+
+    Only a cross-host clash is an error. Everything in a synthesized
+    section except its `path` -- type, host address, user, key_file,
+    shell_type -- is a function of the owning host alone, so two paths on
+    the *same* host collapsing onto one section name write identical
+    credentials and both mounts still work: each one's real path rides on
+    its own `remote:path` reference (_peer_remote_ref()), never on the
+    section, whose `path` key rclone's sftp backend ignores outright
+    (rclone issue #4307) and which is only there as documentation. Two
+    *different* hosts landing on one name is the real failure: the second
+    write silently replaces the first's address, and a mount that should
+    have gone to one machine quietly sources its data from another. Fail
+    the render instead, naming both paths, exactly as plan_mounts() does
+    for a systemd slug collision."""
+    clash = claimed.get(section_name)
+    if clash is None or clash[0] == peer["owning_host"]:
+        return
+    raise ValueError(
+        f"stortree: {clash[1]!r} on {clash[0]!r} and {local_path!r} on "
+        f"{peer['owning_host']!r} both resolve to the rclone.conf section "
+        f"name {section_name!r}, which would point one of them at the wrong "
+        f"host -- rename one of them. See docs/config-schema.md"
+    )
+
+
+def _peer_mount_path(remote_path, stortree_root=DEFAULT_STORTREE_ROOT):
+    """The absolute path on the owning host that a peer sftp section
+    points at. Built in one place because two callers have to agree on it
+    exactly: _peer_remote_ref() appends it to the remote reference a
+    mount unit actually uses, and filter_rclone_conf() writes the same
+    string into that section's own `path` key."""
+    return f"{stortree_root}/{remote_path}"
+
+
+def _peer_remote_ref(
+    owning_host, local_path, remote_path, stortree_root=DEFAULT_STORTREE_ROOT
+):
     """The full `remote:path` rclone reference for a peer-sftp mount.
     rclone's sftp backend has no working way to bake a root path into
     the remote's own .conf section -- a `path` key there is silently
@@ -1065,11 +1147,17 @@ def _peer_remote_ref(owning_host, local_path, remote_path):
     appended to the remote reference itself, matching the same `path`
     filter_rclone_conf() writes into that section for documentation."""
     section = _peer_section_name(owning_host, local_path)
-    path = f"/srv/stortree/{remote_path}" if remote_path else "/srv/stortree"
-    return f"{section}:{path}"
+    return f"{section}:{_peer_mount_path(remote_path, stortree_root)}"
 
 
-def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None, group_members=None):
+def filter_rclone_conf(
+    rclone_conf_text,
+    resolved,
+    hostvars=None,
+    group_members=None,
+    stortree_root=DEFAULT_STORTREE_ROOT,
+    stortree_etc=DEFAULT_STORTREE_ETC,
+):
     """Filter the master rclone.conf INI down to only the sections
     `resolved` (this host's stortree_resolve() output) actually needs,
     plus one synthesized sftp section per peer dependency (spec.md §3).
@@ -1083,6 +1171,10 @@ def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None, group_members=
     per user -- both have to agree on `_peer_section_name()`'s input (the
     expanded, not templated, path) since that's what ties a mount's
     `remote` back to the section actually holding its credentials.
+    `stortree_root`/`stortree_etc` are the role variables of the same
+    names -- the mount root a synthesized section's `path` is built from,
+    and the state directory holding the peer SSH key it authenticates
+    with.
     """
     hostvars = hostvars or {}
     group_members = group_members or {}
@@ -1090,14 +1182,29 @@ def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None, group_members=
     master = configparser.ConfigParser()
     master.read_string(rclone_conf_text)
 
+    # Only the two scopes that name a remote this host mounts *itself*:
+    # `server_subtrees` (every node it owns, samba descendants included --
+    # resolve() puts every `host == hostname` node there) and
+    # `client_mounts` (its own copy of a subtree it doesn't own, whose
+    # `remote` is normally a synthesized peer ref but can be a real
+    # third-party section when a `clients:` block hands it one directly).
+    #
+    # Deliberately *not* `samba_shares`: those are universal (every host
+    # exports every `samba:` node in the tree, spec.md §1), so walking
+    # their descendants for remotes hands every host in the fleet the
+    # credentials for every remote referenced anywhere under a share --
+    # including nodes it doesn't own, doesn't peer, and has been
+    # explicitly opted out of by `client-defaults.rclone: false`. A
+    # descendant this host owns is already covered by `server_subtrees`
+    # above; one it doesn't own reaches it as a peer dependency, which
+    # gets a synthesized sftp section below and never needs the owning
+    # host's own third-party credentials. That is the whole point of
+    # spec.md §3's scoping: "other remotes stay off it entirely".
     needed = set()
     for entry in resolved.get("server_subtrees", []):
         needed.add(_remote_section(entry.get("remote")))
     for entry in resolved.get("client_mounts", []):
         needed.add(_remote_section(entry.get("remote")))
-    for share in resolved.get("samba_shares", []):
-        for d in share.get("descendants", []):
-            needed.add(_remote_section(d.get("remote")))
     needed.discard(None)
 
     out = configparser.ConfigParser()
@@ -1105,6 +1212,7 @@ def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None, group_members=
         if section in needed:
             out[section] = dict(master[section])
 
+    claimed = {}
     for peer in resolved.get("peer_dependencies", []):
         if peer.get("per_user"):
             # Exactly one section, at the same real path plan_mounts()
@@ -1128,13 +1236,15 @@ def filter_rclone_conf(rclone_conf_text, resolved, hostvars=None, group_members=
         )
         for local_path, remote_path in expanded:
             section_name = _peer_section_name(peer["owning_host"], local_path)
+            _check_peer_section_clash(claimed, section_name, peer, local_path)
+            claimed[section_name] = (peer["owning_host"], local_path)
             out[section_name] = {
                 "type": "sftp",
                 "host": address,
                 "user": "stortree",
-                "key_file": PEER_SSH_KEY_PATH,
+                "key_file": f"{stortree_etc}/{PEER_SSH_KEY_NAME}",
                 "shell_type": "unix",
-                "path": f"/srv/stortree/{remote_path}" if remote_path else "/srv/stortree",
+                "path": _peer_mount_path(remote_path, stortree_root),
             }
 
     buf = io.StringIO()
@@ -1161,17 +1271,16 @@ def _slug(path):
     (see _escape_slug_segment) before being rejoined with "-", so a
     segment literally named "foo-bar" can no longer collapse onto the
     same slug as nested "foo/bar" the way a naive "/" -> "-" replacement
-    would. The empty (root) path maps to the reserved "root" -- see the
-    explicit uniqueness check in plan_mounts() for the backstop against
-    the one remaining case this doesn't rule out on its own (a real
-    top-level segment literally named "root"). Also exposed directly as
-    the `stortree_slug` filter: a per-user bind-mount unit's own template
-    needs to compute its `symlink_target`'s unit slug from that raw path
-    string alone (there's no separate plan_mounts() entry lookup handy at
-    render time), the same way plan_mounts() computes every entry's own
-    `slug` field here."""
-    if not path:
-        return "root"
+    would. Every resolved path has at least one segment -- a top-level
+    subtree's own name (_walk_tree()) -- so there is no empty-path case
+    to reserve a name for; back when one shared tree root existed, that
+    root's own client mount resolved to `local_path == ""` and mapped to
+    a reserved "root" slug, which nothing can produce now. Also exposed
+    directly as the `stortree_slug` filter: a per-user bind-mount unit's
+    own template needs to compute its `symlink_target`'s unit slug from
+    that raw path string alone (there's no separate plan_mounts() entry
+    lookup handy at render time), the same way plan_mounts() computes
+    every entry's own `slug` field here."""
     return "-".join(_escape_slug_segment(seg) for seg in path.split("/"))
 
 
@@ -1475,7 +1584,7 @@ def user_container_paths(resolved, group_members=None, mount_plan=None):
     return result
 
 
-def plan_mounts(resolved, group_members=None):
+def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROOT):
     """Flatten this host's resolved server_subtrees/client_mounts/
     peer_dependencies into one flat plan of every local path that has to
     exist (spec.md §2), resolving a user-subdirs entry's %U-templated
@@ -1508,10 +1617,11 @@ def plan_mounts(resolved, group_members=None):
     Every peer_dependencies entry becomes a mount too -- a samba
     descendant this host doesn't own is data this host's local tree still
     has to contain (spec.md §1 "Samba sharing is universal"), sourced
-    directly from its actual owning host exactly like the root client
-    mount is (mesh, not funneled through root_host -- each peer_dependency
-    already names its own real owning host). The root-level entry
-    (`local_path == ""`) is skipped here since it's already the
+    directly from its actual owning host exactly like a client mount of a
+    whole top-level subtree is (a mesh: each peer_dependency already names
+    its own real owning host, rather than everything funnelling through
+    one shared root). An entry with no `samba_node` is skipped here since
+    it's a top-level subtree's own peer mount, already planned as the
     client_mounts entry above; every other entry gets its own mount,
     per-user-resolved the same way as a per-user server_subtrees entry
     (including the shared-mount-plus-bind-mounts case -- the owning
@@ -1637,7 +1747,10 @@ def plan_mounts(resolved, group_members=None):
                 {
                     "local_path": p["local_path"],
                     "remote": _peer_remote_ref(
-                        p["owning_host"], p["local_path"], p["remote_path"]
+                        p["owning_host"],
+                        p["local_path"],
+                        p["remote_path"],
+                        stortree_root,
                     ),
                     "args": p["args"],
                     "access": p.get("access") or {},
@@ -1652,7 +1765,7 @@ def plan_mounts(resolved, group_members=None):
         real_entry, symlinks = _expand_per_user(
             p["local_path"],
             access,
-            lambda rp: _peer_remote_ref(p["owning_host"], rp, rp),
+            lambda rp: _peer_remote_ref(p["owning_host"], rp, rp, stortree_root),
             p.get("requires") or [],
         )
         if real_entry is not None:

@@ -188,7 +188,8 @@
   # (an `owner` grant) or one shared mount plus one bind mount per member
   # (a `group`-only grant).
   ansible.builtin.set_fact:
-    stortree_mounts_plan: "{{ stortree | stortree_plan_mounts(stortree_group_members) }}"
+    stortree_mounts_plan: >-
+      {{ stortree | stortree_plan_mounts(stortree_group_members, stortree_root) }}
   tags: [mounts]
 
 - name: Compute this host's per-user container ownership
@@ -337,10 +338,10 @@
   # mounted at yet, so a first-time mount still gets its directory
   # created normally below.
   ansible.builtin.stat:
-    path: "{{ (stortree_root ~ '/' ~ item.local_path) if item.local_path else stortree_root }}"
+    path: "{{ stortree_root ~ '/' ~ item.local_path }}"
   loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
   loop_control:
-    label: "{{ item.local_path or '(root)' }}"
+    label: "{{ item.local_path }}"
   register: stortree_mount_point_probe
   ignore_errors: true
   tags: [mounts]
@@ -467,15 +468,15 @@
   # unless a node nests under a user-subdirs container.
   ansible.builtin.file:
     path: >-
-      {{ (stortree_root ~ '/' ~ (item.local_path | stortree_physical_path(stortree_user_containers)))
-         if item.local_path else stortree_root }}
+      {{ stortree_root ~ '/'
+         ~ (item.local_path | stortree_physical_path(stortree_user_containers)) }}
     state: directory
     owner: "{{ stortree_user if item.remote else (item.access | stortree_access_owner(stortree_user)) }}"
     group: "{{ stortree_group if item.remote else (item.access | stortree_access_group(stortree_group)) }}"
     mode: "{{ '0751' if item.remote else (item.access | stortree_access_mode) }}"
   loop: "{{ stortree_mounts_plan | rejectattr('symlink_target') | list }}"
   loop_control:
-    label: "{{ item.local_path or '(root)' }}"
+    label: "{{ item.local_path }}"
   when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
   ignore_errors: true
   tags: [mounts]
@@ -637,7 +638,7 @@
   loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
   loop_control:
     loop_var: entry
-    label: "{{ entry.local_path or '(root)' }}"
+    label: "{{ entry.local_path }}"
   register: stortree_mounts_units_rendered
   notify: stortree mounts changed
   tags: [mounts]
@@ -697,7 +698,7 @@
     state: restarted
   loop: "{{ stortree_mounts_units_rendered.results }}"
   loop_control:
-    label: "{{ item.entry.local_path or '(root)' }}"
+    label: "{{ item.entry.local_path }}"
   when: item.changed
   tags: [mounts]
 
@@ -728,7 +729,7 @@
     state: started
   loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
   loop_control:
-    label: "{{ item.local_path or '(root)' }}"
+    label: "{{ item.local_path }}"
   tags: [mounts]
 
 - name: Enable and start every per-user personal mount

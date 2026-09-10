@@ -5,7 +5,7 @@ references below (`§1`, `§2`, ...) are spec.md's Architecture sections.
 
 ## Status
 
-Everything through phase 9 below is implemented: `resolve()`, all ten
+Everything through phase 9 below is implemented: `resolve()`, all nine
 roles, both playbooks, and Molecule scaffolding for a per-role `default`
 scenario plus one multi-host `full-tree` scenario. What's **not** done is
 running `molecule test`/`molecule converge` against real Docker containers
@@ -186,8 +186,11 @@ implementation:
 Docker on the machine this was built on is in daily use for unrelated
 services, so `molecule test`/`molecule converge` (which needs privileged,
 systemd-in-Docker containers plus throwaway LDAP/sftp containers, §9) was
-deliberately **not** run here. Everything else now runs on every push
-via `.github/workflows/ci.yml`, rather than by hand:
+deliberately **not** run here. Everything else below is run by hand on a
+checkout — GitHub Actions workflows that would run it on every push
+(`ci.yml`) and the Molecule scenario on manual dispatch (`molecule.yml`)
+are written, but live on the unmerged `github-workflows` branch rather
+than on `master`:
 
 - `pytest` — three layers, all pure and hostless:
   - `resolve()`/`filter_rclone_conf()` and the rest of
@@ -227,8 +230,7 @@ scenario. The scenario files exist, are checked for internal consistency
 by `tests/test_repo_consistency.py`, and are believed correct, but
 remain unexercised — before trusting this against real hosts, run at
 least the `full-tree` scenario (`cd molecule/full-tree && molecule
-test`, the manually dispatched `.github/workflows/molecule.yml`, or
-per-role via `cd roles/<role> && molecule test`) somewhere Docker
+test`, or per-role via `cd roles/<role> && molecule test`) somewhere Docker
 capacity isn't shared with other workloads, then a staging pass
 (`ansible-playbook site.yml --check --diff` against real hosts, then a
 real apply) per spec.md §9's own caveat about what Molecule-in-Docker

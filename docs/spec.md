@@ -483,8 +483,10 @@ along with it well before any platform this project targets existed, so
 it's not installable anywhere `stortree_pam_smbpass` would run. The
 `stortree_pam_smbpass` role instead stacks `pam_exec.so
 expose_authtok seteuid` into the host's PAM `auth`/`password` chain
-*after* SSSD's module (via `ansible.builtin.pamd` for a declarative,
-idempotent edit rather than hand-patching `/etc/pam.d/common-auth`),
+*after* SSSD's module (via `community.general.pamd` for a declarative,
+idempotent edit rather than hand-patching `/etc/pam.d/common-auth` --
+`pamd` has only ever shipped in `community.general`, never in
+ansible-core),
 pointed at a small script the role deploys
 (`roles/stortree_pam_smbpass/files/pam-smbpass-sync.sh`). `pam_exec`
 hands that script the plaintext credential on stdin on any successful PAM
@@ -928,8 +930,10 @@ failure handling instead of bespoke retry logic.
 **Dependencies**, gathered here from the roles above for reference:
 
 - **Control node**: `ansible`, plus the `ansible.posix` collection
-  (`ansible.posix.authorized_key` in §7) and the `community.crypto`
-  collection (`community.crypto.openssh_keypair` in §7).
+  (`ansible.posix.authorized_key` in §7), the `community.crypto`
+  collection (`community.crypto.openssh_keypair` in §7) and the
+  `community.general` collection (`community.general.pamd` in §5).
+  All three are in `requirements.yml`.
 - **Every managed host**: `rclone` (§2), `samba` (§4), `sssd` (§5), and
   `samba-common-bin`/`libpam-modules` (`smbpasswd` and `pam_exec.so`,
   §5) — existing, well-known Linux storage/identity tooling the roles

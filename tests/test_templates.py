@@ -322,23 +322,6 @@ def test_mount_unit_stop_is_tolerant_of_an_already_gone_mountpoint(
     assert "Restart=on-failure" in unit
 
 
-def test_mount_unit_for_the_tree_root_mounts_stortree_root_itself(
-    render, mount_plans, containers, parent_slugs
-):
-    # A root-level client mount has local_path "" -- the mount path is
-    # stortree_root with no trailing slash, not "/srv/stortree/".
-    entry = dict(
-        entry_for(mount_plans[GADGET], "tree"), local_path="", slug="root"
-    )
-    unit = render(
-        MOUNT_UNIT,
-        entry=entry,
-        **mount_vars(mount_plans, containers, parent_slugs, GADGET),
-    )
-    assert " /srv/stortree \\" in unit
-    assert "/srv/stortree/ " not in unit
-
-
 # -- stortree-user-mount@.service.j2 --------------------------------------
 
 

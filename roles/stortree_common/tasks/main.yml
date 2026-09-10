@@ -48,11 +48,14 @@
   tags: [common]
 
 - name: Ensure the fixed mount root exists
-  # Skipped once `stortree_root` is itself already an active mountpoint
-  # -- true on any host with a whole-tree root client mount (a
-  # client_mounts entry, local_path == "", spec.md §1): that mount
-  # carries no `access` of its own (stortree_mounts' plan_mounts()
-  # always resolves the root client entry with access: {}), and a mount
+  # Skipped once `stortree_root` is itself already an active mountpoint.
+  # Nothing stortree resolves ever mounts there any more (every path
+  # starts at a named top-level subtree), but an operator can still give
+  # `/srv/stortree` its own dedicated filesystem -- and it used to be the
+  # normal case, back when the whole tree hung off one shared root a
+  # non-owning host client-mounted whole (`local_path == ""`).
+  #
+  # The skip matters because a mount
   # still running a unit rendered before --allow-other became
   # unconditional (stortree_mounts' own header comment) is reachable
   # only by the mounting user (stortree) -- root included, when this

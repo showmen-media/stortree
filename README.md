@@ -113,8 +113,9 @@ role/playbook layout, and the Molecule test harness — are in
 
 ## Requirements
 
-On the control node: `ansible` plus the `ansible.posix` and
-`community.crypto` collections (see `requirements.txt`/`requirements.yml`).
+On the control node: `ansible` plus the `ansible.posix`,
+`community.crypto` and `community.general` collections (see
+`requirements.txt`/`requirements.yml`).
 On every managed host: existing, well-known Linux storage/identity
 tooling that the roles configure rather than reinvent — `rclone`, `samba`,
 `sssd`, and `samba-common-bin`/`libpam-modules`. See
@@ -143,8 +144,7 @@ Then `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ## Tests
 
 Everything except the Molecule scenario runs in seconds on a checkout,
-with no Docker and no hosts to talk to, and runs on every push via
-[GitHub Actions](.github/workflows/ci.yml):
+with no Docker and no hosts to talk to:
 
 ```
 pytest                       # resolution, filters, and rendered templates
@@ -160,12 +160,15 @@ them to plays, and the roles' Jinja templates, rendered through
 ansible-core's own filters against real `resolve()` output so a systemd
 unit or `smb.conf` can be asserted on without a host to apply it to.
 
-The multi-host Molecule scenario is the one thing that isn't automatic
-— it needs privileged systemd-in-Docker containers and has never been
-run. It has its own manually dispatched workflow
-([.github/workflows/molecule.yml](.github/workflows/molecule.yml)), or
-run it locally with `cd molecule/full-tree && molecule test`. See
+The multi-host Molecule scenario is the exception — it needs privileged
+systemd-in-Docker containers and has never been run. Run it locally with
+`cd molecule/full-tree && molecule test`. See
 [docs/plan.md](docs/plan.md) "What's verified".
+
+GitHub Actions workflows for all of the above (`ci.yml` on every push,
+`molecule.yml` on manual dispatch) are written but not yet on `master` —
+they live on the `github-workflows` branch. Until that's merged, the
+commands above are run by hand.
 
 ## Docs
 
