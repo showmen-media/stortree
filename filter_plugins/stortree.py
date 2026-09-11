@@ -551,6 +551,44 @@ def access_mode(access):
     return f"0{owner_bits}{group_bits}{other_bit}"
 
 
+def bindfs_perms(access):
+    """access_mode() restated as the chmod-style spec bindfs's `-p`
+    takes, for a presentation mount (docs/spec.md §2 "The presentation
+    layer").
+
+    rclone took two separate flags -- `--dir-perms` and `--file-perms`
+    -- so a mode and its file-only counterpart could just be handed over
+    as they were. bindfs takes one spec for both and resolves the
+    difference with chmod's capital `X`, which sets the execute bit only
+    where it means "enter" (a directory) rather than "run" (a regular
+    file). So the octal here is the *file* mode -- access_mode() with
+    every execute bit cleared -- followed by `+X` for exactly the
+    classes whose execute bit access_mode() did set, which puts those
+    bits back on directories alone.
+
+    Passing access_mode() to `-p` directly would be the obvious thing
+    and is wrong: `0751` would mark every regular file in the subtree
+    executable.
+
+    The `other` execute bit access_mode() adds for traversal (see its
+    own docstring) survives this translation intact, which matters more
+    here than it did under rclone: a presentation mount for a node whose
+    descendants are owned by *someone else* is the only thing standing
+    between those descendants and being unreachable, since the mount
+    above them now presents a real owner instead of the uniform
+    stortree:stortree a transport mount used to show."""
+    mode = access_mode(access)
+    file_digits = ""
+    classes = ""
+    for digit, klass in zip(mode[1:], "ugo"):
+        bits = int(digit)
+        file_digits += str(bits & ~1)
+        if bits & 1:
+            classes += klass
+    spec = f"0{file_digits}"
+    return f"{spec},{classes}+X" if classes else spec
+
+
 def _walk_tree(tree):
     """One host-independent walk of the whole tree.
 

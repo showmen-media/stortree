@@ -14,6 +14,7 @@ from filter_plugins.stortree import (
     access_grant_usernames,
     access_group,
     access_mode,
+    bindfs_perms,
     access_owner,
     filter_rclone_conf,
     group_gids_from_getent,
@@ -1355,6 +1356,45 @@ def test_access_mode_default_permissions_from_normalize_access_gets_public_execu
     assert access_mode(access) == "0701"
     access = _normalize_access({"group": "g", "permissions": "rx"})
     assert access_mode(access) == "0750"
+
+
+def test_bindfs_perms_puts_the_execute_bits_on_directories_only():
+    # bindfs takes one -p spec for files and directories both, where
+    # rclone took --dir-perms and --file-perms separately. The octal is
+    # therefore the *file* mode and capital X puts the execute bits back
+    # on directories alone. Handing access_mode() to -p directly would
+    # mark every regular file in the subtree executable.
+    assert bindfs_perms({}) == "0640,ugo+X"  # access_mode 0751
+    assert bindfs_perms({"owner": "jd"}) == "0600,uo+X"  # access_mode 0701
+
+
+def test_bindfs_perms_preserves_the_public_traverse_bit():
+    # The one access_mode() adds so a descendant grant owned by someone
+    # else stays reachable. It matters more under a presentation mount
+    # than it did under rclone: the mount above such a descendant now
+    # presents a real owner instead of a uniform stortree:stortree, so
+    # this bit is the only thing keeping the descendant reachable.
+    assert bindfs_perms(_normalize_access({"owner": "jd"})).endswith("o+X")
+
+
+def test_bindfs_perms_omits_the_x_clause_when_no_class_has_execute():
+    # An explicit `permissions: rw` grant opts out of execute entirely
+    # (access_mode 0660). There is then nothing for +X to add, and
+    # emitting a bare "+X" would be a chmod syntax error.
+    access = {"owner": "jd", "group": "g", "permissions": "rw", "permissions_explicit": True}
+    assert bindfs_perms(access) == "0660"
+
+
+def test_bindfs_perms_round_trips_every_mode_access_mode_can_produce():
+    # Each spec below was checked against bindfs 1.14.7 itself, mounting
+    # a real tree and stat-ing the result; the comment is the observed
+    # directory mode, which is what access_mode() meant in the first
+    # place.
+    assert bindfs_perms({}) == "0640,ugo+X"  # dir 751
+    assert bindfs_perms({"owner": "jd"}) == "0600,uo+X"  # dir 701
+    assert bindfs_perms({"group": "g"}) == "0660,ugo+X"  # dir 771
+    explicit = {"owner": "jd", "permissions": "rwx", "permissions_explicit": True}
+    assert bindfs_perms(explicit) == "0600,u+X"  # dir 700
 
 
 def test_samba_access_tokens_quotes_names_with_spaces():
