@@ -26,8 +26,10 @@ from filter_plugins.stortree import (
     DEFAULT_STORTREE_ETC,
     DEFAULT_STORTREE_ROOT,
     PEER_SSH_KEY_NAME,
+    mount_unit_names,
     plan_mounts,
     resolve,
+    user_mount_unit_names,
 )
 
 # The three copies of docs/config-schema.md's worked example: what the
@@ -254,3 +256,49 @@ def test_the_peer_ssh_key_name_matches_what_stortree_peer_trust_writes():
         for name in re.findall(r"\{\{ stortree_etc \}\}/([\w.]+)", tasks)
     }
     assert referenced == {PEER_SSH_KEY_NAME}
+
+
+def test_every_unit_family_the_plugin_names_is_swept_by_the_role():
+    # Three places sweep stortree's units by wildcard -- the `find` that
+    # detects stale unit files, the `systemctl reset-failed` that clears
+    # ghost state, and playbooks/status.yml's own `list-units` -- and
+    # each names the unit families literally. A fourth place invents the
+    # names: mount_unit_names()/user_mount_unit_names(). A family added
+    # there but missed in any of the three sweeps is a unit that is
+    # rendered and started but never listed, never reset, and never
+    # cleaned up when it goes stale, on every apply, silently.
+    plan = [
+        {"local_path": "a", "remote": "r:/", "slug": "a"},
+        {"local_path": "b", "remote": None, "symlink_target": "a", "slug": "b"},
+    ]
+    containers = [{"local_path": "c", "slug": "c", "requires_slug": "a"}]
+    families = {
+        name.split("@", 1)[0] + "@"
+        for name in mount_unit_names(plan) + user_mount_unit_names(containers)
+    }
+    assert len(families) == 3, f"unexpected unit families: {families}"
+
+    sweeps = {
+        "stortree_mounts find + reset-failed": (
+            REPO_ROOT / "roles/stortree_mounts/tasks/main.yml"
+        ),
+        "status.yml list-units": REPO_ROOT / "playbooks/status.yml",
+    }
+    for where, path in sweeps.items():
+        globbed = set(re.findall(r"(stortree-[a-z-]+@)\*\.service", path.read_text()))
+        assert families <= globbed, f"{where} misses {families - globbed}"
+
+
+def test_the_role_derives_no_unit_name_the_plugin_does_not_render():
+    # The other half of the same seam: stortree_mounts restarts and
+    # enables units by reading each render task's own `dest` back, so a
+    # unit's name is written once (in the task that creates the file)
+    # rather than re-spelled in the tasks that act on it. A second
+    # spelling is what this guards against coming back -- three families
+    # x three steps was nine places one rename had to reach.
+    tasks = (REPO_ROOT / "roles/stortree_mounts/tasks/main.yml").read_text()
+    interpolated = set(re.findall(r"\"(stortree-[a-z-]+@\{\{[^\"]*)\"", tasks))
+    assert interpolated == set(), (
+        "unit names are being rebuilt in the role instead of read from the "
+        f"render task's own dest: {interpolated}"
+    )

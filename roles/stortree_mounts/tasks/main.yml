@@ -209,34 +209,6 @@
     stortree_user_containers: "{{ stortree | stortree_user_containers(stortree_group_members, stortree_mounts_plan) }}"
   tags: [mounts]
 
-- name: Note which mounts have another mount nested inside them
-  # A mount that something else nests inside (`requires_slug` pointing
-  # back at it) needs consistent, predictable stortree:stortree ownership
-  # regardless of its own `access` grant -- every nested mount always
-  # runs as User=stortree (the unit template, unconditionally), so
-  # fusermount's own same-owner check for a *new* mount only ever
-  # succeeds against a parent path it can see itself owning. An
-  # *ungranted* parent has no such guarantee: its reported ownership,
-  # once actually mounted, is whatever its own remote backend happens to
-  # report (a third-party storage box's own arbitrary account, or -- for
-  # a peer-sftp mount -- the numeric uid the owning host's `stortree`
-  # account happens to have been allocated, never guaranteed to match
-  # this host's own) -- neither is reliably `stortree` from this host's
-  # point of view, and fusermount refuses ("bad mount point ...
-  # Permission denied") the moment it isn't. The template forces
-  # --uid/--gid for exactly the mounts in this set, on top of (never
-  # instead of) whatever their own `access` grant already pins.
-  # (--allow-other is no longer part of this set's job -- every mount
-  # renders it now, granted or not, this file's header comment.)
-  ansible.builtin.set_fact:
-    stortree_mounts_parent_slugs: >-
-      {{ stortree_mounts_plan
-         | selectattr('requires_slug')
-         | map(attribute='requires_slug')
-         | unique
-         | list }}
-  tags: [mounts]
-
 - name: Find currently installed stortree mount units
   # Run before any path is touched below (see this file's header comment)
   # -- a path that's switching roles between runs (real per-user mount ->
@@ -257,10 +229,8 @@
     stortree_mounts_stale_units: >-
       {{ stortree_mounts_installed_units.files
          | map(attribute='path')
-         | map('basename')
-         | reject('in', (stortree_mounts_plan | stortree_mount_unit_names)
-                         + (stortree_user_containers | stortree_user_mount_unit_names))
-         | list }}
+         | list
+         | stortree_stale_units(stortree_mounts_plan, stortree_user_containers) }}
   tags: [mounts]
 
 - name: Stop and disable stale mount units
@@ -682,7 +652,25 @@
   ansible.builtin.meta: flush_handlers
   tags: [mounts]
 
-- name: Restart any mount whose unit file actually changed
+- name: Collect every unit this apply rendered
+  # The three families differ in template and unit-name prefix and in
+  # nothing else that the two steps below care about: restarting a
+  # changed unit and enabling/starting it are the same operation on all
+  # of them, and they have to happen in the order the units were
+  # rendered in (a wrapper mount before the bind mounts nesting inside
+  # it -- see the render tasks above). Written once here instead of
+  # three times each, and keyed off each result's own `dest`, so a
+  # unit's name comes from the task that actually rendered it rather
+  # than from a second expression that has to be kept saying the same
+  # thing.
+  ansible.builtin.set_fact:
+    stortree_mounts_rendered_units: >-
+      {{ stortree_mounts_units_rendered.results
+         + stortree_user_mounts_units_rendered.results
+         + stortree_binds_units_rendered.results }}
+  tags: [mounts]
+
+- name: Restart any unit whose file actually changed
   # A changed ExecStart (new rclone args, or access-driven --allow-other/
   # --uid/--gid/--dir-perms/--file-perms, spec.md §6) never takes effect
   # on an already-running unit otherwise: systemd_service: state: started
@@ -691,63 +679,23 @@
   # aware the *file* changed, not the running process -- it keeps running
   # with whatever args it originally started with, silently stale, until
   # something restarts it. Scoped to just the units that actually
-  # re-rendered (register above), not every resolved mount, so an
-  # unrelated mount's open file handles aren't disrupted on every apply.
+  # re-rendered, not every resolved unit, so an unrelated mount's open
+  # file handles aren't disrupted on every apply.
   ansible.builtin.systemd_service:
-    name: "stortree-mount@{{ item.entry.slug }}.service"
+    name: "{{ item.dest | basename }}"
     state: restarted
-  loop: "{{ stortree_mounts_units_rendered.results }}"
+  loop: "{{ stortree_mounts_rendered_units }}"
   loop_control:
     label: "{{ item.entry.local_path }}"
   when: item.changed
   tags: [mounts]
 
-- name: Restart any personal mount whose unit file actually changed
+- name: Enable and start every rendered unit
   ansible.builtin.systemd_service:
-    name: "stortree-user-mount@{{ item.entry.slug }}.service"
-    state: restarted
-  loop: "{{ stortree_user_mounts_units_rendered.results }}"
+    name: "{{ item.dest | basename }}"
+    enabled: true
+    state: started
+  loop: "{{ stortree_mounts_rendered_units }}"
   loop_control:
     label: "{{ item.entry.local_path }}"
-  when: item.changed
-  tags: [mounts]
-
-- name: Restart any bind mount whose unit file actually changed
-  ansible.builtin.systemd_service:
-    name: "stortree-bind@{{ item.entry.slug }}.service"
-    state: restarted
-  loop: "{{ stortree_binds_units_rendered.results }}"
-  loop_control:
-    label: "{{ item.entry.local_path }}"
-  when: item.changed
-  tags: [mounts]
-
-- name: Enable and start every resolved mount
-  ansible.builtin.systemd_service:
-    name: "stortree-mount@{{ item.slug }}.service"
-    enabled: true
-    state: started
-  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
-  loop_control:
-    label: "{{ item.local_path }}"
-  tags: [mounts]
-
-- name: Enable and start every per-user personal mount
-  ansible.builtin.systemd_service:
-    name: "stortree-user-mount@{{ item.slug }}.service"
-    enabled: true
-    state: started
-  loop: "{{ stortree_user_containers | selectattr('requires_slug') | list }}"
-  loop_control:
-    label: "{{ item.local_path }}"
-  tags: [mounts]
-
-- name: Enable and start every per-user bind mount
-  ansible.builtin.systemd_service:
-    name: "stortree-bind@{{ item.slug }}.service"
-    enabled: true
-    state: started
-  loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
-  loop_control:
-    label: "{{ item.local_path }}"
   tags: [mounts]

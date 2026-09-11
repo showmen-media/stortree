@@ -172,11 +172,13 @@ commands above are run by hand.
 
 ## Docs
 
-- [docs/spec.md](docs/spec.md) — architecture, role/playbook layout, and
-  the Molecule-based test harness design.
+- [docs/spec.md](docs/spec.md) — the specification: architecture,
+  role/playbook layout, and the Molecule-based test harness design.
 - [docs/config-schema.md](docs/config-schema.md) — full schema reference
-  for `config.yml`, `ldap.yml`, and `rclone.conf`.
-- [docs/plan.md](docs/plan.md) — build status and the phased build plan.
+  for `config.yml`, `ldap.yml`, and `rclone.conf`, including how the
+  three derived name schemes work ("Names and identity").
+- [docs/plan.md](docs/plan.md) — how it was built, the interpretation
+  calls made along the way, and what is and isn't verified.
 - [docs/runbook.md](docs/runbook.md) — operator commands.
 
 ## Status

@@ -48,8 +48,10 @@ tree:
   subdirs:
     backups: {}
     home:
+      # `user-subdirs` below is what makes this a per-user share: the
+      # Samba path picks up %U automatically, so each connecting user
+      # lands in their own folder rather than seeing everyone's.
       samba:
-        subpath: "%U"
       user-subdirs:
         whitfield-media:
           access:

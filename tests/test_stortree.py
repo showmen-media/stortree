@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,9 @@ from filter_plugins.stortree import (
     needed_users,
     per_user_mount_path,
     plan_mounts,
+    plan_remote_sections,
     resolve,
+    stale_unit_names,
     samba_access_tokens,
     physical_path,
     user_container_paths,
@@ -930,7 +933,9 @@ pass = p
 
 def test_filter_rclone_conf_scopes_to_needed_sections_plus_peers():
     resolved = {
-        "server_subtrees": [{"remote": "remote-a:/x"}],
+        "server_subtrees": [
+            {"path": "own", "remote": "remote-a:/x", "args": {}, "access": {}}
+        ],
         "client_mounts": [],
         "samba_shares": [],
         "peer_dependencies": [
@@ -940,6 +945,7 @@ def test_filter_rclone_conf_scopes_to_needed_sections_plus_peers():
                 "remote_path": "shared/piece-b",
                 "samba_node": "shared",
                 "per_user": False,
+                "args": {},
             }
         ],
     }
@@ -958,9 +964,10 @@ def test_filter_rclone_conf_scopes_to_needed_sections_plus_peers():
 
 def test_filter_rclone_conf_expands_per_user_peer_sections():
     # a per-user peer dependency's %U has to become one real INI section
-    # per actual user -- plan_mounts() independently expands the same
-    # entry into one mount per user, and both have to compute the exact
-    # same section name for a mount's `remote` to actually resolve
+    # per actual user, named for the same resolved path the mount that
+    # uses it lands on -- which is now true by construction, since the
+    # section list is read straight off that mount plan
+    # (plan_remote_sections())
     resolved = {
         "server_subtrees": [],
         "client_mounts": [],
@@ -973,6 +980,7 @@ def test_filter_rclone_conf_expands_per_user_peer_sections():
                 "samba_node": "home",
                 "per_user": True,
                 "access": {"owner": "jd", "permissions": "rwx"},
+                "args": {},
             }
         ],
     }
@@ -1005,6 +1013,7 @@ def test_filter_rclone_conf_group_only_peer_section_collapses_to_one():
                 "samba_node": "home",
                 "per_user": True,
                 "access": {"group": "Michael Whitfield Family", "permissions": "rwx"},
+                "args": {},
             }
         ],
     }
@@ -1057,7 +1066,7 @@ def test_needed_groups_covers_non_per_user_grants_too():
             "rclone.remote": "r1:/",
             "subdirs": {
                 "shared": {
-                    "samba": {"subpath": ""},
+                    "samba": {},
                     "access.group": "not-per-user-group",
                     "subdirs": {"leaf": {"host": "h2", "access.owner": "jd"}},
                 }
@@ -1771,7 +1780,7 @@ def test_requires_reaches_a_nested_node_and_leaves_bind_mounts_alone():
             "rclone.remote": "r1:/",
             "subdirs": {
                 "home": {
-                    "samba": {"subpath": PER_USER_PLACEHOLDER},
+                    "samba": {},
                     "user-subdirs": {
                         "fam": {
                             "access.group": "Fam",
@@ -1930,7 +1939,7 @@ def test_plan_mounts_peer_sources_a_plain_samba_descendant_it_does_not_own():
             "rclone.remote": "r1:/",
             "subdirs": {
                 "share": {
-                    "samba": {"subpath": None},
+                    "samba": {},
                     "subdirs": {"leaf": {"host": "h2", "rclone.remote": "r2:/leaf"}},
                 }
             },
@@ -1964,7 +1973,7 @@ def test_client_opt_out_beats_universal_samba_sharing():
             "client-defaults": {"rclone": False},
             "subdirs": {
                 "share": {
-                    "samba": {"subpath": None},
+                    "samba": {},
                     "subdirs": {"leaf": {"host": "h2", "rclone.remote": "r2:/leaf"}},
                 }
             },
@@ -2114,12 +2123,17 @@ def test_filter_rclone_conf_keeps_a_client_mounts_own_direct_remote():
 
 
 def test_filter_rclone_conf_ignores_entries_with_no_remote_at_all():
-    # A plain-directory entry has remote None; _remote_section() has to
-    # return None for it rather than blowing up or inventing a section.
+    # A plain-directory entry has remote None. It has to drop out before
+    # any section name is computed from it, rather than blowing up or
+    # inventing a section -- and drop out of the *output* too, since a
+    # host holding a credential it never mounts with is the thing the
+    # scoping rule exists to prevent.
     conf = "[only]\ntype = sftp\n"
     resolved = {
-        "server_subtrees": [{"local_path": "top", "remote": None}],
-        "client_mounts": [{"local_path": "top/x", "remote": None}],
+        "server_subtrees": [
+            {"path": "top", "remote": None, "args": {}, "access": {}}
+        ],
+        "client_mounts": [{"local_path": "top/x", "remote": None, "args": {}}],
         "samba_shares": [{"descendants": [{"path": "top/x", "remote": None}]}],
         "peer_dependencies": [],
     }
@@ -2203,13 +2217,17 @@ def test_filter_rclone_conf_rejects_two_hosts_claiming_one_peer_section():
                 "owning_host": "storage",
                 "local_path": "node/alpha/tree",
                 "remote_path": "node/alpha/tree",
+                "samba_node": "node",
                 "per_user": False,
+                "args": {},
             },
             {
                 "owning_host": "storage-node-alpha",
                 "local_path": "tree",
                 "remote_path": "tree",
+                "samba_node": "tree",
                 "per_user": False,
+                "args": {},
             },
         ],
     }
@@ -2236,13 +2254,17 @@ def test_filter_rclone_conf_allows_one_host_claiming_a_section_twice():
                 "owning_host": "h1",
                 "local_path": "a/b",
                 "remote_path": "a/b",
+                "samba_node": "a",
                 "per_user": False,
+                "args": {},
             },
             {
                 "owning_host": "h1",
                 "local_path": "a-b",
                 "remote_path": "a-b",
+                "samba_node": "a-b",
                 "per_user": False,
+                "args": {},
             },
         ],
     }
@@ -2301,8 +2323,10 @@ def test_filter_rclone_conf_drops_a_per_user_peer_nobody_is_granted():
                 "owning_host": "h2",
                 "local_path": "top/home/%U/media",
                 "remote_path": "top/home/%U/media",
+                "samba_node": "top/home",
                 "per_user": True,
                 "access": {"group": "Nobody Here", "permissions": "rwx"},
+                "args": {},
             }
         ],
     }
@@ -2333,7 +2357,7 @@ def test_a_samba_block_marks_a_node_for_export_however_it_is_written():
     # opposite: the first two resolved to no share at all, silently, and
     # `samba: true` crashed resolve() with an AttributeError from deep
     # inside the share-building loop.
-    for block in ({}, None, True, {"subpath": "%U"}):
+    for block in ({}, None, True, {"name": "top_share"}):
         tree = {"top": {"host": "h1", "rclone.remote": "r:/", "samba": block}}
         (share,) = resolve(tree, "h1", ["h1", "h2"])["samba_shares"]
         assert share["node_path"] == "top"
@@ -2381,22 +2405,23 @@ def test_samba_name_overrides_the_derived_share_name():
     tree = {
         "tree": {
             "host": "h1",
-            "subdirs": {"home": {"samba": {"name": "home", "subpath": "%U"}}},
+            "subdirs": {"home": {"samba": {"name": "home"}}},
         }
     }
     (share,) = resolve(tree, "h1", ["h1", "h2"])["samba_shares"]
     assert share["name"] == "home"
     assert share["node_path"] == "tree/home"
-    assert share["subpath"] == "%U"
 
 
 def test_samba_name_does_not_leak_back_into_the_callers_config():
-    # resolve() fills in a default name; the operator's own dict is not
-    # its to write that into.
-    samba = {"subpath": "%U"}
+    # resolve() fills in a default name *and* the derived subpath; the
+    # operator's own dict is not its to write either of them into. An
+    # empty block catches both -- anything at all appearing in it is a
+    # leak.
+    samba = {}
     tree = {"top": {"host": "h1", "samba": samba}}
     resolve(tree, "h1", ["h1", "h2"])
-    assert samba == {"subpath": "%U"}
+    assert samba == {}
 
 
 def test_a_samba_name_outside_the_legal_alphabet_is_rejected():
@@ -2457,7 +2482,7 @@ def test_client_opt_out_also_withholds_peer_trust_from_the_serving_side():
             "client-defaults": {"rclone": False},
             "subdirs": {
                 "share": {
-                    "samba": {"subpath": None},
+                    "samba": {},
                     "subdirs": {"leaf": {"host": "h2", "rclone.remote": "r2:/leaf"}},
                 }
             },
@@ -2563,17 +2588,18 @@ def test_a_misspelled_subdirs_is_rejected_not_dropped():
         resolve(tree, "h1", ["h1"])
 
 
-def test_a_misspelled_samba_subpath_is_rejected():
-    # Cost: the share exports the node root instead of the per-user
-    # subpath, so every connecting user sees everyone else's folder.
+def test_a_misspelled_samba_key_is_rejected():
+    # `name` is the only key a `samba` block still takes, and getting it
+    # wrong silently exports the share under its derived path-based name
+    # instead of the one clients were told to mount.
     tree = {
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "samba": {"sub-path": "%U"},
+            "samba": {"nmae": "home"},
         }
     }
-    with pytest.raises(ValueError, match="unknown `samba` key 'sub-path'"):
+    with pytest.raises(ValueError, match="unknown `samba` key 'nmae'"):
         resolve(tree, "h1", ["h1"])
 
 
@@ -2665,3 +2691,217 @@ def test_every_key_the_worked_example_uses_passes_validation():
     # own worked example has to resolve on every host.
     for host in EXAMPLE_HOSTS:
         assert resolve(EXAMPLE_TREE, host, EXAMPLE_HOSTS)
+
+
+# -- the section list is the mount plan ------------------------------------
+
+
+EXAMPLE_GROUPS = {
+    "Whitfield Family & Friends": ["jd", "mw"],
+    "Michael Whitfield Family": ["mw"],
+    "Media Production": ["jd"],
+}
+
+
+def example_tree_remote_sections():
+    """Every rclone remote named anywhere in the worked example, as
+    section names -- the master rclone.conf a control node would really
+    be filtering, rather than a hand-listed subset that goes stale the
+    moment the example grows a remote."""
+    found = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "rclone.remote" and isinstance(value, str):
+                    found.add(value.split(":", 1)[0])
+                elif key == "rclone" and isinstance(value, dict):
+                    remote = value.get("remote")
+                    if isinstance(remote, str):
+                        found.add(remote.split(":", 1)[0])
+                walk(value)
+
+    walk(EXAMPLE_TREE)
+    return sorted(found)
+
+
+@pytest.mark.parametrize("host", EXAMPLE_HOSTS)
+def test_every_shipped_section_is_one_this_hosts_mounts_actually_use(host):
+    # The invariant plan_remote_sections() exists to hold, checked
+    # end-to-end on the worked example rather than on a hand-built
+    # `resolved`: the sections in a host's rclone.conf are exactly the
+    # sections its own mount units reference -- none missing (a mount
+    # with no credentials), none spare (a credential with no mount).
+    conf = "".join(
+        f"[{name}]\ntype = smb\n\n" for name in example_tree_remote_sections()
+    ) + "[nobodys-remote]\ntype = s3\n"
+    resolved = resolve(EXAMPLE_TREE, host, EXAMPLE_HOSTS)
+    out = filter_rclone_conf(conf, resolved, {}, EXAMPLE_GROUPS)
+
+    shipped = set(re.findall(r"^\[(.+)\]$", out, re.MULTILINE))
+    referenced = {
+        e["remote"].split(":", 1)[0]
+        for e in plan_mounts(resolved, EXAMPLE_GROUPS)
+        if e["remote"]
+    }
+    assert shipped == referenced, host
+    assert "nobodys-remote" not in shipped, "the filter copied a remote nothing uses"
+
+
+def test_a_per_user_node_nobody_is_granted_ships_no_credential():
+    # Reading the plan rather than `resolved`'s own scopes tightened this
+    # case: a per-user node this host owns, whose group has no members
+    # here, resolves to no mount at all -- so its remote's credentials
+    # have no reason to be on the host, and now aren't.
+    conf = "[shared-box]\ntype = smb\n"
+    tree = {
+        "top": {
+            "host": "h1",
+            "user-subdirs": {
+                "vault": {
+                    "access.group": "Nobody Here",
+                    "rclone.remote": "shared-box:/vault",
+                }
+            },
+        }
+    }
+    resolved = resolve(tree, "h1", ["h1"])
+
+    assert filter_rclone_conf(conf, resolved, {}, {}).strip() == ""
+    assert "[shared-box]" in filter_rclone_conf(
+        conf, resolved, {}, {"Nobody Here": ["someone"]}
+    )
+
+
+def test_plan_remote_sections_separates_master_sections_from_peer_ones():
+    # The two halves reach filter_rclone_conf() differently -- one is
+    # copied out of the master conf verbatim, the other is synthesized --
+    # so they come back apart rather than as one set of names.
+    tree = {
+        "own": {"host": "h1", "rclone.remote": "direct:/x"},
+        "theirs": {"host": "h2", "rclone.remote": "not-mine:/y"},
+    }
+    master, peers = plan_remote_sections(resolve(tree, "h1", ["h1", "h2"]))
+
+    assert master == {"direct"}
+    assert set(peers) == {"peer-h2-theirs"}
+    assert peers["peer-h2-theirs"]["owning_host"] == "h2"
+    assert peers["peer-h2-theirs"]["path"] == "/srv/stortree/theirs"
+
+
+# -- stale_unit_names ------------------------------------------------------
+
+
+def test_stale_units_are_the_installed_ones_the_plan_no_longer_names():
+    plan = [
+        {"local_path": "top", "remote": "r:/", "slug": "top"},
+        {"local_path": "top/u", "remote": None, "symlink_target": "top", "slug": "top-u"},
+    ]
+    containers = [{"local_path": "top/home", "slug": "top-home", "requires_slug": "top"}]
+    installed = [
+        "/etc/systemd/system/stortree-mount@top.service",
+        "/etc/systemd/system/stortree-bind@top-u.service",
+        "/etc/systemd/system/stortree-user-mount@top-home.service",
+        "/etc/systemd/system/stortree-mount@gone.service",
+        "/etc/systemd/system/stortree-bind@gone-u.service",
+        "/etc/systemd/system/stortree-user-mount@gone-home.service",
+    ]
+
+    assert stale_unit_names(installed, plan, containers) == [
+        "stortree-mount@gone.service",
+        "stortree-bind@gone-u.service",
+        "stortree-user-mount@gone-home.service",
+    ]
+
+
+def test_stale_units_is_empty_when_every_installed_unit_is_still_planned():
+    plan = [{"local_path": "top", "remote": "r:/", "slug": "top"}]
+    installed = ["/etc/systemd/system/stortree-mount@top.service"]
+    assert stale_unit_names(installed, plan, []) == []
+
+
+def test_stale_units_on_a_host_with_nothing_installed_yet():
+    assert stale_unit_names([], [], []) == []
+
+
+# -- the samba subpath is derived, not written -----------------------------
+
+
+def test_a_shared_node_with_user_subdirs_gets_the_per_user_path():
+    # The whole point of the derivation: `user-subdirs` means the node's
+    # immediate children are per-user folders, so the share has to land
+    # each connecting user in their own.
+    tree = {
+        "tree": {
+            "host": "h1",
+            "subdirs": {
+                "home": {"samba": {}, "user-subdirs": {"fam": {"access.group": "F"}}}
+            },
+        }
+    }
+    (share,) = resolve(tree, "h1", ["h1"])["samba_shares"]
+    assert share["subpath"] == PER_USER_PLACEHOLDER
+
+
+def test_a_shared_node_without_user_subdirs_serves_itself():
+    tree = {
+        "tree": {
+            "host": "h1",
+            "subdirs": {"backups": {"samba": {}, "subdirs": {"old": {}}}},
+        }
+    }
+    (share,) = resolve(tree, "h1", ["h1"])["samba_shares"]
+    assert share["subpath"] is None
+
+
+@pytest.mark.parametrize("block", [{}, None], ids=["empty", "bare"])
+def test_an_empty_user_subdirs_block_is_still_a_per_user_share(block):
+    # Presence, not truthiness -- the same reading `samba` itself gets.
+    # `user-subdirs: {}` and a bare `user-subdirs:` (which YAML parses as
+    # None) declare no substructure yet, but they do say the node has a
+    # per-user level. Reading them as "not per-user" would mean emptying
+    # a node's `user-subdirs` silently widens its share from one user's
+    # own folder to the directory holding everyone's.
+    tree = {"tree": {"host": "h1", "samba": {}, "user-subdirs": block}}
+    (share,) = resolve(tree, "h1", ["h1"])["samba_shares"]
+    assert share["subpath"] == PER_USER_PLACEHOLDER
+
+
+def test_the_derived_subpath_reaches_the_worked_examples_home_share():
+    # End-to-end on the shipped example, which no longer writes it: the
+    # `home` share is per-user because `home` has `user-subdirs`.
+    shares = {
+        s["node_path"]: s
+        for s in resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)[
+            "samba_shares"
+        ]
+    }
+    assert shares["tree/home"]["subpath"] == PER_USER_PLACEHOLDER
+
+
+def test_writing_samba_subpath_says_it_is_derived_and_what_to_do():
+    # It used to be a real key, so an existing config setting it isn't a
+    # typo -- the generic unknown-key error would suggest correcting a
+    # spelling that was already right. The answer is to delete the line.
+    tree = {"top": {"host": "h1", "samba": {"subpath": "%U"}}}
+    with pytest.raises(ValueError) as excinfo:
+        resolve(tree, "h1", ["h1"])
+    message = str(excinfo.value)
+    assert "no longer written in config.yml" in message
+    assert "user-subdirs" in message
+    assert "Delete the line" in message
+
+
+def test_writing_samba_subpath_is_rejected_even_where_it_matched_the_derivation():
+    # Including the case where it would have derived to the same value:
+    # a key that is sometimes accepted is a key that still has to be
+    # understood, and half a schema is worse than none.
+    tree = {
+        "top": {
+            "host": "h1",
+            "samba": {"subpath": PER_USER_PLACEHOLDER},
+            "user-subdirs": {"fam": {}},
+        }
+    }
+    with pytest.raises(ValueError, match="no longer written"):
+        resolve(tree, "h1", ["h1"])

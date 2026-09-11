@@ -25,8 +25,12 @@ passdb backend = tdbsam
       whitespace-delimited, and a name can contain a space (e.g. "Michael
       Whitfield Family", config-schema.md's worked example) -- and, for a
       %U-templated share, adds %U itself as a standing entry (spec.md
-      §6): the share's own path already confines each connecting user to
-      their own subtree, so their baseline access there shouldn't depend
+      §6). `subpath` is derived rather than configured -- it is %U for a
+      node with a `user-subdirs` key and unset otherwise
+      (_normalize_samba())
+      -- so "has a subpath" and "is per-user" are the same question. For
+      those, the share's own path already confines each connecting user
+      to their own subtree, so their baseline access there shouldn't depend
       on any particular descendant's `access` grant existing at all. A
       descendant with its own remote (e.g. mw-fam) doesn't strictly need
       its grant repeated here either way -- stortree_mounts already
@@ -34,7 +38,7 @@ passdb backend = tdbsam
       level) -- but leaving it in this union is harmless (%U already
       subsumes it for reaching one's own tree) and still correct for a
       plain local descendant with no mount of its own to enforce it. #}
-   {% set include_self = share.subpath and '%U' in share.subpath %}
+   {% set include_self = share.subpath is not none %}
    valid users = {{ share.access | stortree_samba_access_tokens(include_self) | join(' ') }}
 
    write list = {{ share.access | selectattr('permissions', 'search', 'w') | list | stortree_samba_access_tokens(include_self) | join(' ') }}

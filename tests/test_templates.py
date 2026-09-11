@@ -50,13 +50,13 @@ def directives(rendered, name):
     ]
 
 
-def mount_vars(mount_plans, containers, parent_slugs, host):
+def mount_vars(containers, host):
     """The variable set roles/stortree_mounts/tasks/main.yml has in
-    scope when it renders a unit template."""
-    return {
-        "stortree_user_containers": containers[host],
-        "stortree_mounts_parent_slugs": parent_slugs[host],
-    }
+    scope when it renders a unit template. Just the one now: which
+    mounts have something nested inside them used to be a separate fact
+    the role derived and passed alongside, and is a field on the entry
+    itself since (plan_mounts()' `has_nested_children`)."""
+    return {"stortree_user_containers": containers[host]}
 
 
 # -- every template at least parses ---------------------------------------
@@ -76,12 +76,12 @@ def test_every_role_template_parses(jinja_env):
 
 
 def test_mount_unit_top_level_subtree_is_ordered_after_the_network_only(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     unit = render(
         MOUNT_UNIT,
         entry=entry_for(mount_plans[ALPHA], "tree"),
-        **mount_vars(mount_plans, containers, parent_slugs, ALPHA),
+        **mount_vars(containers, ALPHA),
     )
     # `tree` on its owning host nests inside nothing and declares no
     # `requires` that resolves here, so network-online is its only
@@ -98,7 +98,7 @@ def test_mount_unit_top_level_subtree_is_ordered_after_the_network_only(
 
 
 def test_mount_unit_runs_as_the_stortree_service_account(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # Every nested mount depends on this being unconditional -- see the
     # "Note which mounts have another mount nested inside them" task in
@@ -107,7 +107,7 @@ def test_mount_unit_runs_as_the_stortree_service_account(
     unit = render(
         MOUNT_UNIT,
         entry=entry_for(mount_plans[BRAVO], "tree/home/.mounts/whitfield-media"),
-        **mount_vars(mount_plans, containers, parent_slugs, BRAVO),
+        **mount_vars(containers, BRAVO),
     )
     assert "User=stortree" in unit
     assert "Group=stortree" in unit
@@ -115,7 +115,7 @@ def test_mount_unit_runs_as_the_stortree_service_account(
 
 
 def test_mount_unit_nested_mount_is_partof_the_mount_it_lives_inside(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # PartOf, not just After: a parent remount otherwise leaves this
     # rclone process alive over a detached mountpoint, with systemd
@@ -123,7 +123,7 @@ def test_mount_unit_nested_mount_is_partof_the_mount_it_lives_inside(
     unit = render(
         MOUNT_UNIT,
         entry=entry_for(mount_plans[BRAVO], "tree/home/.mounts/whitfield-media"),
-        **mount_vars(mount_plans, containers, parent_slugs, BRAVO),
+        **mount_vars(containers, BRAVO),
     )
     assert "After=stortree-mount@tree.service" in unit
     assert "PartOf=stortree-mount@tree.service" in unit
@@ -133,7 +133,7 @@ def test_mount_unit_nested_mount_is_partof_the_mount_it_lives_inside(
 
 
 def test_mount_unit_prefers_its_containers_wrapper_mount_over_the_outer_mount(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # tree/home/jd/sys-configs sits directly under the per-user
     # container tree/home/jd, which nests inside a remote-backed mount
@@ -147,7 +147,7 @@ def test_mount_unit_prefers_its_containers_wrapper_mount_over_the_outer_mount(
     unit = render(
         MOUNT_UNIT,
         entry=entry,
-        **mount_vars(mount_plans, containers, parent_slugs, BRAVO),
+        **mount_vars(containers, BRAVO),
     )
     assert directives(unit, "After") == [
         "network-online.target",
@@ -159,7 +159,7 @@ def test_mount_unit_prefers_its_containers_wrapper_mount_over_the_outer_mount(
 
 
 def test_mount_unit_declared_requires_is_hard_and_never_partof(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # bravo's client mount of `tree` points its cache-dir into
     # .bravo-cache (docs/config-schema.md "Requires"). That's a hard
@@ -173,7 +173,7 @@ def test_mount_unit_declared_requires_is_hard_and_never_partof(
     unit = render(
         MOUNT_UNIT,
         entry=entry,
-        **mount_vars(mount_plans, containers, parent_slugs, BRAVO),
+        **mount_vars(containers, BRAVO),
     )
     cache_unit = "stortree-mount@.bravo\\x2dcache.service"
     assert f"After={cache_unit}" in unit
@@ -183,12 +183,12 @@ def test_mount_unit_declared_requires_is_hard_and_never_partof(
 
 
 def test_mount_unit_flattens_rclone_args_one_per_line(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     unit = render(
         MOUNT_UNIT,
         entry=entry_for(mount_plans[GADGET], "tree"),
-        **mount_vars(mount_plans, containers, parent_slugs, GADGET),
+        **mount_vars(containers, GADGET),
     )
     for expected in (
         "  --vfs-cache-mode full \\",
@@ -201,7 +201,7 @@ def test_mount_unit_flattens_rclone_args_one_per_line(
 
 
 def test_mount_unit_renders_a_boolean_true_arg_as_a_bare_flag(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # `rclone.args: {read-only: true}` is a valueless rclone flag, not
     # "--read-only True" (which rclone rejects). Nothing in the worked
@@ -213,7 +213,7 @@ def test_mount_unit_renders_a_boolean_true_arg_as_a_bare_flag(
     unit = render(
         MOUNT_UNIT,
         entry=entry,
-        **mount_vars(mount_plans, containers, parent_slugs, ALPHA),
+        **mount_vars(containers, ALPHA),
     )
     assert "  --read-only \\" in unit
     assert "  --dir-cache-time 5m \\" in unit
@@ -221,12 +221,12 @@ def test_mount_unit_renders_a_boolean_true_arg_as_a_bare_flag(
 
 
 def test_mount_unit_owner_grant_pins_uid_and_perms(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     unit = render(
         MOUNT_UNIT,
         entry=entry_for(mount_plans[BRAVO], "tree/home/jd/sys-configs"),
-        **mount_vars(mount_plans, containers, parent_slugs, BRAVO),
+        **mount_vars(containers, BRAVO),
     )
     assert "--allow-other \\" in unit
     assert "--uid 10001 \\" in unit  # jd, per stortree_user_uids
@@ -238,12 +238,12 @@ def test_mount_unit_owner_grant_pins_uid_and_perms(
 
 
 def test_mount_unit_group_grant_pins_gid_and_not_uid(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     unit = render(
         MOUNT_UNIT,
         entry=entry_for(mount_plans[BRAVO], "tree/home/.mounts/whitfield-media"),
-        **mount_vars(mount_plans, containers, parent_slugs, BRAVO),
+        **mount_vars(containers, BRAVO),
     )
     assert "--gid 20001 \\" in unit  # "Whitfield Family & Friends"
     assert "--uid" not in unit
@@ -252,21 +252,21 @@ def test_mount_unit_group_grant_pins_gid_and_not_uid(
 
 
 def test_mount_unit_forces_stortree_ownership_on_a_mount_others_nest_inside(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # `tree` carries no access grant of its own, but other mounts nest
     # inside it, so it must still present predictable stortree:stortree
     # ownership -- otherwise fusermount refuses every nested mount with
     # "bad mount point ... Permission denied" (the task comment in
     # roles/stortree_mounts).
-    assert "tree" in parent_slugs[BRAVO]
     entry = entry_for(mount_plans[BRAVO], "tree")
+    assert entry["has_nested_children"]
     assert entry["access"] == {}
 
     unit = render(
         MOUNT_UNIT,
         entry=entry,
-        **mount_vars(mount_plans, containers, parent_slugs, BRAVO),
+        **mount_vars(containers, BRAVO),
     )
     assert "--allow-other \\" in unit
     assert "--uid 900 \\" in unit  # stortree_uid
@@ -274,7 +274,7 @@ def test_mount_unit_forces_stortree_ownership_on_a_mount_others_nest_inside(
 
 
 def test_mount_unit_ungranted_leaf_mount_still_presents_the_plain_default(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # The complement of the test above: no grant *and* nothing nested
     # inside still gets --allow-other and the plain 0751 default, so the
@@ -293,11 +293,12 @@ def test_mount_unit_ungranted_leaf_mount_still_presents_the_plain_default(
         slug="tree-backups\\x2dmirror",
         access={},
         requires_slug="tree",
+        has_nested_children=False,
     )
     unit = render(
         MOUNT_UNIT,
         entry=entry,
-        **mount_vars(mount_plans, containers, parent_slugs, ALPHA),
+        **mount_vars(containers, ALPHA),
     )
     assert "--allow-other \\" in unit
     assert "--dir-perms 0751 \\" in unit
@@ -307,14 +308,14 @@ def test_mount_unit_ungranted_leaf_mount_still_presents_the_plain_default(
 
 
 def test_mount_unit_stop_is_tolerant_of_an_already_gone_mountpoint(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # With PartOf= above, a stop routinely runs after the tree this
     # mount lived in is already gone; that has to be a clean stop.
     unit = render(
         MOUNT_UNIT,
         entry=entry_for(mount_plans[ALPHA], "tree"),
-        **mount_vars(mount_plans, containers, parent_slugs, ALPHA),
+        **mount_vars(containers, ALPHA),
     )
     (stop,) = directives(unit, "ExecStop")
     assert 'mountpoint -q "/srv/stortree/tree" || exit 0' in stop
@@ -326,12 +327,12 @@ def test_mount_unit_stop_is_tolerant_of_an_already_gone_mountpoint(
 
 
 def test_user_mount_unit_presents_the_staging_dir_as_its_owner(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     unit = render(
         USER_MOUNT_UNIT,
         entry=container_for(containers[BRAVO], "tree/home/jd"),
-        **mount_vars(mount_plans, containers, parent_slugs, BRAVO),
+        **mount_vars(containers, BRAVO),
     )
     assert (
         "ExecStart=/usr/bin/rclone mount /srv/stortree/tree/home/stortree-user-jd "
@@ -347,7 +348,7 @@ def test_user_mount_unit_presents_the_staging_dir_as_its_owner(
 
 
 def test_user_mount_unit_is_partof_the_mount_its_staging_dir_lives_in(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # Observed in production: one wrapper survived an outer remount as a
     # live process with no mount behind it, and that user's folder sat
@@ -355,7 +356,7 @@ def test_user_mount_unit_is_partof_the_mount_its_staging_dir_lives_in(
     unit = render(
         USER_MOUNT_UNIT,
         entry=container_for(containers[ALPHA], "tree/home/mw"),
-        **mount_vars(mount_plans, containers, parent_slugs, ALPHA),
+        **mount_vars(containers, ALPHA),
     )
     assert "After=stortree-mount@tree.service" in unit
     assert "PartOf=stortree-mount@tree.service" in unit
@@ -363,7 +364,7 @@ def test_user_mount_unit_is_partof_the_mount_its_staging_dir_lives_in(
 
 
 def test_user_mount_unit_for_a_plain_local_container_has_no_ordering_edge(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # roles/stortree_mounts only renders this template for containers
     # with requires_slug set, but the template must not fall apart on
@@ -374,7 +375,7 @@ def test_user_mount_unit_for_a_plain_local_container_has_no_ordering_edge(
     unit = render(
         USER_MOUNT_UNIT,
         entry=entry,
-        **mount_vars(mount_plans, containers, parent_slugs, ALPHA),
+        **mount_vars(containers, ALPHA),
     )
     assert directives(unit, "After") == []
     assert directives(unit, "PartOf") == []
@@ -384,7 +385,7 @@ def test_user_mount_unit_for_a_plain_local_container_has_no_ordering_edge(
 
 
 def test_bind_unit_depends_on_both_its_source_and_its_container(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # A bind mount is Type=oneshot + RemainAfterExit, so it reports
     # active forever once ExecStart succeeded, with nothing running to
@@ -394,7 +395,7 @@ def test_bind_unit_depends_on_both_its_source_and_its_container(
     unit = render(
         BIND_UNIT,
         entry=entry_for(mount_plans[BRAVO], "tree/home/mw/mw-fam"),
-        **mount_vars(mount_plans, containers, parent_slugs, BRAVO),
+        **mount_vars(containers, BRAVO),
     )
     source = "stortree-mount@tree-home-.mounts-mw\\x2dfam.service"
     wrapper = "stortree-user-mount@tree-home-mw.service"
@@ -406,7 +407,7 @@ def test_bind_unit_depends_on_both_its_source_and_its_container(
 
 
 def test_bind_unit_binds_the_shared_mount_onto_the_per_user_path(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # A group-only grant backs every member's folder with one shared
     # mount plus a bind per member -- a symlink can't do this job on a
@@ -414,7 +415,7 @@ def test_bind_unit_binds_the_shared_mount_onto_the_per_user_path(
     unit = render(
         BIND_UNIT,
         entry=entry_for(mount_plans[BRAVO], "tree/home/jd/whitfield-media"),
-        **mount_vars(mount_plans, containers, parent_slugs, BRAVO),
+        **mount_vars(containers, BRAVO),
     )
     assert (
         "ExecStart=/bin/mount --bind "
@@ -424,7 +425,7 @@ def test_bind_unit_binds_the_shared_mount_onto_the_per_user_path(
 
 
 def test_bind_unit_stop_tolerates_an_already_unmounted_path(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # PartOf= means this unit is routinely stopped as part of a parent
     # remount, by which point its mountpoint can already be gone --
@@ -432,7 +433,7 @@ def test_bind_unit_stop_tolerates_an_already_unmounted_path(
     unit = render(
         BIND_UNIT,
         entry=entry_for(mount_plans[BRAVO], "tree/home/jd/whitfield-media"),
-        **mount_vars(mount_plans, containers, parent_slugs, BRAVO),
+        **mount_vars(containers, BRAVO),
     )
     (stop,) = directives(unit, "ExecStop")
     assert stop.startswith("-/bin/sh -c")  # leading `-`: failure ignored
@@ -442,7 +443,7 @@ def test_bind_unit_stop_tolerates_an_already_unmounted_path(
 
 
 def test_bind_unit_falls_back_to_requires_slug_without_a_wrapper(
-    render, mount_plans, containers, parent_slugs
+    render, mount_plans, containers
 ):
     # A container that's plain-local (chowned directly, no wrapper mount
     # rendered) leaves the bind ordered against whatever plan_mounts()
@@ -451,7 +452,6 @@ def test_bind_unit_falls_back_to_requires_slug_without_a_wrapper(
         BIND_UNIT,
         entry=entry_for(mount_plans[BRAVO], "tree/home/mw/mw-fam"),
         stortree_user_containers=[],
-        stortree_mounts_parent_slugs=parent_slugs[BRAVO],
     )
     assert "stortree-user-mount@" not in unit
     assert "After=stortree-mount@tree.service" in unit

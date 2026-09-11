@@ -1,4 +1,10 @@
-# stortree — development plan
+# stortree — specification
+
+What stortree is and how it behaves: the design the roles and
+`filter_plugins/stortree.py` implement, section by section. It says what
+the system does, not how it got built — [plan.md](plan.md) is the build
+plan, and the `§N` references throughout this repo point at the
+Architecture sections below.
 
 ## Goal
 
@@ -391,9 +397,12 @@ every remote (`storagebox`, `some-remote`, `some-gcs-bucket`, …). The
 `stortree_secrets` role reads the decrypted INI in memory (via the same
 filter plugin, using Python's `configparser`) and templates a **filtered,
 host-specific `rclone.conf`** containing only the remote sections that
-host's resolved server+client+Samba role actually needs (Samba sharing
-being universal per §1 means even a client-only host can pull in peer
-sections here), writing it to
+host's own **mount plan** (§2) references — every mount it makes gets
+its credentials, and nothing else does. Deriving it from the plan rather
+than from the resolved tree is deliberate: a host exports every Samba
+share in the tree (§1), so reading remotes out of *those* hands each
+host the credentials behind shares it exports but doesn't own, which is
+precisely what this scoping exists to prevent. Written to
 `/etc/stortree/rclone.conf` on that host (mode `0600`, owned by the local
 `stortree` service account). This keeps e.g. a storage-gadget's remote
 scoped to only the credentials it has a resolved use for — other remotes
@@ -412,13 +421,14 @@ with that subtree's own top-level path as the local path — the section's
 `path` is the owning host's own copy of that one subtree, and the
 client's mount unit references the synthesized section's name the same
 way any other peer-sourced mount does, instead of the subtree's own
-third-party `rclone.remote` value. A per-user peer dependency's %U gets resolved to a
-single real path here too, exactly the way `stortree_mounts` (§2, §6)
-independently resolves the same entry to its own one real mount — an
-owner grant's own path, or a group-only grant's one shared `.mounts`
-path, never one section per member — both have to agree on that resolved
-(not templated) path to name the section the same way, so
-`stortree_secrets` is the one role that resolves
+third-party `rclone.remote` value. A per-user peer dependency's %U is
+resolved to a single real path — an owner grant's own path, or a
+group-only grant's one shared `.mounts` path, never one section per
+member. The section is named for whatever path the *mount plan* landed
+on, so a mount and the section holding its credentials cannot disagree
+about it; that agreement used to be two separate resolutions of the same
+%U that happened to match. Resolving it needs real group membership,
+which is why `stortree_secrets` is the one role that resolves
 `stortree_group_members`/`stortree_group_gids`/`stortree_user_uids` (§6)
 fresh via `getent`, first in `site.yml`'s order among the roles that need
 them; `stortree_mounts` reuses those same facts rather than re-deriving
@@ -430,7 +440,7 @@ The `stortree_samba` role generates `smb.conf` share stanzas from every
 `samba:`-configured node resolved for the current host (§1) — which,
 since Samba sharing is universal, means every host gets a stanza for
 every such node in the tree, not only the ones whose subtrees it happens
-to own: path, subpath templates (`%U` for the `home` per-user pattern),
+to own: path (with Samba's `%U` where the node has `user-subdirs`),
 and `valid users`/`write list` derived from the resolved `access` rules
 once those are mapped to real POSIX groups/users (§5, §6). The stanza's
 name is the node's own `samba.name` where it sets one, and otherwise the

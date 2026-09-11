@@ -15,13 +15,12 @@
     # `stortree` (not `stortree_facts_*`) is deliberate: this is the
     # shared, cross-role fact every other role reads (spec.md §1), not a
     # role-private working variable.
-    # `stortree_root` (roles/stortree_common/defaults/main.yml) rather
-    # than the filter's own fallback: a client mount of a subtree this
-    # host doesn't own resolves to a peer reference with the owning
-    # host's absolute path baked in, so an overridden root has to reach
-    # resolve() or that path is silently wrong. Role defaults are visible
-    # across the whole play, so stortree_common's value is already in
-    # scope here even though its tasks run after this role's.
+    # `stortree_root` (this role's own defaults/main.yml, which is why
+    # it lives there -- see that file) rather than the filter's own
+    # fallback: a client mount of a subtree this host doesn't own
+    # resolves to a peer reference with the owning host's absolute path
+    # baked in, so an overridden root has to reach resolve() or that
+    # path is silently wrong.
     stortree: >-
       {{ stortree_tree
          | stortree_resolve(inventory_hostname, stortree_all_hosts, stortree_root) }}

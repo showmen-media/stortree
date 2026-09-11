@@ -59,11 +59,12 @@ its own, shaped exactly like any other node below it:
   samba:                       # presence marks this node for export — write it bare
                                # (or `samba: true`/`samba: {}`) to share with the
                                # defaults, `samba: false` to opt back out
-    subpath: "<template>"     # optional — e.g. "%U" for per-connecting-user
-                               # substitution; omit to share the node itself
                                # — every participating host exposes this node
                                # as a share, not just its resolved owner; see
-                               # "Samba sharing is universal" below
+                               # "Samba sharing is universal" below. The share
+                               # path is derived: a node with `user-subdirs`
+                               # gets Samba's per-user `%U`, one without serves
+                               # the node itself
     name: "<share-name>"      # optional — the share's name in smb.conf, i.e. what
                                # clients mount as //<host>/<name>; defaults to the
                                # node's path with everything outside [A-Za-z0-9_-]
@@ -121,7 +122,6 @@ tree:
     backups: {}
     home:
       samba:
-        subpath: "%U"
       user-subdirs:
         whitfield-media:
           access:
@@ -377,7 +377,7 @@ tree:
   rclone.remote: storagebox:/
   subdirs:
     home:
-      samba: {subpath: "%U"}
+      samba:
       subdirs:
         media-prod:
           access.group: Media Production      # what the owner enforces
@@ -549,12 +549,12 @@ Same map-of-`name -> node` shape, but they resolve differently:
   `user-subdirs` node are per-user folders, and the nodes listed
   (`whitfield-media`, `sys-configs`, `mw-fam`, `media-prod`) describe the
   substructure repeated inside each of those per-user folders, e.g.
-  `home/<username>/whitfield-media`, `home/<username>/sys-configs`. This
-  holds independent of `samba.subpath: "%U"` (set on `home` in the
-  example above) — that setting only templates the *Samba* path so
-  an SMB client lands in its own per-user folder, and is otherwise
-  irrelevant here; if `user-subdirs` is used without `samba.subpath`, the
-  per-user folders still have to be the immediate children of that node.
+  `home/<username>/whitfield-media`, `home/<username>/sys-configs`.
+  That shape is also what makes a `samba:` block on the same node a
+  per-user share: the Samba path picks up `%U` precisely when the node
+  has `user-subdirs` (see "Samba sharing is universal"), so an SMB
+  client lands in its own per-user folder rather than in the directory
+  holding everyone's.
   `access` on each descendant still applies per the usual rules, so
   `sys-configs` (`access.owner: jd`) only shows up inside `jd`'s own
   per-user folder, not everyone else's — an `owner` grant always pins
@@ -691,9 +691,8 @@ host" for the operator-facing side of this.
 
 A `samba:` block marks a node for export as an SMB share. It's the key's
 *presence* that marks it, not what's under it: `samba:` written bare,
-`samba: {}` and `samba: true` all mean "share this with the defaults"
-(no `subpath`, so the share serves the node itself). Only an explicit
-`samba: false` opts a node back out. That export is
+`samba: {}` and `samba: true` all mean "share this with the defaults".
+Only an explicit `samba: false` opts a node back out. That export is
 not limited to the node's own resolved `host` (or that host's usual peer
 dependencies, spec.md §1) — **every host in the Ansible inventory**
 exposes the share, including a host that owns no subtree of its own and
@@ -707,6 +706,39 @@ restricted to hosts that already serve some other part of the tree.
 There's no "designated Samba host": if a node has a `samba:` block, every
 inventory host — server, client-only, or entirely unnamed in
 `config.yml` — ends up serving it.
+
+#### The share path
+
+Where a share points is derived from the node, not written:
+
+- a node with a `user-subdirs` key is exported at `<node>/%U` — Samba
+  expands `%U` to the connecting username, so each user lands in their
+  own folder;
+- a node without one is exported at `<node>` itself.
+
+There is no key for this. The node's shape already answers the question:
+`user-subdirs` means the node's immediate children *are* per-user
+folders, so a share of that node that didn't descend into one would be
+exposing every user's folder to every other user — over SMB, with
+nothing at apply time saying so. That was previously reachable two ways,
+by omitting the old `samba.subpath` key or by misspelling it, and is now
+unreachable.
+
+It's the key's *presence* that decides, exactly as with `samba:` itself.
+`user-subdirs: {}` and a bare `user-subdirs:` declare no substructure
+yet, but they still say the node has a per-user level — reading them as
+"not per-user" would mean emptying a node's `user-subdirs` silently
+widens its share from one user's own folder to the directory holding
+everyone's.
+
+`%U` also earns each connecting user a standing entry in the share's
+`valid users`, so their access to their own folder doesn't depend on any
+particular descendant carrying an `access` grant.
+
+A config that still writes `samba.subpath` fails with a message saying
+so — it was a real key once, so it's rejected specifically rather than
+as a typo. Delete the line; the derived value is the one it was almost
+certainly setting.
 
 #### Share names
 
@@ -722,7 +754,6 @@ tree:
     home:
       samba:
         name: home
-        subpath: "%U"
 ```
 
 An explicit name is held to that same alphabet rather than sanitized
@@ -783,6 +814,52 @@ etc suffix — is different: it's a single literal key (this codebase's
 hidden-subtree naming convention, matching `.cache`'s own leading dot),
 not a two-segment shorthand with an empty first segment. It's left
 untouched rather than being expanded into `{"": {"bravo-cache": {...}}}`.
+
+## Names and identity
+
+Three things in a running fleet are named after a node's path, and all
+three use a *different* scheme. They look similar enough to be mistaken
+for one another when read side by side in a rendered file, so this is
+what each one is and why it isn't the others.
+
+| Name | Looks like | Escaping | On collision |
+| --- | --- | --- | --- |
+| systemd unit slug | `stortree-mount@tree-home-jd.service` | `\xHH` per segment | rejected |
+| rclone peer section | `[peer-storage-node-alpha-tree-home]` | none | rejected across hosts |
+| Samba share name | `[tree_home]` | fold to `_` | rejected |
+
+**systemd unit slugs** flatten `tree/home/jd` to `tree-home-jd` and are
+what `stortree-mount@`, `stortree-bind@` and `stortree-user-mount@` are
+instantiated with. Because a path segment may itself contain `-`, each
+segment is escaped on its own before the `-` join, in the same `\xHH`
+convention `systemd-escape` uses: a directory literally named
+`backups-mirror` becomes `backups\x2dmirror`, so it can't collide with
+nested `backups/mirror`. That makes the scheme injective — two paths
+cannot produce one unit name — and it is why unit names in
+`/etc/systemd/system` sometimes read oddly. Two mounts landing on one
+slug is still checked for and still fails the run, as a backstop.
+
+**rclone peer section names** flatten the same way and are deliberately
+*not* escaped, because they can't be: an rclone remote name may hold
+only letters, digits, `_`, `-`, `.` and space, so `\xHH` isn't
+available, and every readable alternative mangles ordinary names. The
+name stays legible instead — it's a string you read straight out of a
+rendered `rclone.conf` when a peer mount misbehaves — and the residual
+ambiguity is detected rather than encoded away. See "Peer section names"
+for the collision rule, which is narrower than the other two: only a
+collision between *different* owning hosts is an error.
+
+**Samba share names** don't escape either; they fold every character
+outside `A-Za-z0-9_-` to `_`, because that's the alphabet an operator
+types into a mount command. Unlike the other two, this one is
+overridable — `samba.name` on the node — and unlike the other two the
+name is a piece of config rather than purely derived. See "Share names".
+
+The common thread: a derived name that can't be made both injective and
+readable is made readable, and the collision is reported with both
+paths named rather than resolved silently. What differs is only how much
+room each target format leaves — systemd allows escapes, so slugs use
+them; rclone and Samba don't, so those two detect instead.
 
 ## ldap.yml
 

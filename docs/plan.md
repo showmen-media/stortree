@@ -1,16 +1,18 @@
 # stortree — build plan
 
-Tracks how [spec.md](spec.md) gets implemented, and current status. Section
-references below (`§1`, `§2`, ...) are spec.md's Architecture sections.
+How [spec.md](spec.md) got built: the judgment calls made where the spec
+left something implicit, the phases the work was done in, and what is
+and isn't verified. Section references below (`§1`, `§2`, ...) are
+spec.md's Architecture sections.
 
 ## Status
 
-Everything through phase 9 below is implemented: `resolve()`, all nine
-roles, both playbooks, and Molecule scaffolding for a per-role `default`
-scenario plus one multi-host `full-tree` scenario. What's **not** done is
-running `molecule test`/`molecule converge` against real Docker containers
-— see "What's verified" below for exactly what has and hasn't been
-exercised.
+Every phase below is done, and each says so. The list is kept as the
+record of how the project was built, not as a tracker to update — what
+is true of the code *today* is whatever `pytest`, `ansible-lint` and
+`yamllint --strict` say when you run them, and `git log` is the account
+of how it changed. The one thing no check here covers is in "What's
+verified" below, and that gap is real rather than pending.
 
 ## Repo hygiene
 
@@ -183,55 +185,42 @@ implementation:
 
 ## What's verified
 
-Docker on the machine this was built on is in daily use for unrelated
-services, so `molecule test`/`molecule converge` (which needs privileged,
-systemd-in-Docker containers plus throwaway LDAP/sftp containers, §9) was
-deliberately **not** run here. Everything else below is run by hand on a
-checkout — GitHub Actions workflows that would run it on every push
-(`ci.yml`) and the Molecule scenario on manual dispatch (`molecule.yml`)
-are written, but live on the unmerged `github-workflows` branch rather
-than on `master`:
+Everything in this repo is checked without a running fleet, and one
+thing isn't checked at all.
 
-- `pytest` — three layers, all pure and hostless:
-  - `resolve()`/`filter_rclone_conf()` and the rest of
-    `filter_plugins/stortree.py`, including the mutual-peer-dependency,
-    client-only-host, and unnamed-inventory-host cases §1 calls out
-    explicitly. Statement *and* branch coverage of that module is at
-    100%, enforced by a `fail_under` floor in `pyproject.toml`.
-  - the `FilterModule` mapping itself (`tests/test_filters.py`) — that
-    every name a role pipes through is registered, and vice versa. A
-    typo there breaks every playbook while leaving the resolution tests
-    green, which is exactly what it used to do.
-  - the roles' Jinja templates (`tests/test_templates.py`) — the three
-    systemd unit templates, `smb.conf.j2` and `sssd.conf.j2`, rendered
-    through ansible-core's own filters/tests/`AnsibleUndefined` against
-    real `plan_mounts()`/`user_container_paths()` output. This is the
-    layer where a wrong `PartOf=` or a missing `--uid` becomes a mount
-    that silently serves the wrong thing, and it previously had no
-    coverage outside the unrun Molecule scenario.
-  - drift guards (`tests/test_repo_consistency.py`) — the worked example
-    exists in three copies (unit fixture, `stortree/config.yml.example`,
-    Molecule fixture) and `molecule/full-tree/converge.yml` claims to be
-    1:1 with `playbooks/site.yml`; both are now checked rather than
-    maintained by hand, along with the repo-hygiene rule above.
-- `ansible-playbook playbooks/site.yml --syntax-check` and the same for
-  `status.yml`, run against config copied from the `*.example` files by
-  the same commands README.md gives an operator — so a stale example
-  fails CI rather than someone's first run.
+Run by hand on a checkout (and by `ci.yml` on the unmerged
+`github-workflows` branch, which is why this says "by hand"):
+
+- `pytest` — the pure resolution layer, the `FilterModule` mapping, the
+  roles' real Jinja templates rendered through ansible-core's own
+  filters, and a set of drift guards over the things this repo keeps in
+  more than one place. Each `tests/*.py` opens with what it covers and
+  why; that's the description, not this list. Statement *and* branch
+  coverage of `filter_plugins/stortree.py` is at 100%, enforced by a
+  `fail_under` floor in `pyproject.toml`, so a new branch has to arrive
+  with the test that exercises it.
+- `ansible-playbook playbooks/site.yml --syntax-check`, and the same for
+  `status.yml`, against config copied from the `*.example` files by the
+  same commands README.md gives an operator — so a stale example fails
+  before someone's first run does.
 - `ansible-lint` (clean at the `production` profile) and `yamllint
-  --strict` over the whole repo. Both were run by hand at the time this
-  section was first written and had since drifted red; the skips that
-  remain are listed with their rationale in `.ansible-lint`.
+  --strict` over the whole repo. The skips that remain are listed with
+  their rationale in `.ansible-lint`.
 - `shellcheck` over `pam-smbpass-sync.sh`, which runs as root inside the
   PAM stack with a plaintext password on stdin.
 
-Still not run: `molecule test` for any role, or the `full-tree`
-scenario. The scenario files exist, are checked for internal consistency
-by `tests/test_repo_consistency.py`, and are believed correct, but
-remain unexercised — before trusting this against real hosts, run at
+**Not run: Molecule, in any scenario.** `molecule test`/`molecule
+converge` needs privileged systemd-in-Docker containers plus throwaway
+LDAP/sftp containers (§9), and Docker on the machine this was built on
+is in daily use for unrelated services. The scenario files exist and are
+checked for internal consistency by `tests/test_repo_consistency.py`,
+but nothing has ever applied a role to a container, mounted a real
+remote, or exercised a genuine two-host peer dependency.
+
+That is the gap to close before trusting this against real hosts: run at
 least the `full-tree` scenario (`cd molecule/full-tree && molecule
-test`, or per-role via `cd roles/<role> && molecule test`) somewhere Docker
-capacity isn't shared with other workloads, then a staging pass
+test`, or per-role via `cd roles/<role> && molecule test`) somewhere
+Docker capacity isn't shared with other workloads, then a staging pass
 (`ansible-playbook site.yml --check --diff` against real hosts, then a
-real apply) per spec.md §9's own caveat about what Molecule-in-Docker
+real apply) — see spec.md §9's own caveat about what Molecule-in-Docker
 does and doesn't prove.
