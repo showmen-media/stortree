@@ -289,7 +289,7 @@ unit, since it isn't a second rclone mount of the same remote.
 
 Every one of those containment dependencies also carries `PartOf=`, and
 that part is not optional bookkeeping. A mount nested inside another
-mount — a nested rclone mount, a per-user wrapper mount (§6), or a bind
+mount — a nested rclone mount, a presentation mount (§6), or a bind
 mount, all three — has its mountpoint inside the parent's presented tree,
 so remounting the parent detaches it. `After=`/`Requires=` propagate
 start ordering and stop, never *restart*, so nothing brings the nested
@@ -300,7 +300,7 @@ there's no process left to notice at all; an rclone mount usually dies
 with its parent and gets restarted, but not reliably. This was observed
 in production the first apply after `requires` landed: adding the key
 changed one outer mount's unit file, restarting it took every nested
-mount on that host with it, three of four wrapper mounts died and were
+mount on that host with it, three of four presentation mounts died and were
 restarted normally, and the fourth survived as a live process with no
 mount behind it — so the next `state: started` was a no-op and that one
 user's folder sat at the bare `stortree:stortree` directory underneath
@@ -728,7 +728,7 @@ actually needed).
 
 The per-user folder `access_grant_usernames()` says a `user-subdirs`
 node needs — `home/jd`, say — is itself owned by that one real user, not
-`stortree`: `user_container_paths()` derives, from the same
+`stortree`: `staged_node_paths()` derives, from the same
 `server_subtrees`/`peer_dependencies` facts, every `<prefix>/<username>`
 container any resolved grant anywhere under that prefix implies (deduped
 by path — several sibling descendants resolving to the same user all
@@ -741,7 +741,7 @@ bare traversal `access_mode()`'s public-execute bit alone would give an
 here, the container and the grant agree on exactly who it's for.
 
 Getting there takes one of two different mechanisms, depending on what
-the container's own ancestors look like, and `user_container_paths()`
+the container's own ancestors look like, and `staged_node_paths()`
 tells `stortree_mounts` which one applies via `requires_slug` (`_nearest_
 mount_slug()` against the resolved mount plan, checking not the
 container's own path but its *staging path*, below): a genuinely local
@@ -757,24 +757,55 @@ mount's own single, uniform `--uid`/`--gid` says, for the simple reason
 that a plain `chown()`/`chmod()` through that mount's FUSE layer has
 nowhere real to persist a *different* value for just this one path.
 
-For that second case, `stortree_mounts` renders a per-user "wrapper
-mount" instead: an `rclone mount` using the `local` backend (source =
-`STORTREE_USER_PREFIX + username`, a sibling of the container itself,
+For that second case, `stortree_mounts` renders a **presentation
+mount** instead (`stortree-present@.service.j2`): a `bindfs` mount whose
+source is a sibling staging directory (`STORTREE_STAGING_PREFIX + name`)
 inside the very same remote-backed ancestor — ordinary content nothing
-but the `stortree` account driving both mounts ever touches directly;
-target = the container's own path), with that one user's real
-`--uid`/`--gid`/`--dir-perms`. This works where a plain `chown` can't
-because rclone's VFS-layer `--uid`/`--gid`/`--dir-perms`/`--file-perms`
-override applies uniformly to whatever a mount presents, *regardless* of
-backend or of what the underlying path natively supports — the same
-mechanism that already lets any remote-backed node's mount present
-`access`-derived ownership at all, on a backend with no native
-permission concept of its own (S3, say). No second network connection
-either: the wrapper's source is
-already local (it's read through the outer mount, which already has
-whatever network connection it needs), so `vfs-cache-mode: off` on the
-wrapper — there's no network latency at this layer to hide, only
-staleness risk against the real mount underneath it.
+but the `stortree` account ever touches directly — and whose target is
+the node's own path, carrying the resolved `access` grant as
+`-u`/`-g`/`-p`. This works where a plain `chown` can't because the
+ownership is *synthesized in the reply* rather than stored: it applies
+uniformly to whatever the mount presents, regardless of backend or of
+what the underlying path natively supports.
+
+The same mechanism covers two kinds of node, which is why
+`staged_node_paths()` collects both. A **per-user container** is the
+case above. A **granted plain-directory node** — one carrying an
+`access` grant with no `rclone.remote` of its own — has the identical
+problem one level up: its grant names an owner, group and mode, and
+before presentation mounts were general, nothing applied any of them.
+Ansible reported the chown as `changed` on every apply while `stat`
+kept returning the ancestor mount's own uniform owner.
+
+Three flags are not obvious and are load-bearing:
+
+- **`-p`** takes one chmod-style spec for files and directories both,
+  where rclone took `--dir-perms` and `--file-perms` separately. The
+  octal is therefore the *file* mode and capital `X` puts the execute
+  bits back on directories alone — see `bindfs_perms()`. Passing
+  `access_mode()` straight through would mark every regular file in the
+  subtree executable.
+- **`--mirror=<service account>`** is what lets a granted node contain
+  anything else. Without it the mount presents its path as the granted
+  owner to everyone, `stortree` included, and `fusermount` then refuses
+  every nested mount underneath it — a descendant with its own remote,
+  or another presentation — with "user has no write access to
+  mountpoint". The tree's previous answer was to force any mount with
+  nested children to `stortree:stortree` and discard its grant, which is
+  precisely the bug this mechanism exists to fix. `--mirror` keeps the
+  grant real for every actual user and lets only the account that
+  already owns the staging directory see itself as owner.
+- **`-o nonempty`** is required, not defensive: Debian's `bindfs` links
+  libfuse2, which refuses a non-empty mountpoint outright, and a staged
+  node's mountpoint is routinely non-empty. rclone mounted over that
+  silently. libfuse3 dropped the check and ignores the option.
+
+No second network connection either: the source is already local (it's
+read through the outer mount, which already has whatever network
+connection it needs), and `bindfs` keeps no cache of its own to go
+stale — a write through the staging path shows at the presented path
+immediately, where the rclone wrapper this replaced could hide it for
+minutes behind its VFS directory cache.
 
 `access_grant_usernames()` says *who* gets a folder; `per_user_mount_path()`
 says *where the real content actually lives*, and the two only disagree
@@ -817,46 +848,57 @@ so no `smb.conf` change is needed for this to work either. A peer-sourced
 real, shared path — there's nothing at a per-member path on the owning
 host's own disk for a `group`-only grant, bind mount included.
 
-A per-user container's own wrapper mount (above) changes what a
-descendant's bind-mount unit has to wait for, when that descendant lives
-directly under a wrapped container: `mw-fam`'s `home/jd/mw-fam` used to
-just nest inside the outer remote-backed mount directly; once `home/jd`
-itself is a separate wrapper mount, `home/jd/mw-fam` nests *inside that
-wrapper's own presented tree* instead, so `mw-fam`'s bind-mount unit has
-to come after the wrapper mount, not just the outer one. `mw-fam` itself
-is completely unchanged by this — same bind mount, same gid ownership,
-same everything — only *when* its unit is allowed to start moves; the
-`stortree-bind@`/`stortree-mount@` unit templates both check, ahead of
-whatever `plan_mounts()` itself computed as `requires_slug`, whether the
-entry's own immediate parent is a container with a wrapper mount of its
-own, and prefer that dependency when one exists. This preserves the
-"real ownership stacks on top" pattern (§6) one level deeper: `mw-fam`'s
-own distinct group ownership shadows whatever the wrapper mount
-would've shown at that exact path, exactly as it already shadowed the
-outer mount before the wrapper existed — rclone's uid/gid override is
-uniform across a whole mount (no way to carve out one nested path with a
-different owner from inside the same mount), so this is the only way
-`mw-fam`'s ownership and the container's can coexist at all.
+A staged node's own presentation mount (above) changes what a
+descendant's bind-mount unit has to wait for: `mw-fam`'s `home/jd/mw-fam`
+used to just nest inside the outer remote-backed mount directly; once
+`home/jd` itself is a presentation mount, `home/jd/mw-fam` nests
+*inside that presentation's tree* instead, so `mw-fam`'s bind-mount unit
+has to come after it, not just after the outer one. `mw-fam` itself is
+completely unchanged by this — same bind mount, same gid ownership, same
+everything — only *when* its unit is allowed to start moves; the
+`stortree-bind@`/`stortree-mount@` unit templates both consult
+`presented_ancestor()`, ahead of whatever `plan_mounts()` itself computed
+as `requires_slug`, and prefer that dependency when one exists.
 
-Ordering alone isn't enough, though: a wrapped container's path stops
-being a real directory the moment its wrapper mounts, and becomes a
+That is a *search* for the deepest staged ancestor, not a look at the
+immediate parent. A container is always the immediate parent of what
+nests inside it, so the immediate-parent lookup this replaced was
+sufficient while containers were the only staged paths there were. A
+granted plain-directory node can sit several levels above the mount
+nested in it — a grant at `system/data` presenting a descendant mount at
+`system/data/store/thing` is two — and the old lookup silently found
+nothing there, leaving that descendant with no ordering at all against
+the mount that owns its mountpoint.
+
+This preserves the "real ownership stacks on top" pattern (§6) one level
+deeper: `mw-fam`'s own distinct group ownership shadows whatever the
+presentation would've shown at that exact path, exactly as it already
+shadowed the outer mount before — a mount's uid/gid override is uniform
+across the whole mount (no way to carve out one nested path with a
+different owner from inside it), so this is the only way `mw-fam`'s
+ownership and the container's can coexist at all.
+
+Ordering alone isn't enough, though: a staged node's path stops
+being a real directory the moment its presentation mounts, and becomes a
 mountpoint whose visible contents are the *staging* directory's. So a
 directory created at `home/jd/mw-fam` — the empty mountpoint every
-bind mount needs — is simply hidden the instant the wrapper comes up,
+bind mount needs — is simply hidden the instant the presentation comes up,
 and the bind's own `mount --bind` then fails outright against a path
-that, as far as anything above the wrapper can see, doesn't exist. This
-is how the first apply after wrapper mounts existed actually failed in
+that, as far as anything above the presentation can see, doesn't exist. This
+is how the first apply after these mounts existed actually failed in
 production: all eight per-user binds, both hosts, each one's new
-`Requires=` on the wrapper dutifully bringing the wrapper up first and
+`Requires=` dutifully bringing the presentation up first and
 thereby hiding the very mountpoint the unit was about to mount onto.
 `physical_path()` (`filter_plugins/stortree.py`) is the fix and the
 general rule: every directory `stortree_mounts` creates is created at
-its *physical* path, rewriting anything strictly inside a wrapped
-container to the staging directory the wrapper re-presents it from, so
-it shows up at the visible container path for real and stays mountable.
-Strictly inside — the container path itself is the wrapper's own
+its *physical* path, rewriting anything strictly inside a staged
+node to the staging directory its presentation serves it from, so it
+shows up at the visible path for real and stays mountable. Outward,
+deepest staged ancestor first, because staged nodes nest where
+containers never could.
+Strictly inside — a staged node's own path is its presentation's
 mountpoint and has to keep existing exactly where it is; and an
-unwrapped (plain local, directly chowned) container has no wrapper
+unstaged (plain local, directly chowned) node has no presentation
 shadowing anything, so nothing under it moves at all. The mount units
 themselves are untouched by this: they still mount onto the visible
 path, which is the whole point — only directory *creation* follows the

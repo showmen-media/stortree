@@ -79,26 +79,30 @@ implementation:
    spec.md at all — every existing mechanism enforces a *descendant's*
    `access` grant, never the per-user container path itself
    (`home/jd`), which every task in `stortree_mounts` left at the plain
-   `stortree:stortree` default. Resolved to: `user_container_paths()`
+   `stortree:stortree` default. Resolved to: `staged_node_paths()`
    (`filter_plugins/stortree.py`) derives the one real user each
    container belongs to, and `stortree_mounts` gives it real ownership —
    but *how* depends on what's above it, since that's the one thing this
    call couldn't just apply uniformly: a plain `chown`/`chmod` for a
    container nested under a genuinely local top-level subtree (`host`
    set, no `rclone`), since real, native Unix ownership already works
-   there; a dedicated per-user "wrapper mount" (`rclone mount`'s `local`
-   backend, source = a `stortree-user-<name>` sibling of the container,
-   target = the container itself, that user's real `--uid`/`--gid`/
-   `--dir-perms`) for one nested inside a remote-backed ancestor's own
-   rclone mount instead, discovered the hard way against a live
-   deployment: a plain `chown` there is accepted by the FUSE layer
-   (Ansible reports `changed`) but never actually persists, since a
-   single rclone mount can only ever present one uniform owner for
-   everything under it. That same constraint is also why a sibling
+   there; a **presentation mount** (`bindfs`, source = a
+   `.stortree-staging-<name>` sibling, target = the node itself, the
+   resolved grant as `-u`/`-g`/`-p`) for one nested inside a
+   remote-backed ancestor's own rclone mount instead, discovered the
+   hard way against a live deployment: a plain `chown` there is accepted
+   by the FUSE layer (Ansible reports `changed`) but never actually
+   persists, since a single mount can only ever present one uniform
+   owner for everything under it.
+
+   Generalised since: the identical problem applies to *any* node with
+   an `access` grant and no `rclone.remote` of its own, not just a
+   per-user container, and the same staging-plus-presentation mechanism
+   now covers both. That same constraint is also why a sibling
    descendant with its own distinct ownership (a `group`-only grant's
-   bind mount, e.g. `mw-fam`) now has to wait for the wrapper mount too,
+   bind mount, e.g. `mw-fam`) has to wait for the presentation too,
    stacking its own real ownership on top exactly as it already stacked
-   on the outer mount before the wrapper existed (spec.md §6).
+   on the outer mount before (spec.md §6).
 
 5. **What a key the schema doesn't define should do**, and **what
    counts as a `samba:` block.** Neither is stated anywhere. Both were
@@ -237,7 +241,7 @@ been applied to, and one scenario that has never run at all.
 
 **Applied in production.** These roles run against a real fleet, and a
 number of the design decisions above exist *because* the obvious version
-failed there — interpretation call #4's wrapper mounts (a plain `chown`
+failed there — interpretation call #4's presentation mounts (a plain `chown`
 inside an rclone mount reports `changed` and silently doesn't persist),
 the non-fatal directory creation in `stortree_mounts` (a stale mount
 blocking the very render that would fix it, twice in a row), the
@@ -247,6 +251,33 @@ but the last lookup). Each is marked at its point of implementation with
 what it broke. That is real evidence, but it is evidence about *these*
 hosts in *their* current state — it says nothing about a first apply
 onto a clean one, which is the gap below.
+
+**Measured in production**, when the presentation layer moved from
+`rclone mount` to `bindfs`. Four presentation mounts over a 1000-file
+tree on the fleet's most distant host — the one that peer-mounts
+everything, so it has the longest path to the backend:
+
+| | rclone | bindfs |
+| --- | --- | --- |
+| recursive `ls -lR` | 0.178s median | 0.135s median |
+| resident memory, 4 mounts | 47.28 MB | 1.46 MB |
+| write via staging, `stat` via the presented path | not visible after 10s | visible immediately |
+
+The staleness row is the correctness one: a presentation mount's whole
+job is to re-present a path something else is writing, and rclone's VFS
+directory cache hid a new file for longer than the test would wait.
+
+Under concurrency the single-threaded presentation holds up — per-listing
+latency *falls* from 0.133s at K=1 to 0.056s at K=16, and wall time grows
+sub-linearly (16× the work in 6.8× the time). Sequential reads pay
+nothing measurable for the extra layer: 98.6–99.3 MB/s through the
+presentation against 94.6–96.4 MB/s straight off the transport mount.
+Metadata-only listings are the one place the layer shows, at roughly 3.7×
+on a warm cache — a microbenchmark's worst case for a passthrough
+filesystem, and the reason the numbers above are recorded rather than
+assumed. A bind-mounted descendant bypasses the presentation entirely
+(it is its own mount at that path), so nothing fanned out that way pays
+even that.
 
 Run by hand on a checkout (and by `ci.yml` on the unmerged
 `github-workflows` branch, which is why this says "by hand"):

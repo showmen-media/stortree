@@ -600,12 +600,14 @@ Same map-of-`name -> node` shape, but they resolve differently:
   which descendant triggered it changes who owns it. How that ownership
   actually gets applied depends on what's above the container: a plain
   `chown` for a genuinely local top-level subtree (`host` set, no
-  `rclone`), or a dedicated per-user mount for one nested inside a
+  `rclone`), or a **presentation mount** for one nested inside a
   remote-backed subtree like `tree` here, since a single rclone mount
   can't present two different paths under it with two different owners.
-  See spec.md §6 (`user_container_paths()`) for the mechanism, and its
-  own note there on what this means for a sibling like `mw-fam`'s bind
-  mount, which now has to wait for that per-user mount too.
+  The same mechanism applies to any node with an `access` grant and no
+  `rclone.remote` of its own, not only per-user containers. See spec.md
+  §6 (`staged_node_paths()`) for the mechanism, and its own note there
+  on what this means for a sibling like `mw-fam`'s bind mount, which
+  has to wait for that presentation too.
 
 ### Access
 
@@ -963,7 +965,7 @@ what each one is and why it isn't the others.
 | Samba share name | `[tree_home]` | fold to `_` | rejected |
 
 **systemd unit slugs** flatten `tree/home/jd` to `tree-home-jd` and are
-what `stortree-mount@`, `stortree-bind@` and `stortree-user-mount@` are
+what `stortree-mount@`, `stortree-bind@` and `stortree-present@` are
 instantiated with. Because a path segment may itself contain `-`, each
 segment is escaped on its own before the `-` join, in the same `\xHH`
 convention `systemd-escape` uses: a directory literally named

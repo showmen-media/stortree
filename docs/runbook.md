@@ -121,6 +121,42 @@ under the masked subtree, and `...ignoring` after a `stat`
 `Permission denied` on the probe task itself -- both expected, not
 failures. Two runs back-to-back clear it; nothing to invoke by name.
 
+## A stranded mount after a node gains a presentation
+
+Symptom: a nested mount's unit restart-loops with `Fatal error:
+directory already mounted, use --allow-non-empty to mount anyway`, and
+the path it serves lists as empty. `findmnt` shows it attached as a
+sibling of the mount it should be nested inside.
+
+Cause is one-time and specific to the apply that *introduces* a
+presentation mount over a path that already has mounts nested under it.
+The nested mount was established against the real directory; the new
+presentation then mounted over its parent, so the nested mount is still
+attached but is no longer reachable at the path it occupies. Its own
+`ExecStop` is a no-op there -- `mountpoint -q` resolves through the
+presentation and correctly reports nothing mounted -- so stopping and
+starting the unit cannot clear it, and the fresh `rclone mount` then
+refuses the still-occupied mountpoint. Restarting the presentation
+alone does not help either: `PartOf=` propagates a stop to the nested
+unit, but the stranded mount is not what that unit is holding.
+
+Fix, once, on that host -- stop from the outside in, unmount the
+stranded mount while it is reachable, then start in the other order:
+
+```sh
+systemctl stop 'stortree-mount@<nested-slug>.service'
+systemctl stop 'stortree-present@<node-slug>.service'
+fusermount -uz /srv/stortree/<nested path>        # now reachable
+systemctl start 'stortree-present@<node-slug>.service'
+systemctl start 'stortree-mount@<nested-slug>.service'
+```
+
+Confirm with `findmnt`: the nested mount should now render as a child
+of the presentation, not a sibling. Nothing to do on a host that gets
+both mounts in the same apply from a clean state -- the units' own
+`After=`/`PartOf=` (via `presented_ancestor()`) order them correctly
+from then on, and this cannot recur for that node.
+
 ## "N path(s) ... are still missing" at the end of a mounts run
 
 `stortree_mounts` creates directories with `ignore_errors: true`

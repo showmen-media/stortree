@@ -12,8 +12,9 @@ Ansible project.
 
 > **Status: running in production against a real fleet; the Molecule
 > harness has never been run.** A good deal of the design below is scar
-> tissue from live applies — the `PartOf=` on nested mounts, the wrapper
-> mounts for per-user containers, the non-fatal directory creation, and
+> tissue from live applies — the `PartOf=` on nested mounts, the
+> presentation mounts for granted nodes, the non-fatal directory
+> creation, and
 > the unknown-key rejection each exist because the obvious version broke
 > on real hosts; those incidents are recorded at their point of
 > implementation. What that leaves untested is the *clean-slate* path:
