@@ -21,7 +21,13 @@
     # resolves to a peer reference with the owning host's absolute path
     # baked in, so an overridden root has to reach resolve() or that
     # path is silently wrong.
+    # `stortree_samba_hosts` (this role's own defaults, alongside
+    # stortree_all_hosts) narrows which hosts export shares. It has to
+    # reach resolve() rather than only gating the stortree_samba role,
+    # because it also suppresses the peer mounts made purely to back
+    # those shares -- see resolve()'s own docstring.
     stortree: >-
       {{ stortree_tree
-         | stortree_resolve(inventory_hostname, stortree_all_hosts, stortree_root) }}
+         | stortree_resolve(inventory_hostname, stortree_all_hosts, stortree_root,
+                            stortree_samba_hosts) }}
   tags: [facts]

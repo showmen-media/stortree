@@ -463,6 +463,40 @@ The role validates every rendered `smb.conf` with `testparm` (as a
 fails the play instead of getting written) before triggering a `smbd`
 reload handler.
 
+The `[global]` block is stortree's own defaults merged with
+`stortree_samba_globals` (`roles/stortree_samba/defaults/main.yml`), a
+per-site escape hatch shaped exactly like `ldap.yml`'s `extra:` for
+`sssd.conf` (§5) and there for the same reason: no fleet's Samba
+settings are fully derivable from this tree — `workgroup` above all —
+and without an override the only way to change one is to fork the
+template. A key of the same name replaces the built-in value rather than
+appending a second line, and `testparm` above validates the result, so a
+misspelled directive fails the apply. What `testparm` can't catch is an
+override that is valid but defeats the model: `security = user` and
+`passdb backend = tdbsam` are what make authentication local against the
+NT hashes `stortree_pam_smbpass` syncs (§5) while authorization stays
+the underlying Unix ownership/mode (§6), so changing either is a change
+to the design, not a tweak. `server min protocol` is pinned explicitly
+to what Samba ≥ 4.11 already defaults to — it changes nothing on any
+supported platform, but it puts the posture in the rendered file and
+keeps a future distro default from quietly lowering it.
+
+**Which hosts export at all.** Universality is the default, and the
+`stortree_samba_hosts` list (`roles/stortree_facts/defaults/main.yml`,
+defaulting to the whole fleet) is how a host opts out of it. The list
+reaches `resolve()` rather than only gating the role, because the share
+stanza is the cheap half: the expensive half is the peer sftp mount a
+host makes purely to hold content for a share it exports but doesn't own
+(§1), which is an rclone process and a VFS cache of another host's
+bytes. An excluded host therefore resolves neither, while keeping its
+own client mounts — wanting the tree locally is independent of
+re-exporting it. The same list filters `peer_served_by` on the owning
+side, so §7's trust provisioning never grants SSH access for a mount the
+other end has opted out of making. It is a fleet-level list rather than
+a per-host flag precisely so both ends reach that conclusion from the
+same input, without the `hostvars` cross-referencing §1 rules out. See
+config-schema.md "What universality costs" for the operator-facing view.
+
 ### 5. Identity & authentication (LDAP + SSSD)
 
 `stortree_identity` configures SSSD on every host against the LDAP server

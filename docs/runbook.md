@@ -121,6 +121,72 @@ under the masked subtree, and `...ignoring` after a `stat`
 `Permission denied` on the probe task itself -- both expected, not
 failures. Two runs back-to-back clear it; nothing to invoke by name.
 
+## "N path(s) ... are still missing" at the end of a mounts run
+
+`stortree_mounts` creates directories with `ignore_errors: true`
+throughout, because a stale mount must not abort the play before the
+render/restart step that would fix it (see that file's header). The
+price is that the creation tasks themselves can't report a real failure,
+so the role re-stats every path it expected at the end of the run and
+prints whatever is still missing.
+
+One missing path is not automatically a bug:
+
+- **Expected.** You just added a nested entry, and its own parent mount
+  didn't exist yet when creation was attempted. This is the documented
+  two-run pattern -- run `site.yml` again and the list should be empty.
+- **Real.** The same paths are still listed after a second, back-to-back
+  apply. Scroll back to the `ignore_errors`'d directory tasks in the run
+  output: the actual error (a full disk, a backend rejecting the write,
+  a permission bug) is on the `...ignoring` line there, which is the
+  thing this report exists to stop you from scrolling past.
+
+Paths under a masked mount are excluded from the report entirely -- see
+"A masked mount" above, which is its own known state.
+
+To make it fatal instead of advisory, set `stortree_mounts_strict=true`:
+
+```
+ansible-playbook playbooks/site.yml -e stortree_mounts_strict=true
+```
+
+Worth doing in CI or as a post-deploy gate, where a *converged* fleet is
+the expectation and a second apply should be clean. Leave it off for an
+ordinary apply that adds tree entries, or the legitimate first of the
+two runs will fail.
+
+## Changing Samba's `[global]` settings (e.g. `workgroup`)
+
+stortree renders the whole of `/etc/samba/smb.conf`, so hand-editing it
+is overwritten on the next apply. Set `stortree_samba_globals` instead
+(inventory, `group_vars`, or `-e`) -- it merges over stortree's own
+built-in globals, so a key of the same name replaces that value rather
+than adding a second line:
+
+```yaml
+# group_vars/all.yml
+stortree_samba_globals:
+  workgroup: EXAMPLE
+  server string: "%h (stortree)"
+```
+
+`testparm -s` validates the rendered file before it is written, so a
+misspelled directive fails the apply rather than reaching the host. It
+will *not* catch an override that is valid but defeats the access model
+-- `security` and `passdb backend` are load-bearing (see
+`smb.conf.j2`'s own comment).
+
+## Taking a host out of Samba service
+
+Narrow `stortree_samba_hosts` (defaults to the whole fleet) and re-run
+`site.yml`. The host stops exporting shares, stops peer-mounting the
+content that existed only to back them, and has its `smbd` stopped and
+disabled; the package and `/etc/samba/smb.conf` are deliberately left in
+place for you to remove by hand if the host is done with Samba for good.
+Its own client mounts of the tree are unaffected. See
+[config-schema.md](config-schema.md) "What universality costs" for why
+this is a fleet-level list rather than a per-host flag.
+
 ## Recovering the control node
 
 Only `stortree/` (plus the vault password, stored separately) is the

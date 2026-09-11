@@ -302,3 +302,53 @@ def test_the_role_derives_no_unit_name_the_plugin_does_not_render():
         "unit names are being rebuilt in the role instead of read from the "
         f"render task's own dest: {interpolated}"
     )
+
+
+def test_stortree_samba_hosts_is_defined_once_and_gates_both_ends():
+    # The opt-out is only correct if the *same* list reaches resolve()
+    # and the stortree_samba role: resolve() decides which shares and
+    # peer mounts exist, the role decides whether smbd serves them. Gate
+    # one on a different variable than the other and a host either
+    # exports shares whose content it never mounted, or mounts content
+    # for shares it never exports.
+    defining = [
+        role.name
+        for role in sorted((REPO_ROOT / "roles").iterdir())
+        if role.is_dir()
+        and (role / "defaults" / "main.yml").is_file()
+        and "stortree_samba_hosts" in (role_defaults(role.name) or {})
+    ]
+    assert defining == ["stortree_facts"]
+
+    # Passed positionally into stortree_resolve by the facts role...
+    facts = (REPO_ROOT / "roles/stortree_facts/tasks/main.yml").read_text()
+    assert "stortree_samba_hosts" in facts
+    assert "stortree_resolve(" in facts
+
+    # ...and read by every task of the samba role, so none of them can
+    # act on a host the resolver already excluded.
+    samba = yaml.safe_load(
+        (REPO_ROOT / "roles/stortree_samba/tasks/main.yml").read_text()
+    )
+    for task in samba:
+        assert "when" in task, task["name"]
+        assert "stortree_samba_hosts" in str(task["when"]), task["name"]
+
+
+def test_the_mounts_verification_covers_the_paths_the_role_creates():
+    # The re-stat at the end of stortree_mounts only closes the
+    # ignore_errors gap for paths it actually looks at. Both sources the
+    # creation tasks loop over -- the mount plan and the per-user
+    # containers' staging paths -- have to appear in its loop, or a whole
+    # family of directories goes back to failing silently.
+    tasks = yaml.safe_load(
+        (REPO_ROOT / "roles/stortree_mounts/tasks/main.yml").read_text()
+    )
+    verify = [t for t in tasks if t["name"].startswith("Re-stat")]
+    assert len(verify) == 1
+    loop = verify[0]["loop"]
+    assert "stortree_mounts_plan" in loop
+    assert "staging_path" in loop
+    # ...and it must not re-report a masked path, which has its own
+    # runbook entry rather than being a failure.
+    assert "stortree_path_masked" in str(verify[0]["when"])

@@ -1,4 +1,33 @@
 ---
+# WHAT HAPPENS HERE, IN ORDER
+#
+# This role is the one with real ordering constraints -- most of them
+# discovered the hard way, and each explained at its own task below. The
+# map first, so the sequence is readable without reading the rationale;
+# the rationale then follows, and the individual tasks carry the rest.
+#
+#   1. install rclone/fuse, allow non-mounting users through FUSE
+#   2. compute the flat mount plan + per-user container ownership
+#   3. sweep stale units  ---- before any path creation, so a path that
+#      used to be a mount is a plain empty directory by the time
+#      anything tries to bind onto it
+#   4. probe which resolved mountpoints are active but unreachable
+#      ("masked"), and skip those paths for the rest of the run
+#   5. create directories: parents, mountpoints/plain dirs, per-user
+#      staging dirs, bind mountpoints and their parents  ---- every one
+#      of these is `ignore_errors: true`; see below for why that is
+#      load-bearing rather than sloppy
+#   6. chown plain-local per-user containers to their one real user
+#   7. render units: mounts, per-user wrapper mounts, per-user binds
+#      (in that order -- a wrapper has to exist before what nests in it)
+#   8. restart units whose file actually changed, then enable+start all
+#   9. re-stat every path step 5 was supposed to create, and report
+#      (or, under `stortree_mounts_strict`, fail on) whatever is still
+#      missing  ---- the counterweight to step 5's ignore_errors
+#
+# Steps 3 and 5 and step 9 are a set: the sweep has to precede creation,
+# creation can't be fatal, and so the verification has to come last.
+#
 # One rclone-mount@<slug>.service per resolved mount (server subtree,
 # client mount, or peer-sourced samba descendant this host doesn't own --
 # mesh-sourced directly from whichever host actually owns it, spec.md
@@ -698,4 +727,81 @@
   loop: "{{ stortree_mounts_rendered_units }}"
   loop_control:
     label: "{{ item.entry.local_path }}"
+  tags: [mounts]
+
+- name: Re-stat every directory this apply was supposed to create
+  # The counterweight to the blanket `ignore_errors: true` on every
+  # directory-creation task above (see this file's header for why those
+  # can't be fatal in place). Without this, the two failure modes those
+  # tasks deliberately conflate stay conflated to the end of the run: the
+  # expected transient -- a path inside a mount that hadn't been
+  # re-rendered yet when creation was attempted -- and a real failure
+  # like a full disk, a backend rejecting the write, or a permission bug.
+  # Both left the play green.
+  #
+  # Re-stat*ing* rather than reading back the creation tasks' own results
+  # is the point: by now the render/restart step has run, so a path that
+  # failed creation only because its own mount was stale has almost
+  # certainly appeared in the meantime, and whatever is still missing is
+  # the interesting set.
+  #
+  # The same three families the creation tasks cover, each through the
+  # same `stortree_physical_path` redirection (an entry inside a wrapped
+  # per-user container lives in that container's staging directory, not
+  # at its own path). Masked paths are skipped by `when:` rather than
+  # filtered out of the loop, because `stortree_path_masked` is a filter
+  # and `reject()` takes a test -- the skipped results are then dropped
+  # below by `selectattr('stat', 'defined')`, since a skipped item has no
+  # `stat` at all. A masked ancestor is a known state with its own
+  # runbook entry (docs/runbook.md "A masked mount"), not something to
+  # re-report here.
+  ansible.builtin.stat:
+    path: "{{ stortree_root ~ '/' ~ item }}"
+    get_checksum: false
+  loop: >-
+    {{ (stortree_mounts_plan | map(attribute='local_path')
+          | map('stortree_physical_path', stortree_user_containers) | list)
+     + (stortree_user_containers | selectattr('requires_slug')
+          | map(attribute='staging_path') | list) }}
+  when: not (item | stortree_path_masked(stortree_masked_mount_paths))
+  register: stortree_mounts_verify
+  changed_when: false
+  tags: [mounts]
+
+- name: Report any directory that is still missing
+  # Always runs, whatever `stortree_mounts_strict` says: the silence is
+  # the bug being fixed here, so the operator sees the list either way
+  # and only the *fatality* is configurable.
+  ansible.builtin.debug:
+    msg: >-
+      {{ stortree_mounts_missing | length }} path(s) this apply should
+      have created are still missing:
+      {{ stortree_mounts_missing | join(', ') }}.
+      A brand-new nested entry needs a second apply before its own parent
+      mount exists to create it inside (expected); anything that survives
+      that second apply is a real failure -- look back at the
+      ignore_errors'd directory tasks in this run's output for the actual
+      error. Set stortree_mounts_strict=true to make this fatal.
+  vars:
+    stortree_mounts_missing: >-
+      {{ stortree_mounts_verify.results
+         | selectattr('stat', 'defined') | rejectattr('stat.exists')
+         | map(attribute='item') | list }}
+  when: stortree_mounts_missing | length > 0
+  tags: [mounts]
+
+- name: Fail when a directory is still missing and strict mode is on
+  ansible.builtin.fail:
+    msg: >-
+      stortree_mounts_strict is set and {{ stortree_mounts_missing | length }}
+      expected path(s) are still missing after this apply:
+      {{ stortree_mounts_missing | join(', ') }}
+  vars:
+    stortree_mounts_missing: >-
+      {{ stortree_mounts_verify.results
+         | selectattr('stat', 'defined') | rejectattr('stat.exists')
+         | map(attribute='item') | list }}
+  when:
+    - stortree_mounts_strict | bool
+    - stortree_mounts_missing | length > 0
   tags: [mounts]

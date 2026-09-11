@@ -3,13 +3,47 @@
 # participating host (spec.md §4, config-schema.md "Samba sharing is
 # universal") -- not only the nodes this host happens to own.
 
+{# The [global] block stortree needs, plus whatever the operator adds.
+   `stortree_samba_globals` (roles/stortree_samba/defaults/main.yml)
+   merges over these, so a key of the same name overrides the built-in
+   value rather than duplicating it -- the same escape-hatch shape
+   ldap.yml's `extra:` already gives sssd.conf, and for the same reason:
+   no fleet's Samba settings are fully predictable from this tree, and
+   the alternative to an override is forking the template. `workgroup`
+   in particular is a per-site fact this project has no way to guess.
+
+   Not a free-for-all: `testparm -s` validates the rendered file before
+   it is written (the role's `validate:`), so a misspelled directive or
+   an illegal value fails the apply instead of landing on the host. What
+   it can't catch is an override that's valid but defeats the design --
+   `security` or `passdb backend` set to something the access model
+   doesn't assume, say -- which is why those carry their own comments
+   below rather than being silently overridable. #}
+{% set samba_globals = {
+  'workgroup': 'WORKGROUP',
+  'security': 'user',
+  'map to guest': 'never',
+  'nt acl support': 'yes',
+  'inherit permissions': 'yes',
+  'passdb backend': 'tdbsam',
+  'server min protocol': 'SMB2_02',
+} | combine(stortree_samba_globals | default({})) %}
+{# `security = user` + `passdb backend = tdbsam` are what make the whole
+   access model work: authentication is local, against the NT hashes
+   stortree_pam_smbpass syncs from LDAP (spec.md §5), and authorization
+   is the underlying Unix ownership/mode -- not a domain join, and not a
+   separate Samba-side ACL that could drift from the filesystem.
+   Overriding either is a real change to that model, not a tweak.
+
+   `server min protocol` is set explicitly rather than left implicit: it
+   matches what Samba >= 4.11 already defaults to (SMB2_02 -- SMB1 is
+   off on every platform meta/main.yml lists), so it changes nothing
+   today, but it makes the posture auditable in the rendered file and
+   keeps a future distro default from quietly lowering it. #}
 [global]
-workgroup = WORKGROUP
-security = user
-map to guest = never
-nt acl support = yes
-inherit permissions = yes
-passdb backend = tdbsam
+{% for key, value in samba_globals.items() %}
+{{ key }} = {{ value }}
+{% endfor %}
 
 {% for share in stortree.samba_shares %}
 {# The section header is the name clients mount. resolve()

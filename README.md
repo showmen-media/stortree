@@ -10,10 +10,18 @@ CLI: a control node (an operator's machine or CI) runs `ansible-playbook`
 against the fleet over plain SSH, the same way you'd run any other
 Ansible project.
 
-> 🚧 **Implemented, not yet run against real hosts.** All roles and both
-> playbooks exist; the Docker-based test harness is scaffolded but hasn't
-> been executed here. See [docs/plan.md](docs/plan.md) for current status
-> and [docs/spec.md](docs/spec.md) for the full design.
+> **Status: running in production against a real fleet; the Molecule
+> harness has never been run.** A good deal of the design below is scar
+> tissue from live applies — the `PartOf=` on nested mounts, the wrapper
+> mounts for per-user containers, the non-fatal directory creation, and
+> the unknown-key rejection each exist because the obvious version broke
+> on real hosts; those incidents are recorded at their point of
+> implementation. What that leaves untested is the *clean-slate* path:
+> nothing has ever applied these roles to a host that didn't already have
+> them, which is exactly what the Docker-based scenario in
+> `molecule/full-tree/` would cover. See
+> [docs/plan.md](docs/plan.md) "What's verified" for the precise line
+> between the two, and [docs/spec.md](docs/spec.md) for the full design.
 
 ## Why
 
@@ -113,6 +121,18 @@ role/playbook layout, and the Molecule test harness — are in
 
 ## Requirements
 
+**Managed hosts must be Debian-based.** The roles install packages with
+`ansible.builtin.apt`, use Debian's package names directly
+(`samba-common-bin`, `libpam-modules`), and call `pam-auth-update` — so
+any apt/dpkg distro works, and a non-apt host fails on the first task of
+`stortree_mounts`. Debian and Ubuntu are what the roles declare in
+`meta/main.yml` and the only ones actually applied to; other derivatives
+should work but haven't been tried. Nothing else in the design is
+distro-specific — rclone, Samba and SSSD are configured through their own
+files, not through anything Debian-shaped — so porting elsewhere means
+replacing the five `apt` tasks, the package names, and the
+`pam-auth-update` call, not reworking the roles.
+
 On the control node: `ansible` plus the `ansible.posix`,
 `community.crypto` and `community.general` collections (see
 `requirements.txt`/`requirements.yml`).
@@ -183,11 +203,13 @@ commands above are run by hand.
 
 ## Status
 
-All roles and both playbooks are implemented — see
-[docs/plan.md](docs/plan.md) for exactly what's been verified so far
-(unit tests, syntax checks, lint) versus what still needs a live Molecule
-run before trusting this against real hosts. Contributions and design
-feedback are welcome via issues.
+All roles and both playbooks are implemented and applied to a real
+fleet. The gap is the clean-slate path: `molecule test` has never been
+run in any scenario, so nothing has verified a first apply against a
+host that didn't already have these roles on it — see
+[docs/plan.md](docs/plan.md) "What's verified" for exactly which checks
+back which claim. Contributions and design feedback are welcome via
+issues.
 
 ## License
 

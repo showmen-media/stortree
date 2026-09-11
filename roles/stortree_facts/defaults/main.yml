@@ -26,3 +26,35 @@ stortree_sshd_config_path: "{{ stortree_repo_root }}/stortree/sshd_config"
 # holds hosts that aren't part of the stortree fleet (e.g. the mocked
 # LDAP/sftp containers in the `full-tree` Molecule scenario).
 stortree_all_hosts: "{{ groups['all'] }}"
+
+# Which hosts actually export Samba shares. Defaults to the whole fleet
+# -- "Samba sharing is universal" (config-schema.md) is the design's
+# baseline and stays the default, so an existing tree's behaviour is
+# unchanged by this variable existing.
+#
+# It's worth being explicit about what universality costs, because it is
+# not free and it is paid per host: a host that exports a share whose
+# content it doesn't own peer-mounts that content over sftp from the
+# owning host, which means its own rclone process and its own VFS cache
+# of the same bytes. A cold read then traverses SMB -> sftp -> the
+# owner's rclone -> the third-party remote, and N exporting hosts hold N
+# independent caches of identical content. That is exactly the
+# duplication interpretation call #2 (docs/plan.md) went out of its way
+# to eliminate *within* a host, where one shared mount plus bind mounts
+# replaced one full mount per group member; across hosts the same
+# argument applies, but the answer can't be a bind mount, so it has to
+# be a choice instead.
+#
+# Narrow this list (in inventory or group_vars) for a host that has no
+# business serving SMB at all -- a host that is only a client of the
+# tree, or one kept in the fleet purely to own a subtree others consume.
+# It is a fleet-level list rather than a per-host boolean for the same
+# reason stortree_all_hosts is: resolve() is a pure per-host function
+# that must reach the same conclusion about *other* hosts as they reach
+# about themselves, and a per-host var would need hostvars
+# cross-referencing to do that (spec.md §1 rules that out). A list every
+# host sees identically keeps peer_served_by on the serving side in step
+# with the peer_dependencies the consuming side actually resolves, so a
+# host never provisions SSH trust for a mount the other end has opted
+# out of making.
+stortree_samba_hosts: "{{ stortree_all_hosts }}"

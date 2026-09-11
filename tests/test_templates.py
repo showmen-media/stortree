@@ -676,3 +676,66 @@ def test_sssd_conf_any_other_extra_key_becomes_its_own_section(render):
     # standalone sections named after themselves.
     assert "[domain]\n" not in rendered
     assert rendered.count("[sssd]") == 1
+
+
+# `stortree_samba_globals` (roles/stortree_samba/defaults/main.yml) is the
+# [global] escape hatch -- the same shape ldap.yml's `extra:` gives
+# sssd.conf, and the only way to set a per-site directive (`workgroup`
+# above all) without forking this template.
+
+
+def test_smb_conf_globals_render_without_an_override(smb_conf):
+    # The built-in defaults, unchanged when the operator sets nothing --
+    # the `| default({})` has to hold, since no role variable defines
+    # this on a play that never overrode it.
+    assert "workgroup = WORKGROUP" in smb_conf
+    assert "passdb backend = tdbsam" in smb_conf
+
+
+def test_smb_conf_global_pins_smb1_off_explicitly(smb_conf):
+    # Matches what Samba >= 4.11 already defaults to, so it changes
+    # nothing on any platform meta/main.yml lists -- it's here so the
+    # posture is visible in the rendered file and a future distro default
+    # can't quietly lower it.
+    assert "server min protocol = SMB2_02" in smb_conf
+
+
+def test_smb_conf_globals_override_replaces_a_builtin_rather_than_duplicating_it(
+    render, resolved
+):
+    out = render(
+        SMB_CONF,
+        stortree=resolved[GADGET],
+        stortree_samba_globals={"workgroup": "EXAMPLE"},
+    )
+    assert "workgroup = EXAMPLE" in out
+    # The whole point of `combine` over appending: exactly one workgroup
+    # line survives, or smb.conf has two and the last one silently wins.
+    assert len([ln for ln in out.splitlines() if ln.startswith("workgroup =")]) == 1
+    assert "workgroup = WORKGROUP" not in out
+
+
+def test_smb_conf_globals_can_add_a_directive_stortree_does_not_model(
+    render, resolved
+):
+    out = render(
+        SMB_CONF,
+        stortree=resolved[GADGET],
+        stortree_samba_globals={"server string": "%h (stortree)"},
+    )
+    assert "server string = %h (stortree)" in out
+    # ...without disturbing the built-ins it says nothing about.
+    assert "workgroup = WORKGROUP" in out
+
+
+def test_smb_conf_globals_stay_inside_the_global_section(render, resolved):
+    # An override must never leak past the first share header, or it
+    # silently becomes a per-share setting for whichever stanza follows.
+    out = render(
+        SMB_CONF,
+        stortree=resolved[GADGET],
+        stortree_samba_globals={"workgroup": "EXAMPLE"},
+    )
+    assert "[global]" in out
+    global_block = out.split("[global]", 1)[1].split("\n[", 1)[0]
+    assert "workgroup = EXAMPLE" in global_block

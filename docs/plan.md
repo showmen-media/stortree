@@ -148,6 +148,52 @@ implementation:
    `[global]` in particular would merge into the generated global block
    and rewrite fleet-wide settings instead of adding a share.
 
+7. **Whether "Samba sharing is universal" should be absolute.** The
+   spec states universality as a property, not as a default, and
+   nothing offered a way out of it. Resolved to: it stays the default
+   (no existing tree changes behaviour), but `stortree_samba_hosts`
+   (roles/stortree_facts/defaults/main.yml) narrows it. The argument
+   for making it adjustable at all is the cost, which is easy to miss
+   because the visible artifact — an `smb.conf` stanza — is the free
+   part: a host exporting a share it doesn't own peer-mounts that
+   content, so it pays an rclone process and a VFS cache per
+   peer-sourced path, and a cold read traverses SMB → sftp → the
+   owner's rclone → the third-party remote. N exporting hosts hold N
+   caches of identical bytes. That is the same duplication call #2
+   above went to some length to remove *within* a host, where one
+   shared mount plus bind mounts replaced one mount per group member;
+   across hosts a bind mount can't help, so the only available answer
+   is to let an operator say no. Hence the opt-out suppresses the peer
+   dependencies too, not just the stanza — suppressing only the stanza
+   would leave the entire cost in place and save nothing. A
+   fleet-level list rather than a per-host boolean because `resolve()`
+   has to reach the same conclusion about other hosts as they reach
+   about themselves (spec.md §1 rules out `hostvars`
+   cross-referencing), which is also what keeps `peer_served_by` — and
+   so the SSH trust `stortree_peer_trust` provisions — in step with
+   the mounts the other end actually makes.
+
+8. **What a run should report when a directory it was told to create
+   isn't there.** Every directory-creation task in `stortree_mounts`
+   is `ignore_errors: true`, for a reason established in production
+   (a stale mount aborting the play before the render/restart that
+   would fix it — call it out twice over, since it repeated
+   identically on every subsequent run). Nothing was stated about what
+   should happen afterwards, and what did happen was nothing: the run
+   reported success whether the directories appeared or not, so a full
+   disk and the transient it was meant to tolerate were
+   indistinguishable. Resolved to: a re-stat of every expected path at
+   the end of the role, *after* render/restart — by which point a
+   path that failed only because its mount was stale has usually
+   appeared — which always reports what is still missing and fails
+   only under `stortree_mounts_strict`. Advisory by default because
+   "missing on this apply" genuinely isn't an error: a brand-new
+   nested entry needs two runs by design, and failing the first would
+   break the documented pattern rather than catch a bug. Strict is for
+   a converged fleet, where a second apply should be clean — CI, or an
+   operator's own re-run. Masked paths are excluded: that is a known
+   state with its own runbook entry, not a missing directory.
+
 ## Phased build plan
 
 0. Repo skeleton: `.gitignore`, `requirements.txt`/`requirements.yml`,
@@ -185,8 +231,22 @@ implementation:
 
 ## What's verified
 
-Everything in this repo is checked without a running fleet, and one
-thing isn't checked at all.
+Three different things back the claims here, and it's worth keeping them
+apart: automated checks that run on a checkout, a real fleet this has
+been applied to, and one scenario that has never run at all.
+
+**Applied in production.** These roles run against a real fleet, and a
+number of the design decisions above exist *because* the obvious version
+failed there — interpretation call #4's wrapper mounts (a plain `chown`
+inside an rclone mount reports `changed` and silently doesn't persist),
+the non-fatal directory creation in `stortree_mounts` (a stale mount
+blocking the very render that would fix it, twice in a row), the
+`PartOf=` on nested mounts, and the multi-name `getent` loop in
+`stortree_secrets` (Ansible's `hash_behaviour: replace` clobbering all
+but the last lookup). Each is marked at its point of implementation with
+what it broke. That is real evidence, but it is evidence about *these*
+hosts in *their* current state — it says nothing about a first apply
+onto a clean one, which is the gap below.
 
 Run by hand on a checkout (and by `ci.yml` on the unmerged
 `github-workflows` branch, which is why this says "by hand"):
@@ -217,10 +277,16 @@ checked for internal consistency by `tests/test_repo_consistency.py`,
 but nothing has ever applied a role to a container, mounted a real
 remote, or exercised a genuine two-host peer dependency.
 
-That is the gap to close before trusting this against real hosts: run at
-least the `full-tree` scenario (`cd molecule/full-tree && molecule
-test`, or per-role via `cd roles/<role> && molecule test`) somewhere
-Docker capacity isn't shared with other workloads, then a staging pass
-(`ansible-playbook site.yml --check --diff` against real hosts, then a
-real apply) — see spec.md §9's own caveat about what Molecule-in-Docker
-does and doesn't prove.
+That is the gap, and it is specifically the **clean-slate** gap: the
+production fleet above only ever exercises an apply onto hosts that
+already converged once, so the one path with no evidence behind it at
+all is the first apply onto a host that has never seen these roles —
+package installation, the initial SSSD join, peer trust bootstrapped
+from nothing, and a mount established where no directory yet exists.
+Closing it means running at least the `full-tree` scenario (`cd
+molecule/full-tree && molecule test`, or per-role via `cd roles/<role>
+&& molecule test`) somewhere Docker capacity isn't shared with other
+workloads — see spec.md §9's own caveat about what Molecule-in-Docker
+does and doesn't prove. Adding a *new* host to the existing fleet walks
+the same untested path, so `--check --diff` first is worth it there even
+though the fleet itself is long past its first apply.

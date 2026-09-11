@@ -707,6 +707,52 @@ There's no "designated Samba host": if a node has a `samba:` block, every
 inventory host — server, client-only, or entirely unnamed in
 `config.yml` — ends up serving it.
 
+#### What universality costs, and how to opt a host out
+
+Universality is the default and stays it, but it is not free, and the
+cost is paid per exporting host. A host that exports a share whose
+content it doesn't own peer-mounts that content over sftp from the
+owning host — so it runs its own rclone process and its own VFS cache of
+the same bytes, and a cold read traverses SMB → sftp → the owner's
+rclone → the third-party remote. Across N exporting hosts that is N
+independent caches of identical content. (This is the same duplication
+interpretation call #2 in [plan.md](plan.md) eliminated *within* a host,
+where one shared mount plus bind mounts replaced one full mount per
+group member. Across hosts the answer can't be a bind mount, so it has
+to be a choice instead.)
+
+`stortree_samba_hosts` (roles/stortree_facts/defaults/main.yml) is that
+choice: a fleet-level list, defaulting to every host, of the hosts that
+actually export shares. Narrow it in inventory or `group_vars` for a
+host that has no business serving SMB — one that is only a client of the
+tree, or one kept in the fleet purely to own a subtree others consume:
+
+```yaml
+# group_vars/all.yml
+stortree_samba_hosts:
+  - storage-node-alpha
+  - storage-node-bravo
+```
+
+An excluded host resolves no `samba_shares` **and** none of the peer
+dependencies that exist only to back them — the mount, not the smb.conf
+stanza, is what universality actually costs, so dropping only the stanza
+would save nothing. Its own client mounts are untouched: opting out of
+*exporting* the tree says nothing about wanting it locally. On the
+serving side, hosts that own that content stop provisioning SSH trust
+for mounts the excluded host will never make, because every host reads
+the same list and reaches the same conclusion.
+
+It is a fleet-level list rather than a per-host boolean deliberately.
+`resolve()` is a pure per-host function that has to reach the same
+conclusion about *other* hosts as they reach about themselves; a
+per-host variable would need `hostvars` cross-referencing to do that,
+which spec.md §1 rules out. A host removed from the list after having
+served shares gets its `smbd` stopped and disabled on the next apply
+(the package and `/etc/samba/smb.conf` are left alone) — otherwise it
+would keep exporting the last rendered config, whose share paths point
+at peer mounts that no longer resolve.
+
 #### The share path
 
 Where a share points is derived from the node, not written:

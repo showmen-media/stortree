@@ -1109,7 +1109,7 @@ def _client_mount_entries(index, hostname, samba_sourced_paths, stortree_root):
     return client_mounts, peers
 
 
-def _peer_served_by_entries(index, hostname, all_hosts):
+def _peer_served_by_entries(index, hostname, all_hosts, samba_hosts=None):
     """What every *other* host sources from this one -- the mirror of
     _client_mount_entries() and _samba_peer_dependencies(), asked from
     the other side.
@@ -1119,11 +1119,19 @@ def _peer_served_by_entries(index, hostname, all_hosts):
     _client_mount_targets()/_client_policy() this host used for its own
     copy, so a nested opt-out (or opt-in) is honored identically at both
     ends and the sftp trust provisioned by stortree_peer_trust matches
-    the mounts that actually get made."""
+    the mounts that actually get made.
+
+    `samba_hosts` (see resolve()) applies to the samba half only, and to
+    `other` rather than to this host: an `other` that exports no shares
+    resolves no samba peer dependencies, so serving it would provision
+    trust for a mount it will never make. Its own client mounts are
+    unaffected -- opting out of *exporting* the tree says nothing about
+    wanting it locally."""
     served = []
     for other in all_hosts:
         if other == hostname:
             continue
+        other_serves_samba = samba_hosts is None or other in samba_hosts
         for root_path in index.roots:
             for node, _args, _access in _client_mount_targets(index, root_path, other):
                 if node["host"] == hostname and node["remote"]:
@@ -1135,6 +1143,8 @@ def _peer_served_by_entries(index, hostname, all_hosts):
                             "per_user": False,
                         }
                     )
+        if not other_serves_samba:
+            continue
         for s in index.samba_nodes:
             for d in index.samba_descendants[s["path"]]:
                 if d["host"] == hostname and _has_own_content(d, index.nodes):
@@ -1153,7 +1163,13 @@ def _peer_served_by_entries(index, hostname, all_hosts):
     return _dedupe(served, lambda p: (p["serving_host"], p["local_path"]))
 
 
-def resolve(tree, hostname, all_hosts, stortree_root=DEFAULT_STORTREE_ROOT):
+def resolve(
+    tree,
+    hostname,
+    all_hosts,
+    stortree_root=DEFAULT_STORTREE_ROOT,
+    samba_hosts=None,
+):
     """Resolve everything host `hostname` must do, given the parsed
     contents of config.yml (`tree`) and the full inventory host list
     (`all_hosts`, so a host with no mention in config.yml still resolves
@@ -1170,10 +1186,36 @@ def resolve(tree, hostname, all_hosts, stortree_root=DEFAULT_STORTREE_ROOT):
     same name). It's needed here, rather than only where mounts are
     rendered, because a client mount of a subtree this host doesn't own
     resolves to a peer `remote:path` reference with the owning host's
-    absolute path already baked into it (_peer_remote_ref())."""
+    absolute path already baked into it (_peer_remote_ref()).
+
+    `samba_hosts` is the subset of the fleet that exports Samba shares
+    (`stortree_samba_hosts`, roles/stortree_facts/defaults/main.yml).
+    `None` means the universal default -- every host, which is what
+    "Samba sharing is universal" (config-schema.md) has always meant and
+    stays the behaviour for every caller that doesn't pass it.
+
+    Opting a host out has to be resolved *here*, not just by skipping
+    the stortree_samba role, because the share list is only half of what
+    universality costs: the other half is `peer_dependencies`, the
+    peer-sftp mounts a host makes purely to hold content for shares it
+    exports but doesn't own (_samba_peer_dependencies()). Skipping only
+    the role would leave those mounts -- an rclone process and a VFS
+    cache per peer-sourced path -- running to back shares the host no
+    longer exports, which is precisely the cost the opt-out exists to
+    avoid. Its own client mounts (_client_mount_entries()) are
+    deliberately untouched: those are what the host mounts *for itself*,
+    and wanting the tree locally is independent of re-exporting it.
+
+    The same list also filters `peer_served_by`, from the other side: an
+    opted-out host makes no samba peer mounts, so the hosts that own
+    that content must not provision SSH trust for mounts that will never
+    be made. Both ends read one fleet-level list and reach the same
+    conclusion without hostvars cross-referencing, which is the
+    invariant §1 depends on."""
     index = _index_tree(tree)
 
-    samba_peers = _samba_peer_dependencies(index, hostname)
+    serves_samba = samba_hosts is None or hostname in samba_hosts
+    samba_peers = _samba_peer_dependencies(index, hostname) if serves_samba else []
     client_mounts, client_peers = _client_mount_entries(
         index,
         hostname,
@@ -1184,12 +1226,14 @@ def resolve(tree, hostname, all_hosts, stortree_root=DEFAULT_STORTREE_ROOT):
     return {
         "server_subtrees": [n for n in index.nodes if n["host"] == hostname],
         "client_mounts": client_mounts,
-        "samba_shares": _samba_share_entries(index),
+        "samba_shares": _samba_share_entries(index) if serves_samba else [],
         "peer_dependencies": _dedupe(
             samba_peers + client_peers,
             lambda p: (p["owning_host"], p["local_path"]),
         ),
-        "peer_served_by": _peer_served_by_entries(index, hostname, all_hosts),
+        "peer_served_by": _peer_served_by_entries(
+            index, hostname, all_hosts, samba_hosts
+        ),
     }
 
 

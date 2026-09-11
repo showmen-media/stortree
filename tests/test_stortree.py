@@ -2998,3 +2998,90 @@ def test_relate_plan_entries_drops_a_requires_target_that_is_not_a_mount_here():
     _relate_plan_entries(entries)
     by_path = {e["local_path"]: e for e in entries}
     assert by_path["top"]["requires_mounts"] == []
+
+
+# `stortree_samba_hosts` (roles/stortree_facts/defaults/main.yml) narrows
+# which hosts export shares. Default is the whole fleet -- "Samba sharing
+# is universal" -- so every other test in this file passes no list at all
+# and must keep resolving exactly as before.
+
+
+def _samba_opt_out_tree():
+    # h1 owns the share; h2 owns a descendant of it, so any host that
+    # exports the share has to peer-mount that descendant from h2.
+    return {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "share": {
+                    "samba": {},
+                    "subdirs": {"leaf": {"host": "h2", "rclone.remote": "r2:/leaf"}},
+                }
+            },
+        }
+    }
+
+
+def test_samba_hosts_defaults_to_every_host_when_not_passed():
+    # The universal default is the behaviour every other test relies on;
+    # passing the full fleet explicitly must be indistinguishable from
+    # passing nothing.
+    tree = _samba_opt_out_tree()
+    hosts = ["h1", "h2", "h3"]
+    assert resolve(tree, "h3", hosts) == resolve(tree, "h3", hosts, samba_hosts=hosts)
+
+
+def test_an_opted_out_host_exports_no_shares():
+    tree = _samba_opt_out_tree()
+    hosts = ["h1", "h2", "h3"]
+    assert resolve(tree, "h3", hosts, samba_hosts=["h1", "h2"])["samba_shares"] == []
+    # ...while a host still in the list exports the share as always.
+    assert [
+        s["node_path"]
+        for s in resolve(tree, "h3", hosts, samba_hosts=hosts)["samba_shares"]
+    ] == ["top/share"]
+
+
+def test_an_opted_out_host_stops_peer_mounting_content_for_shares_it_no_longer_exports():
+    # The half of the opt-out that actually costs something: the share
+    # stanza is free, the peer mount behind it is an rclone process and a
+    # VFS cache of someone else's bytes. Gating only the stortree_samba
+    # role would leave this mount running to back a share that is no
+    # longer exported.
+    tree = _samba_opt_out_tree()
+    hosts = ["h1", "h2", "h3"]
+    on = resolve(tree, "h3", hosts, samba_hosts=hosts)
+    assert ("h2", "top/share/leaf") in {
+        (p["owning_host"], p["local_path"]) for p in on["peer_dependencies"]
+    }
+
+    off = resolve(tree, "h3", hosts, samba_hosts=["h1", "h2"])
+    assert not any(p["owning_host"] == "h2" for p in off["peer_dependencies"])
+
+
+def test_an_opted_out_host_keeps_its_own_client_mount_of_the_tree():
+    # Opting out of *exporting* the tree says nothing about wanting it
+    # locally -- h3's own client mount of `top` is unaffected.
+    tree = _samba_opt_out_tree()
+    hosts = ["h1", "h2", "h3"]
+    off = resolve(tree, "h3", hosts, samba_hosts=["h1", "h2"])
+    assert "top" in {m["local_path"] for m in off["client_mounts"]}
+    assert ("h1", "top") in {
+        (p["owning_host"], p["local_path"]) for p in off["peer_dependencies"]
+    }
+
+
+def test_an_opted_out_host_is_not_served_peer_trust_for_the_shares_it_dropped():
+    # The serving side's mirror, and the reason this is one fleet-level
+    # list rather than a per-host boolean: h2 owns `leaf` and must reach
+    # the same conclusion about h3 that h3 reaches about itself, or
+    # stortree_peer_trust grants SSH access for a mount that never
+    # happens.
+    tree = _samba_opt_out_tree()
+    hosts = ["h1", "h2", "h3"]
+    served_on = resolve(tree, "h2", hosts, samba_hosts=hosts)["peer_served_by"]
+    assert {p["serving_host"] for p in served_on} == {"h1", "h3"}
+
+    served_off = resolve(tree, "h2", hosts, samba_hosts=["h1", "h2"])["peer_served_by"]
+    assert {p["serving_host"] for p in served_off} == {"h1"}

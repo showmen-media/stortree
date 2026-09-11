@@ -1,0 +1,25 @@
+---
+# Extra "key = value" pairs merged into the rendered smb.conf's [global]
+# block (smb.conf.j2), for directives stortree doesn't model itself. A
+# key of the same name as one of stortree's own built-in globals
+# overrides that value rather than duplicating it; any other key is
+# appended as a new directive. Same escape-hatch shape as ldap.yml's
+# `extra:` for sssd.conf, and there for the same reason -- no fleet's
+# Samba settings are fully predictable from the tree, and without this
+# the only way to change one is to fork the template.
+#
+# `workgroup` is the common case: stortree defaults it to WORKGROUP,
+# which is right for no site in particular.
+#
+#   stortree_samba_globals:
+#     workgroup: EXAMPLE
+#     server string: "%h (stortree)"
+#     log level: "1"
+#
+# Overrides are validated by `testparm -s` before the file is written
+# (the role's `validate:`), so a misspelled directive fails the apply
+# rather than reaching the host. Note that `security` and `passdb
+# backend` are load-bearing for the access model (see smb.conf.j2's own
+# comment) -- testparm will happily accept a value that quietly breaks
+# it.
+stortree_samba_globals: {}
