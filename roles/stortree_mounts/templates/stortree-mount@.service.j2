@@ -2,13 +2,12 @@
 Same nested-descendant-vs-wrapper-mount preference as
 stortree-bind@.service.j2 (see its own comment) -- a descendant with its
 own separate rclone.remote (not just a per-user bind-mount fan-out) can
-also sit directly under a per-user container that got its own wrapper
+also sit directly under a staged node that got its own presentation
 mount, in which case this entry now nests inside that wrapper's own
 presented tree, not directly inside whatever plan_mounts() itself
 computed as entry.requires_slug.
 #}
-{% set container_path = entry.local_path.rsplit('/', 1)[0] if '/' in entry.local_path else '' %}
-{% set wrapper = (stortree_user_containers | selectattr('local_path', 'equalto', container_path) | selectattr('requires_slug') | list) if container_path else [] %}
+{% set presented = entry.local_path | stortree_presented_ancestor(stortree_staged_nodes) %}
 [Unit]
 Description=rclone mount %i (managed by stortree, do not edit by hand)
 After=network-online.target
@@ -26,10 +25,10 @@ declared `requires` below -- that's a sibling dependency (a cache
 directory), not a tree this mount's own path lives inside, and a cache
 blip shouldn't take a whole shared subtree down with it.
 #}
-{% if wrapper %}
-After=stortree-user-mount@{{ wrapper[0].slug }}.service
-PartOf=stortree-user-mount@{{ wrapper[0].slug }}.service
-RequiresMountsFor={{ stortree_root }}/{{ container_path }}
+{% if presented %}
+After=stortree-present@{{ presented.slug }}.service
+PartOf=stortree-present@{{ presented.slug }}.service
+RequiresMountsFor={{ stortree_root }}/{{ presented.local_path }}
 {% elif entry.requires_slug %}
 After=stortree-mount@{{ entry.requires_slug }}.service
 PartOf=stortree-mount@{{ entry.requires_slug }}.service

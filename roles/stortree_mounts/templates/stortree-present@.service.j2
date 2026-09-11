@@ -1,0 +1,92 @@
+[Unit]
+Description=stortree presentation mount %i (managed by stortree, do not edit by hand)
+{#
+PartOf= for the same reason as stortree-mount@.service.j2 (see its own
+comment): both this mount's mountpoint and the staging directory it
+serves live inside that outer mount, so an outer remount detaches this
+one while leaving the process alive and the unit reporting active.
+Observed in production exactly that way -- one of four presentation
+mounts survived an outer remount as a live process with no mount left
+behind it, so the next apply's `state: started` was a no-op and that
+one user's folder sat at the bare stortree:stortree directory
+underneath while the other three (whose processes had died and were
+restarted) were correct.
+#}
+{% if entry.requires_slug %}
+After=stortree-mount@{{ entry.requires_slug }}.service
+PartOf=stortree-mount@{{ entry.requires_slug }}.service
+RequiresMountsFor={{ stortree_root }}/{{ entry.staging_path }}
+{% endif %}
+
+[Service]
+{#
+Type=forking, not the Type=notify the rclone units use: bindfs is a
+libfuse program and libfuse has no sd_notify support, so there is no
+readiness protocol to wait on. Forking is not a downgrade here --
+libfuse calls fuse_daemonize() only *after* the mount syscall has
+succeeded, so the parent exiting is itself the readiness signal, and
+systemd holds ordering until it does. Verified on this fleet: the
+mountpoint is already in /proc/self/mountinfo by the time `systemctl
+start` returns.
+
+Type=simple with -f would start the unit before the mount exists and
+silently break every RequiresMountsFor= above it.
+#}
+Type=forking
+User={{ stortree_user }}
+Group={{ stortree_group }}
+{#
+-p takes chmod-style specs, not rclone's two separate --dir-perms and
+--file-perms, so `entry.perms` is the *file* mode followed by `+X` for
+the classes whose execute bit belongs on directories only -- see
+stortree_bindfs_perms() in filter_plugins/stortree.py, which is where
+that translation and the reason for it live.
+
+--mirror is what makes a granted node able to contain anything else.
+Without it this mount presents its own path as the granted owner to
+everyone, `stortree` included, and fusermount then refuses every nested
+mount underneath it -- an rclone mount for a descendant with its own
+remote, or another presentation mount -- with "user has no write access
+to mountpoint", because the mounting account no longer appears to own
+the path it is mounting on. Verified on this fleet, both directions.
+
+The alternative the tree used before presentation mounts were general
+was to force any mount with nested children to stortree:stortree
+outright, discarding its own grant (the `has_nested_children` branch in
+stortree-mount@.service.j2). That is exactly the bug this whole
+mechanism exists to fix, so it cannot be the answer here. --mirror
+keeps the grant real for every actual user and lets only the service
+account -- which already owns the staging directory underneath, and
+already drives this mount -- see itself as owner.
+
+--chown-ignore/--chgrp-ignore/--chmod-ignore make this layer
+presentation-only: ownership and mode are what stortree resolved, and
+an in-tree chown or chmod fails silently rather than reaching the
+staging directory, where it could not have persisted anyway. All three
+are needed -- chown and chgrp are separate policies in bindfs and
+--chown-ignore alone still lets a chgrp through.
+
+`nonempty` is required, not defensive: Debian's bindfs links libfuse2,
+which refuses a non-empty mountpoint outright, and a staged node's
+mountpoint is routinely non-empty -- the per-user bind mountpoint
+directories sit inside it, and on a peer host the path resolves through
+the owning host's own presented tree, so it is already showing that
+host's output before this one mounts. rclone mounted over that
+silently; libfuse2 will not. libfuse3 dropped the check and ignores the
+option, so this stays correct if the package is ever relinked.
+#}
+ExecStart=/usr/bin/bindfs {{ stortree_root }}/{{ entry.staging_path }} {{ stortree_root }}/{{ entry.local_path }} \
+  -u {{ stortree_user_uids[entry.owner] if entry.owner else stortree_uid }} \
+  -g {{ stortree_group_gids[entry.group] if entry.group else stortree_gid }} \
+  -p {{ entry.perms }} \
+  --mirror={{ stortree_user }} \
+  -o allow_other,nonempty \
+  --chown-ignore \
+  --chgrp-ignore \
+  --chmod-ignore
+ExecStop=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do mountpoint -q "{{ stortree_root }}/{{ entry.local_path }}" || exit 0; /bin/fusermount -uz "{{ stortree_root }}/{{ entry.local_path }}" || exit 0; done'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

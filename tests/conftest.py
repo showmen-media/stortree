@@ -22,7 +22,7 @@ from filter_plugins.stortree import (  # noqa: E402  (needs sys.path above)
     FilterModule,
     plan_mounts,
     resolve,
-    user_container_paths,
+    staged_node_paths,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -33,7 +33,7 @@ EXAMPLE_HOSTS = ["storage-node-alpha", "storage-node-bravo", "some-storage-gadge
 
 # What `getent group` returns on a host for the worked example's groups
 # -- resolve() is pure and never sees this, but everything downstream of
-# it (plan_mounts, user_container_paths, the templates) does.
+# it (plan_mounts, staged_node_paths, the templates) does.
 EXAMPLE_GROUP_MEMBERS = {
     "Whitfield Family & Friends": ["jd", "mw"],
     "Michael Whitfield Family": ["mw"],
@@ -141,9 +141,9 @@ def mount_plans(resolved):
 
 @pytest.fixture(scope="session")
 def containers(resolved, mount_plans):
-    """{hostname: user_container_paths(...)} -- stortree_user_containers."""
+    """{hostname: staged_node_paths(...)} -- stortree_staged_nodes."""
     return {
-        h: user_container_paths(r, EXAMPLE_GROUP_MEMBERS, mount_plans[h])
+        h: staged_node_paths(r, EXAMPLE_GROUP_MEMBERS, mount_plans[h])
         for h, r in resolved.items()
     }
 

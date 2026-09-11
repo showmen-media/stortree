@@ -61,19 +61,27 @@ PER_USER_PLACEHOLDER = "%U"
 # "%" either).
 SHARED_MOUNT_SEGMENT = ".mounts"
 
-# Sibling-of-<username> segment name for a per-user container's staging
-# directory (user_container_paths()) -- real content, sitting inside
-# whatever remote-backed mount the container itself nests under, that a
-# per-user "wrapper" rclone mount (the `local` backend) re-presents at
-# the container's own path with that one user's real --uid/--gid/
-# --dir-perms. Not dot-prefixed like SHARED_MOUNT_SEGMENT: nothing about
-# it needs hiding from a %U-templated Samba share (a connecting user's
-# own share root is their own container, `home/<them>` -- a *sibling*
-# path like `home/stortree-user-<them>` is never reachable through it at
-# all, same as any other sibling of their own folder), and unlike
-# `.mounts` there's one of these per user, not one shared instance to set
-# apart from real per-user segment names.
-STORTREE_USER_PREFIX = "stortree-user-"
+# Sibling segment prefix for a staged node's staging directory
+# (staged_node_paths()) -- real content, sitting inside whatever
+# remote-backed mount the node itself nests under, that a bindfs
+# "presentation" mount re-presents at the node's own path under the
+# owner, group and mode its `access` grant resolved to.
+#
+# Staging has to be a *sibling* rather than the node's own path because
+# the node's path is where the presentation mount lands: a mount cannot
+# read from the path it is mounted on. It has to sit inside the same
+# remote-backed ancestor so it is ordinary content on the same backend,
+# reachable by nothing but the `stortree` account driving the mount.
+#
+# Dot-prefixed, unlike the `stortree-user-` convention it replaces. That
+# one only ever named a sibling of a per-user container inside a
+# `user-subdirs` node, where nothing needed hiding -- a connecting
+# user's share root is their own container, so a sibling was already
+# unreachable. A staged node can be anywhere in the tree, including
+# directly inside a browsable share, so its staging directory has to be
+# something a listing skips. One uniform prefix now covers both cases;
+# see docs/spec.md §2 "The presentation layer".
+STORTREE_STAGING_PREFIX = ".stortree-staging-"
 
 # Fallbacks for the two paths the roles own as overridable variables:
 # `stortree_root` (roles/stortree_facts/defaults/main.yml), the mount
@@ -1925,60 +1933,116 @@ def _nearest_mount_slug(local_path, mount_entries):
     return best["slug"] if best else None
 
 
-def user_container_paths(resolved, group_members=None, mount_plan=None):
-    """Every per-user container directory a `user-subdirs` node implies
-    -- the immediate `<prefix>/<username>` folder (docs/config-schema.md
-    "subdirs vs user-subdirs": "the immediate children of a user-subdirs
-    node are per-user folders") that every one of its descendants'
-    resolved users needs to already exist -- paired with the one specific
-    user it should be privately owned by, closing the gap
-    access_mode()'s public-execute bit only papers over: that bit makes
-    the container *traversable* by anyone (needed so an unrelated
-    descendant grant nested underneath stays reachable at all), not
-    *owned* by the one person it's actually for. A real per-user
-    container -- one you can also drop a file straight into, like an
-    ordinary home directory -- has to be owned by that person outright.
+# A per-user container's presentation mode. Not bindfs_perms() of its
+# own grant: a container's grant is synthesized from a `user-subdirs`
+# node rather than written in config.yml, and access_mode() would read
+# it as an owner-only grant and hand back 0701 -- dropping the group
+# read bit these have carried since before `access` existed. Held here
+# literally so the behaviour is a decision rather than a side effect,
+# and so the one real difference from a staged node stays visible.
+CONTAINER_PERMS = "0640,ug+X"
+CONTAINER_MODE = "0750"
 
-    A container that's a plain local path (no remote-backed ancestor at
-    all) gets that ownership the simple way: stortree_mounts just chowns
-    it directly, real native ownership, no more machinery needed. One
-    nested inside a remote-backed ancestor's own rclone mount can't be
-    chowned that way at all -- that ancestor's mount presents one single,
-    uniform --uid/--gid for every path underneath it, and a plain
-    chown()/chmod() through the FUSE layer has nowhere real to persist a
-    *different* value for just this one path (confirmed against a live
-    deployment: Ansible reported the chown as `changed`, but the FUSE
-    layer just re-reported the mount's own fixed owner on the next
-    `stat`). The three extra fields below are for that case: `staging_
-    path` (`STORTREE_USER_PREFIX + owner`, a sibling of the container
-    itself, ordinary content inside the *same* remote-backed ancestor,
-    touched by nothing but the `stortree` account driving the wrapper
-    mount), `slug` (the wrapper mount's own systemd unit name, from the
-    *container's* path -- not the staging path's -- so it reads the same
-    way every other mount's own slug does), and `requires_slug`
-    (`_nearest_mount_slug()` against `mount_plan`'s own real mounts,
-    naming whichever one the staging path nests under, `None` if it
-    doesn't nest under any real mount at all -- i.e. a plain local
-    container, which needs no wrapper mount in the first place; see
-    stortree_mounts' own split on this field for which of the two
-    ownership mechanisms a given container actually gets)."""
+
+def _staged_entry(local_path, owner, group, perms, mode, mount_entries):
+    """One staged node's record: where it lives in the tree, where its
+    content physically sits, and what the presentation mount over it
+    has to say. Shared by both kinds staged_node_paths() collects."""
+    parent = local_path.rsplit("/", 1)[0] if "/" in local_path else ""
+    name = local_path.rsplit("/", 1)[-1]
+    prefixed = f"{STORTREE_STAGING_PREFIX}{name}"
+    staging_path = f"{parent}/{prefixed}" if parent else prefixed
+    return {
+        "local_path": local_path,
+        "owner": owner,
+        "group": group,
+        "perms": perms,
+        "mode": mode,
+        "staging_path": staging_path,
+        "slug": _slug(local_path),
+        "requires_slug": _nearest_mount_slug(staging_path, mount_entries),
+    }
+
+
+def staged_node_paths(resolved, group_members=None, mount_plan=None):
+    """Every node whose `access` grant cannot be applied where the node
+    sits, paired with the staging directory a presentation mount serves
+    it from (docs/spec.md §2 "The presentation layer").
+
+    Two kinds qualify, for the same underlying reason and with the same
+    fix:
+
+    A **per-user container** -- the immediate `<prefix>/<username>`
+    folder a `user-subdirs` node implies (docs/config-schema.md
+    "subdirs vs user-subdirs") -- closes the gap access_mode()'s
+    public-execute bit only papers over: that bit makes the container
+    *traversable* by anyone (needed so an unrelated descendant grant
+    nested underneath stays reachable at all), not *owned* by the one
+    person it is actually for.
+
+    A **granted plain-directory node** -- one with an `access` grant and
+    no `rclone.remote` of its own -- has the same problem one level up.
+    Its grant names an owner, group and mode; nothing applies them. It
+    is not a mount, so no `--uid` pins it, and a chown at its path lands
+    on whatever remote-backed ancestor's FUSE layer happens to be
+    presenting it, which reports success and persists nothing. Ansible
+    called that `changed` on every apply while `stat` kept returning the
+    ancestor's own uniform owner, and the post-apply check only ever
+    asserted the path existed.
+
+    Either way the answer is the same: the node's real content moves to
+    a sibling staging directory (STORTREE_STAGING_PREFIX), ordinary
+    content inside the same remote-backed ancestor, and a bindfs mount
+    re-presents it at the node's own path under the owner, group and
+    mode that were resolved for it.
+
+    A node with no remote-backed ancestor at all needs none of this --
+    it is a plain local directory and stortree_mounts just chowns it,
+    real native ownership, no machinery. That case falls out as
+    `requires_slug: None`, which is the field the role splits on.
+
+    Entries are deduped by `local_path` with containers taking
+    precedence: a `user-subdirs` node's own grant is what *produced* the
+    container, so the two would otherwise describe the same path twice
+    and race to mount over each other."""
     group_members = group_members or {}
-    mount_entries = [e for e in (mount_plan or []) if e.get("remote")]
-    containers = _resolved_user_containers(resolved, group_members)
+    plan = mount_plan or []
+    mount_entries = [e for e in plan if e.get("remote")]
     result = []
+    seen = set()
+
+    containers = _resolved_user_containers(resolved, group_members)
     for local_path, owner in sorted(containers.items()):
-        parent = local_path.rsplit("/", 1)[0] if "/" in local_path else ""
-        prefixed = f"{STORTREE_USER_PREFIX}{owner}"
-        staging_path = f"{parent}/{prefixed}" if parent else prefixed
         result.append(
-            {
-                "local_path": local_path,
-                "owner": owner,
-                "staging_path": staging_path,
-                "slug": _slug(local_path),
-                "requires_slug": _nearest_mount_slug(staging_path, mount_entries),
-            }
+            _staged_entry(
+                local_path, owner, None, CONTAINER_PERMS, CONTAINER_MODE, mount_entries
+            )
         )
+        seen.add(local_path)
+
+    for e in plan:
+        # A mount applies its own grant through --uid/--gid; a bind
+        # mount is a second view of a path that already has one.
+        if e.get("remote") or e.get("symlink_target"):
+            continue
+        access = e.get("access") or {}
+        if not (access.get("owner") or access.get("group")):
+            continue
+        if e["local_path"] in seen:
+            continue
+        result.append(
+            _staged_entry(
+                e["local_path"],
+                access.get("owner"),
+                access.get("group"),
+                bindfs_perms(access),
+                access_mode(access),
+                mount_entries,
+            )
+        )
+        seen.add(e["local_path"])
+
+    result.sort(key=lambda c: c["local_path"])
     return result
 
 
@@ -2363,21 +2427,21 @@ def mount_unit_names(mount_plan):
     ]
 
 
-def user_mount_unit_names(containers):
-    """The full systemd unit filename for every per-user wrapper mount a
-    user_container_paths() result actually needs one for -- only entries
-    with `requires_slug` set (a container nested under a real remote
-    mount); one with none is a plain local path stortree_mounts chowns
-    directly instead, no wrapper unit at all. Mirrors mount_unit_names()
-    for the same reason: stortree_mounts needs this to work out which
-    currently-installed stortree-user-mount@ units are stale, through
+def present_unit_names(staged):
+    """The full systemd unit filename for every presentation mount a
+    staged_node_paths() result actually needs one for -- only entries
+    with `requires_slug` set (a node nested under a real remote mount);
+    one with none is a plain local path stortree_mounts chowns directly
+    instead, no presentation unit at all. Mirrors mount_unit_names() for
+    the same reason: stortree_mounts needs this to work out which
+    currently-installed stortree-present@ units are stale, through
     stale_unit_names() below."""
     return [
-        f"stortree-user-mount@{c['slug']}.service" for c in containers if c.get("requires_slug")
+        f"stortree-present@{c['slug']}.service" for c in staged if c.get("requires_slug")
     ]
 
 
-def stale_unit_names(installed_paths, mount_plan, containers):
+def stale_unit_names(installed_paths, mount_plan, staged):
     """Which currently-installed stortree unit *files* no longer belong
     to this host's resolved plan -- the ones stortree_mounts stops,
     disables and removes before it touches any path on disk.
@@ -2390,9 +2454,7 @@ def stale_unit_names(installed_paths, mount_plan, containers):
     the role: a rename on either side that stops this matching means a
     live unit stopped and deleted on every apply and re-rendered
     immediately after, and nothing else in the suite would notice."""
-    resolved = set(mount_unit_names(mount_plan)) | set(
-        user_mount_unit_names(containers)
-    )
+    resolved = set(mount_unit_names(mount_plan)) | set(present_unit_names(staged))
     return [
         name
         for name in (path.rsplit("/", 1)[-1] for path in installed_paths)
@@ -2400,36 +2462,75 @@ def stale_unit_names(installed_paths, mount_plan, containers):
     ]
 
 
-def physical_path(local_path, containers):
-    """Where a path actually has to be *created on disk*, given that a
-    wrapped per-user container (user_container_paths() with `requires_slug`
-    set) isn't a real directory at all once its wrapper mount is up -- it's
-    a mountpoint, and what's visible underneath it is the wrapper's own
-    staging directory, not whatever happens to sit physically at that path.
+def presented_ancestor(local_path, staged):
+    """The staged node whose presentation mount `local_path` ends up
+    nested inside -- the deepest staged_node_paths() entry (with
+    `requires_slug` set, so it really does get a mount) that is a proper
+    ancestor of `local_path`, or None if it sits under none of them.
 
-    Anything created at `<container>/<...>` before the wrapper mounts is
-    therefore shadowed the instant it does, and anything mounted onto such
-    a path fails outright with the mountpoint simply not existing -- which
-    is exactly what happened in production the first apply after wrapper
-    mounts existed: every per-user bind mount's own mountpoint directory
-    had been created under the container path, the bind unit's new
-    `Requires=` pulled the wrapper mount up first, and all eight binds then
-    failed their `mount --bind` against a path the wrapper had just hidden.
-    Rewriting to the staging path puts that directory where the wrapper
-    re-presents it from, so it shows up at the visible container path for
-    real and stays mountable.
+    A mount or bind mount at such a path must order itself against that
+    presentation, not merely against the rclone mount further up: the
+    presentation is what puts its mountpoint on screen, and remounting
+    it detaches anything mounted inside (hence PartOf=, see
+    stortree-mount@.service.j2).
 
-    Only *strict* descendants are rewritten: the container path itself is
-    the wrapper's mountpoint and has to keep existing physically right
-    where it is. A path under an unwrapped (plain local, directly chowned)
-    container is returned untouched -- there's no wrapper mount shadowing
-    anything there."""
-    for container in containers or []:
-        if not container.get("requires_slug"):
+    Deepest, and a search rather than a look at the immediate parent,
+    because staged nodes are no longer only per-user containers. A
+    container is always the immediate parent of the paths nested in it,
+    so `local_path.rsplit('/', 1)[0]` used to be the whole answer. A
+    granted plain-directory node can sit any number of levels above the
+    thing nested inside it -- a node granted at `system/data` presenting
+    a descendant mount at `system/data/store/thing` is two levels -- and
+    the immediate-parent lookup silently found nothing there, leaving
+    the descendant with no ordering against the mount that owns its
+    mountpoint."""
+    best = None
+    for node in staged or []:
+        if not node.get("requires_slug"):
             continue
-        prefix = container["local_path"] + "/"
+        prefix = node["local_path"] + "/"
         if local_path.startswith(prefix):
-            return container["staging_path"] + "/" + local_path[len(prefix) :]
+            if best is None or len(node["local_path"]) > len(best["local_path"]):
+                best = node
+    return best
+
+
+def physical_path(local_path, staged):
+    """Where a path actually has to be *created on disk*, given that a
+    staged node (staged_node_paths() with `requires_slug` set) isn't a
+    real directory at all once its presentation mount is up -- it's a
+    mountpoint, and what's visible underneath it is the mount's own
+    staging directory, not whatever happens to sit physically at that
+    path.
+
+    Anything created at `<node>/<...>` before the presentation mounts is
+    therefore shadowed the instant it does, and anything mounted onto
+    such a path fails outright with the mountpoint simply not existing
+    -- which is exactly what happened in production the first apply
+    after these mounts existed: every per-user bind mount's own
+    mountpoint directory had been created under the container path, the
+    bind unit's new `Requires=` pulled the presentation up first, and
+    all eight binds then failed their `mount --bind` against a path the
+    presentation had just hidden.
+
+    Rewriting outward, deepest staged ancestor first, because staged
+    nodes nest: with both `a` and `a/b` staged, `a/b/c` is physically
+    `<stg a>/<stg b>/c` and one pass would only ever find one of the
+    two. Containers could never nest -- a container is always the
+    immediate child of a `user-subdirs` node -- so a single
+    longest-prefix rewrite was enough while these were the only staged
+    paths there were.
+
+    Only *strict* descendants are rewritten: a staged node's own path is
+    its presentation mountpoint and has to keep existing physically
+    right where it is. A path under an unstaged (plain local, directly
+    chowned) node is returned untouched -- there's no presentation mount
+    shadowing anything there."""
+    wrapped = [c for c in (staged or []) if c.get("requires_slug")]
+    for node in sorted(wrapped, key=lambda c: c["local_path"].count("/"), reverse=True):
+        prefix = node["local_path"] + "/"
+        if local_path.startswith(prefix):
+            local_path = node["staging_path"] + "/" + local_path[len(prefix) :]
     return local_path
 
 
@@ -2466,11 +2567,12 @@ class FilterModule(object):
             "stortree_access_mode": access_mode,
             "stortree_needed_groups": needed_groups,
             "stortree_needed_users": needed_users,
-            "stortree_user_containers": user_container_paths,
+            "stortree_staged_nodes": staged_node_paths,
             "stortree_plan_mounts": plan_mounts,
             "stortree_slug": _slug,
             "stortree_stale_units": stale_unit_names,
             "stortree_physical_path": physical_path,
+            "stortree_presented_ancestor": presented_ancestor,
             "stortree_path_masked": path_masked,
             "stortree_samba_access_tokens": samba_access_tokens,
         }

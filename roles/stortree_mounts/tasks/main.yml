@@ -228,21 +228,21 @@
       {{ stortree | stortree_plan_mounts(stortree_group_members, stortree_root) }}
   tags: [mounts]
 
-- name: Compute this host's per-user container ownership
-  # One entry per real <user-subdirs-prefix>/<username> folder any of
-  # this host's resolved access grants (server_subtrees or
-  # peer_dependencies) needs -- see user_container_paths() in
-  # filter_plugins/stortree.py for why this can't just be read off
-  # stortree_mounts_plan's own entries (that per-user container path
-  # never appears there as an entry of its own, only implied as an
-  # ancestor of one). stortree_mounts_plan (just computed above) is what
-  # lets it tell apart the two ways a container can get real ownership:
-  # `requires_slug` set means the container nests inside a remote-backed
-  # mount and needs a wrapper mount of its own (plain chown can't work
-  # there -- see user_container_paths()'s own docstring); unset means a
-  # plain local container, chowned directly, no wrapper needed.
+- name: Compute this host's staged nodes
+  # Every node whose access grant can't be applied where the node sits
+  # -- a per-user <user-subdirs-prefix>/<username> folder, or any
+  # granted plain-directory node inside a remote-backed ancestor. See
+  # staged_node_paths() in filter_plugins/stortree.py for why the
+  # per-user ones can't just be read off stortree_mounts_plan's own
+  # entries (that container path never appears there as an entry of its
+  # own, only implied as an ancestor of one). stortree_mounts_plan (just
+  # computed above) is what lets it tell apart the two ways a node can
+  # get real ownership: `requires_slug` set means it nests inside a
+  # remote-backed mount and needs a presentation mount of its own (plain
+  # chown can't work there -- see staged_node_paths()'s own docstring);
+  # unset means a plain local path, chowned directly, nothing needed.
   ansible.builtin.set_fact:
-    stortree_user_containers: "{{ stortree | stortree_user_containers(stortree_group_members, stortree_mounts_plan) }}"
+    stortree_staged_nodes: "{{ stortree | stortree_staged_nodes(stortree_group_members, stortree_mounts_plan) }}"
   tags: [mounts]
 
 - name: Find currently installed stortree mount units
@@ -256,7 +256,7 @@
     patterns:
       - "stortree-mount@*.service"
       - "stortree-bind@*.service"
-      - "stortree-user-mount@*.service"
+      - "stortree-present@*.service"
   register: stortree_mounts_installed_units
   tags: [mounts]
 
@@ -266,7 +266,7 @@
       {{ stortree_mounts_installed_units.files
          | map(attribute='path')
          | list
-         | stortree_stale_units(stortree_mounts_plan, stortree_user_containers) }}
+         | stortree_stale_units(stortree_mounts_plan, stortree_staged_nodes) }}
   tags: [mounts]
 
 - name: Stop and disable stale mount units
@@ -310,7 +310,7 @@
   ansible.builtin.command:  # noqa: command-instead-of-module
     cmd: >-
       systemctl reset-failed 'stortree-mount@*.service' 'stortree-bind@*.service'
-      'stortree-user-mount@*.service'
+      'stortree-present@*.service'
   changed_when: false
   tags: [mounts]
 
@@ -417,7 +417,7 @@
   ansible.builtin.file:
     path: >-
       {{ stortree_root ~ '/'
-         ~ ((item.local_path | dirname) | stortree_physical_path(stortree_user_containers)) }}
+         ~ ((item.local_path | dirname) | stortree_physical_path(stortree_staged_nodes)) }}
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
@@ -475,7 +475,7 @@
   ansible.builtin.file:
     path: >-
       {{ stortree_root ~ '/'
-         ~ (item.local_path | stortree_physical_path(stortree_user_containers)) }}
+         ~ (item.local_path | stortree_physical_path(stortree_staged_nodes)) }}
     state: directory
     owner: "{{ stortree_user if item.remote else (item.access | stortree_access_owner(stortree_user)) }}"
     group: "{{ stortree_group if item.remote else (item.access | stortree_access_group(stortree_group)) }}"
@@ -513,7 +513,7 @@
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
     mode: "0751"
-  loop: "{{ stortree_user_containers | selectattr('requires_slug') | list }}"
+  loop: "{{ stortree_staged_nodes | selectattr('requires_slug') | list }}"
   loop_control:
     label: "{{ item.staging_path }}"
   when: not (item.staging_path | stortree_path_masked(stortree_masked_mount_paths))
@@ -537,7 +537,7 @@
   ansible.builtin.file:
     path: >-
       {{ stortree_root ~ '/'
-         ~ ((item.local_path | dirname) | stortree_physical_path(stortree_user_containers)) }}
+         ~ ((item.local_path | dirname) | stortree_physical_path(stortree_staged_nodes)) }}
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
@@ -582,7 +582,7 @@
   # exists at the visible path for real. Unwrapped (plain local) containers
   # rewrite to nothing at all and keep working exactly as before.
   ansible.builtin.file:
-    path: "{{ stortree_root ~ '/' ~ (item.local_path | stortree_physical_path(stortree_user_containers)) }}"
+    path: "{{ stortree_root ~ '/' ~ (item.local_path | stortree_physical_path(stortree_staged_nodes)) }}"
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
@@ -626,10 +626,10 @@
   ansible.builtin.file:
     path: "{{ stortree_root ~ '/' ~ item.local_path }}"
     state: directory
-    owner: "{{ item.owner }}"
-    group: "{{ stortree_group }}"
-    mode: "0750"
-  loop: "{{ stortree_user_containers | rejectattr('requires_slug') | list }}"
+    owner: "{{ item.owner | default(stortree_user, true) }}"
+    group: "{{ item.group | default(stortree_group, true) }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ stortree_staged_nodes | rejectattr('requires_slug') | list }}"
   loop_control:
     label: "{{ item.local_path }}"
   when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
@@ -660,10 +660,10 @@
   # being up first (stortree-bind@.service.j2's own preference for a
   # matching wrapper mount over its plain requires_slug).
   ansible.builtin.template:
-    src: stortree-user-mount@.service.j2
-    dest: "/etc/systemd/system/stortree-user-mount@{{ entry.slug }}.service"
+    src: stortree-present@.service.j2
+    dest: "/etc/systemd/system/stortree-present@{{ entry.slug }}.service"
     mode: "0644"
-  loop: "{{ stortree_user_containers | selectattr('requires_slug') | list }}"
+  loop: "{{ stortree_staged_nodes | selectattr('requires_slug') | list }}"
   loop_control:
     loop_var: entry
     label: "{{ entry.local_path }}"
@@ -767,8 +767,8 @@
     get_checksum: false
   loop: >-
     {{ (stortree_mounts_plan | map(attribute='local_path')
-          | map('stortree_physical_path', stortree_user_containers) | list)
-     + (stortree_user_containers | selectattr('requires_slug')
+          | map('stortree_physical_path', stortree_staged_nodes) | list)
+     + (stortree_staged_nodes | selectattr('requires_slug')
           | map(attribute='staging_path') | list) }}
   when: not (item | stortree_path_masked(stortree_masked_mount_paths))
   register: stortree_mounts_verify

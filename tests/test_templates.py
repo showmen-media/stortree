@@ -13,7 +13,7 @@ wrong people access.
 
 Templates are rendered through ansible-core's own filters, tests and
 AnsibleUndefined (see tests/conftest.py), against data straight out of
-resolve()/plan_mounts()/user_container_paths() -- not hand-written
+resolve()/plan_mounts()/staged_node_paths() -- not hand-written
 stand-ins -- so a change to a resolved entry's shape shows up here as a
 failing render rather than at apply time.
 """
@@ -24,7 +24,7 @@ from conftest import EXAMPLE_HOSTS, REPO_ROOT
 
 MOUNT_UNIT = "stortree-mount@.service.j2"
 BIND_UNIT = "stortree-bind@.service.j2"
-USER_MOUNT_UNIT = "stortree-user-mount@.service.j2"
+PRESENT_UNIT = "stortree-present@.service.j2"
 SMB_CONF = "smb.conf.j2"
 SSSD_CONF = "sssd.conf.j2"
 
@@ -56,7 +56,7 @@ def mount_vars(containers, host):
     mounts have something nested inside them used to be a separate fact
     the role derived and passed alongside, and is a field on the entry
     itself since (plan_mounts()' `has_nested_children`)."""
-    return {"stortree_user_containers": containers[host]}
+    return {"stortree_staged_nodes": containers[host]}
 
 
 # -- every template at least parses ---------------------------------------
@@ -151,9 +151,9 @@ def test_mount_unit_prefers_its_containers_wrapper_mount_over_the_outer_mount(
     )
     assert directives(unit, "After") == [
         "network-online.target",
-        "stortree-user-mount@tree-home-jd.service",
+        "stortree-present@tree-home-jd.service",
     ]
-    assert directives(unit, "PartOf") == ["stortree-user-mount@tree-home-jd.service"]
+    assert directives(unit, "PartOf") == ["stortree-present@tree-home-jd.service"]
     assert "RequiresMountsFor=/srv/stortree/tree/home/jd" in unit
     assert "stortree-mount@tree.service" not in unit
 
@@ -323,19 +323,19 @@ def test_mount_unit_stop_is_tolerant_of_an_already_gone_mountpoint(
     assert "Restart=on-failure" in unit
 
 
-# -- stortree-user-mount@.service.j2 --------------------------------------
+# -- stortree-present@.service.j2 --------------------------------------
 
 
 def test_user_mount_unit_presents_the_staging_dir_as_its_owner(
     render, mount_plans, containers
 ):
     unit = render(
-        USER_MOUNT_UNIT,
+        PRESENT_UNIT,
         entry=container_for(containers[BRAVO], "tree/home/jd"),
         **mount_vars(containers, BRAVO),
     )
     assert (
-        "ExecStart=/usr/bin/bindfs /srv/stortree/tree/home/stortree-user-jd "
+        "ExecStart=/usr/bin/bindfs /srv/stortree/tree/home/.stortree-staging-jd "
         "/srv/stortree/tree/home/jd \\" in unit
     )
     assert "-u 10001 \\" in unit  # jd
@@ -357,6 +357,83 @@ def test_user_mount_unit_presents_the_staging_dir_as_its_owner(
     assert "Type=notify" not in unit
 
 
+def test_present_unit_mirrors_the_service_account_so_nested_mounts_can_start(render):
+    # Without --mirror this mount presents its path as the granted owner
+    # to everyone, and fusermount then refuses any nested mount beneath
+    # it ("user has no write access to mountpoint") because the mounting
+    # account no longer appears to own the path it is mounting on.
+    # Verified on a real host, both directions.
+    #
+    # The alternative the tree used before presentation mounts were
+    # general was to force any mount with nested children to
+    # stortree:stortree outright, discarding its grant -- which is the
+    # bug this whole mechanism exists to fix.
+    unit = render(
+        PRESENT_UNIT,
+        entry={
+            "local_path": "tree/system",
+            "owner": "jd",
+            "group": None,
+            "perms": "0600,uo+X",
+            "mode": "0701",
+            "staging_path": "tree/.stortree-staging-system",
+            "slug": "tree-system",
+            "requires_slug": "tree",
+        },
+        stortree_staged_nodes=[],
+    )
+    assert "--mirror=stortree" in unit
+
+
+def test_present_unit_takes_owner_group_and_perms_from_the_resolved_grant(render):
+    # A granted plain-directory node, the kind that used to have its
+    # grant silently dropped. Unlike a per-user container it can carry a
+    # group and a non-default mode, so none of the three is hardcoded.
+    unit = render(
+        PRESENT_UNIT,
+        entry={
+            "local_path": "tree/shared",
+            "owner": "jd",
+            "group": "Michael Whitfield Family",
+            "perms": "0660,ugo+X",
+            "mode": "0771",
+            "staging_path": "tree/.stortree-staging-shared",
+            "slug": "tree-shared",
+            "requires_slug": "tree",
+        },
+        stortree_staged_nodes=[],
+    )
+    assert "-u 10001 \\" in unit  # jd
+    assert "-g 20002 \\" in unit  # the granted group, not stortree_gid
+    assert "-p 0660,ugo+X \\" in unit
+    assert (
+        "ExecStart=/usr/bin/bindfs /srv/stortree/tree/.stortree-staging-shared "
+        "/srv/stortree/tree/shared \\" in unit
+    )
+
+
+def test_present_unit_falls_back_to_the_service_account_when_a_grant_is_group_only(render):
+    # access.group with no access.owner: the owner slot has no granted
+    # user to name, so it stays with the account that administers the
+    # path -- matching access_owner()'s own default.
+    unit = render(
+        PRESENT_UNIT,
+        entry={
+            "local_path": "tree/shared",
+            "owner": None,
+            "group": "Michael Whitfield Family",
+            "perms": "0660,ugo+X",
+            "mode": "0771",
+            "staging_path": "tree/.stortree-staging-shared",
+            "slug": "tree-shared",
+            "requires_slug": "tree",
+        },
+        stortree_staged_nodes=[],
+    )
+    assert "-u 900 \\" in unit  # stortree_uid
+    assert "-g 20002 \\" in unit
+
+
 def test_user_mount_unit_is_partof_the_mount_its_staging_dir_lives_in(
     render, mount_plans, containers
 ):
@@ -364,13 +441,13 @@ def test_user_mount_unit_is_partof_the_mount_its_staging_dir_lives_in(
     # live process with no mount behind it, and that user's folder sat
     # at the bare directory underneath while the play reported success.
     unit = render(
-        USER_MOUNT_UNIT,
+        PRESENT_UNIT,
         entry=container_for(containers[ALPHA], "tree/home/mw"),
         **mount_vars(containers, ALPHA),
     )
     assert "After=stortree-mount@tree.service" in unit
     assert "PartOf=stortree-mount@tree.service" in unit
-    assert "RequiresMountsFor=/srv/stortree/tree/home/stortree-user-mw" in unit
+    assert "RequiresMountsFor=/srv/stortree/tree/home/.stortree-staging-mw" in unit
 
 
 def test_user_mount_unit_for_a_plain_local_container_has_no_ordering_edge(
@@ -383,7 +460,7 @@ def test_user_mount_unit_for_a_plain_local_container_has_no_ordering_edge(
         container_for(containers[ALPHA], "tree/home/jd"), requires_slug=None
     )
     unit = render(
-        USER_MOUNT_UNIT,
+        PRESENT_UNIT,
         entry=entry,
         **mount_vars(containers, ALPHA),
     )
@@ -408,7 +485,7 @@ def test_bind_unit_depends_on_both_its_source_and_its_container(
         **mount_vars(containers, BRAVO),
     )
     source = "stortree-mount@tree-home-.mounts-mw\\x2dfam.service"
-    wrapper = "stortree-user-mount@tree-home-mw.service"
+    wrapper = "stortree-present@tree-home-mw.service"
     assert directives(unit, "PartOf") == [source, wrapper]
     assert directives(unit, "Requires") == [source, wrapper]
     assert directives(unit, "After") == [source, wrapper]
@@ -461,9 +538,9 @@ def test_bind_unit_falls_back_to_requires_slug_without_a_wrapper(
     unit = render(
         BIND_UNIT,
         entry=entry_for(mount_plans[BRAVO], "tree/home/mw/mw-fam"),
-        stortree_user_containers=[],
+        stortree_staged_nodes=[],
     )
-    assert "stortree-user-mount@" not in unit
+    assert "stortree-present@" not in unit
     assert "After=stortree-mount@tree.service" in unit
     assert "PartOf=stortree-mount@tree.service" in unit
 

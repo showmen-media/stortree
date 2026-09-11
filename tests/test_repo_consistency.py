@@ -29,7 +29,7 @@ from filter_plugins.stortree import (
     mount_unit_names,
     plan_mounts,
     resolve,
-    user_mount_unit_names,
+    present_unit_names,
 )
 
 # The three copies of docs/config-schema.md's worked example: what the
@@ -263,7 +263,7 @@ def test_every_unit_family_the_plugin_names_is_swept_by_the_role():
     # detects stale unit files, the `systemctl reset-failed` that clears
     # ghost state, and playbooks/status.yml's own `list-units` -- and
     # each names the unit families literally. A fourth place invents the
-    # names: mount_unit_names()/user_mount_unit_names(). A family added
+    # names: mount_unit_names()/present_unit_names(). A family added
     # there but missed in any of the three sweeps is a unit that is
     # rendered and started but never listed, never reset, and never
     # cleaned up when it goes stale, on every apply, silently.
@@ -274,7 +274,7 @@ def test_every_unit_family_the_plugin_names_is_swept_by_the_role():
     containers = [{"local_path": "c", "slug": "c", "requires_slug": "a"}]
     families = {
         name.split("@", 1)[0] + "@"
-        for name in mount_unit_names(plan) + user_mount_unit_names(containers)
+        for name in mount_unit_names(plan) + present_unit_names(containers)
     }
     assert len(families) == 3, f"unexpected unit families: {families}"
 

@@ -30,8 +30,9 @@ from filter_plugins.stortree import (
     stale_unit_names,
     samba_access_tokens,
     physical_path,
-    user_container_paths,
-    user_mount_unit_names,
+    presented_ancestor,
+    staged_node_paths,
+    present_unit_names,
     user_uids_from_getent,
 )
 
@@ -1154,7 +1155,7 @@ def test_needed_users_with_group_members_also_covers_container_owners():
     # group_members in the first place) jd is the only user; with it,
     # every per-user container's owner is covered too, group-derived ones
     # included, since stortree_secrets needs their numeric UIDs too for a
-    # wrapper mount's --uid (user_container_paths(), stortree_mounts).
+    # wrapper mount's --uid (staged_node_paths(), stortree_mounts).
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     group_members = {
         "Whitfield Family & Friends": ["mike", "jd"],
@@ -1164,18 +1165,79 @@ def test_needed_users_with_group_members_also_covers_container_owners():
     assert needed_users(r, group_members) == ["alex", "dana", "jd", "mike"]
 
 
+def test_staged_node_paths_lets_a_container_win_over_a_plain_grant_at_the_same_path():
+    # A user-subdirs node's own grant is what produced the container, so
+    # the same path can arrive from both collections. It must be staged
+    # once, as the container -- two entries would render two presentation
+    # units racing to mount over the same path.
+    r = resolve(
+        {"top": {"host": "h1", "subdirs": {"home": {"user-subdirs": {"d": {"access.owner": "jd"}}}}}},
+        "h1",
+        ["h1"],
+    )
+    plan = plan_mounts(r, {}) + [
+        {"local_path": "top/home/jd", "remote": None, "access": {"owner": "jd"}}
+    ]
+    staged = staged_node_paths(r, {}, plan)
+    at_path = [e for e in staged if e["local_path"] == "top/home/jd"]
+    assert len(at_path) == 1
+    # the container's literal perms, not bindfs_perms() of the grant
+    assert at_path[0]["perms"] == "0640,ug+X"
+
+
+def test_presented_ancestor_ignores_a_staged_node_that_gets_no_mount():
+    # requires_slug unset means a plain-local node, chowned directly.
+    # There is no presentation unit to order against, so nothing nested
+    # inside it should claim one.
+    staged = [{"local_path": "top/home", "slug": "top-home", "requires_slug": None}]
+    assert presented_ancestor("top/home/jd/x", staged) is None
+
+
+def test_presented_ancestor_keeps_the_deepest_regardless_of_list_order():
+    # The deepest staged ancestor owns the mountpoint. Whichever order
+    # they happen to arrive in, the shallower one must not displace it.
+    deep = {"local_path": "top/home/jd", "slug": "d", "requires_slug": "top"}
+    shallow = {"local_path": "top/home", "slug": "s", "requires_slug": "top"}
+    assert presented_ancestor("top/home/jd/x", [deep, shallow]) is deep
+    assert presented_ancestor("top/home/jd/x", [shallow, deep]) is deep
+
+
 def _container_entry(local_path, owner, requires_slug=None):
+    """One per-user container as staged_node_paths() reports it. Its
+    perms/mode are the literal container pair, not bindfs_perms() of an
+    owner grant -- see CONTAINER_PERMS for why those differ."""
     parent = local_path.rsplit("/", 1)[0]
     return {
         "local_path": local_path,
         "owner": owner,
-        "staging_path": f"{parent}/stortree-user-{owner}",
+        "group": None,
+        "perms": "0640,ug+X",
+        "mode": "0750",
+        "staging_path": f"{parent}/.stortree-staging-{owner}",
         "slug": _slug(local_path),
         "requires_slug": requires_slug,
     }
 
 
-def test_user_container_paths_owner_and_group_grants():
+def _staged_entry(local_path, owner, group, perms, mode, requires_slug=None):
+    """One granted plain-directory node as staged_node_paths() reports
+    it -- the kind that used not to exist, whose grant previously went
+    silently unenforced."""
+    parent = local_path.rsplit("/", 1)[0]
+    name = local_path.rsplit("/", 1)[-1]
+    return {
+        "local_path": local_path,
+        "owner": owner,
+        "group": group,
+        "perms": perms,
+        "mode": mode,
+        "staging_path": f"{parent}/.stortree-staging-{name}",
+        "slug": _slug(local_path),
+        "requires_slug": requires_slug,
+    }
+
+
+def test_staged_node_paths_owner_and_group_grants():
     # no mount_plan given -- every container's staging path can't be
     # checked against any real mount, so requires_slug is None
     # throughout (stortree_mounts' "plain local, chown directly" case).
@@ -1185,7 +1247,7 @@ def test_user_container_paths_owner_and_group_grants():
         "Michael Whitfield Family": ["dana"],
         "Media Production": ["alex"],
     }
-    containers = user_container_paths(r, group_members)
+    containers = staged_node_paths(r, group_members)
     assert containers == [
         _container_entry("tree/home/alex", "alex"),
         _container_entry("tree/home/dana", "dana"),
@@ -1194,7 +1256,7 @@ def test_user_container_paths_owner_and_group_grants():
     ]
 
 
-def test_user_container_paths_covers_peer_dependencies_too():
+def test_staged_node_paths_covers_peer_dependencies_too():
     # gadget owns nothing itself -- every per-user container it still
     # needs to create/own comes from peer_dependencies alone, same
     # reasoning as needed_groups()/needed_users() covering both scopes.
@@ -1204,14 +1266,14 @@ def test_user_container_paths_covers_peer_dependencies_too():
         "Michael Whitfield Family": [],
         "Media Production": ["alex"],
     }
-    containers = user_container_paths(r, group_members)
+    containers = staged_node_paths(r, group_members)
     assert containers == [
         _container_entry("tree/home/alex", "alex"),
         _container_entry("tree/home/jd", "jd"),
     ]
 
 
-def test_user_container_paths_dedupes_across_sibling_descendants():
+def test_staged_node_paths_dedupes_across_sibling_descendants():
     # jd shows up via both sys-configs (owner) and fam (group membership)
     # -- one container, not two, and it must still resolve to exactly the
     # one owner both descendants agree on.
@@ -1229,14 +1291,14 @@ def test_user_container_paths_dedupes_across_sibling_descendants():
         }
     }
     r = resolve(tree, "h1", ["h1"])
-    containers = user_container_paths(r, {"Fam": ["jd", "mo"]})
+    containers = staged_node_paths(r, {"Fam": ["jd", "mo"]})
     assert containers == [
         _container_entry("top/home/jd", "jd"),
         _container_entry("top/home/mo", "mo"),
     ]
 
 
-def test_user_container_paths_ignores_non_per_user_and_ungranted_nodes():
+def test_staged_node_paths_ignores_non_per_user_and_ungranted_nodes():
     tree = {
         "top": {
             "host": "h1",
@@ -1255,11 +1317,11 @@ def test_user_container_paths_ignores_non_per_user_and_ungranted_nodes():
         }
     }
     r = resolve(tree, "h1", ["h1"])
-    assert user_container_paths(r, {}) == []
+    assert staged_node_paths(r, {}) == []
 
 
-def test_user_container_paths_requires_slug_finds_the_nesting_mount():
-    # tree/home/jd's staging path (tree/home/stortree-user-jd) nests
+def test_staged_node_paths_requires_slug_finds_the_nesting_mount():
+    # tree/home/jd's staging path (tree/home/.stortree-staging-jd) nests
     # under "tree"'s own real mount (storagebox:/) -- requires_slug
     # should name that mount's slug, the signal stortree_mounts uses to
     # render a wrapper mount for this container instead of chowning it
@@ -1267,12 +1329,12 @@ def test_user_container_paths_requires_slug_finds_the_nesting_mount():
     # mount with one uniform --uid/--gid for everything under it).
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     plan = plan_mounts(r, {"Media Production": ["alex"]})
-    containers = user_container_paths(r, {}, plan)
+    containers = staged_node_paths(r, {}, plan)
     jd = next(c for c in containers if c["local_path"] == "tree/home/jd")
     assert jd["requires_slug"] == _slug("tree")
 
 
-def test_user_container_paths_no_requires_slug_for_a_plain_local_tree():
+def test_staged_node_paths_no_requires_slug_for_a_plain_local_tree():
     # a container under a purely local (host-set, no rclone.remote)
     # top-level subtree nests under no real mount at all -- requires_slug
     # stays None, so stortree_mounts chowns it directly instead of
@@ -1287,7 +1349,13 @@ def test_user_container_paths_no_requires_slug_for_a_plain_local_tree():
     }
     r = resolve(tree, "h1", ["h1"])
     plan = plan_mounts(r, {})
-    assert user_container_paths(r, {}, plan) == [_container_entry("top/home/jd", "jd")]
+    # The granted descendant is staged too now, for the same reason and
+    # by the same rule -- and lands in the same plain-local case, so it
+    # is chowned directly rather than presented.
+    assert staged_node_paths(r, {}, plan) == [
+        _container_entry("top/home/jd", "jd"),
+        _staged_entry("top/home/jd/sys-configs", "jd", None, "0600,uo+X", "0701"),
+    ]
 
 
 def test_access_owner_defaults_to_stortree_when_unset():
@@ -1731,7 +1799,7 @@ def test_mount_unit_names_includes_bind_units_for_per_user_fan_out():
     ]
 
 
-def test_user_mount_unit_names_only_covers_containers_with_a_wrapper_mount():
+def test_present_unit_names_only_covers_containers_with_a_wrapper_mount():
     # a container with requires_slug set gets a wrapper-mount unit; one
     # without (a plain local container, chowned directly instead) gets
     # none at all.
@@ -1739,7 +1807,7 @@ def test_user_mount_unit_names_only_covers_containers_with_a_wrapper_mount():
         {"slug": "tree-home-jd", "requires_slug": "tree"},
         {"slug": "top-home-jd", "requires_slug": None},
     ]
-    assert user_mount_unit_names(containers) == ["stortree-user-mount@tree-home-jd.service"]
+    assert present_unit_names(containers) == ["stortree-present@tree-home-jd.service"]
 
 
 def _entry(plan, local_path):
@@ -1885,14 +1953,14 @@ CONTAINERS_FOR_PHYSICAL_PATH = [
     {
         "local_path": "tree/home/jd",
         "owner": "jd",
-        "staging_path": "tree/home/stortree-user-jd",
+        "staging_path": "tree/home/.stortree-staging-jd",
         "slug": "tree-home-jd",
         "requires_slug": "tree",
     },
     {
         "local_path": "top/home/dana",
         "owner": "dana",
-        "staging_path": "top/home/stortree-user-dana",
+        "staging_path": "top/home/.stortree-staging-dana",
         "slug": "top-home-dana",
         "requires_slug": None,
     },
@@ -1906,11 +1974,11 @@ def test_physical_path_redirects_inside_a_wrapped_container():
     # directory the wrapper re-presents from.
     assert (
         physical_path("tree/home/jd/mw-fam", CONTAINERS_FOR_PHYSICAL_PATH)
-        == "tree/home/stortree-user-jd/mw-fam"
+        == "tree/home/.stortree-staging-jd/mw-fam"
     )
     assert (
         physical_path("tree/home/jd/a/b/c", CONTAINERS_FOR_PHYSICAL_PATH)
-        == "tree/home/stortree-user-jd/a/b/c"
+        == "tree/home/.stortree-staging-jd/a/b/c"
     )
     assert physical_path("tree/home/jd", CONTAINERS_FOR_PHYSICAL_PATH) == "tree/home/jd"
 
@@ -3091,16 +3159,16 @@ def test_stale_units_are_the_installed_ones_the_plan_no_longer_names():
     installed = [
         "/etc/systemd/system/stortree-mount@top.service",
         "/etc/systemd/system/stortree-bind@top-u.service",
-        "/etc/systemd/system/stortree-user-mount@top-home.service",
+        "/etc/systemd/system/stortree-present@top-home.service",
         "/etc/systemd/system/stortree-mount@gone.service",
         "/etc/systemd/system/stortree-bind@gone-u.service",
-        "/etc/systemd/system/stortree-user-mount@gone-home.service",
+        "/etc/systemd/system/stortree-present@gone-home.service",
     ]
 
     assert stale_unit_names(installed, plan, containers) == [
         "stortree-mount@gone.service",
         "stortree-bind@gone-u.service",
-        "stortree-user-mount@gone-home.service",
+        "stortree-present@gone-home.service",
     ]
 
 
