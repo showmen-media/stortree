@@ -335,16 +335,26 @@ def test_user_mount_unit_presents_the_staging_dir_as_its_owner(
         **mount_vars(containers, BRAVO),
     )
     assert (
-        "ExecStart=/usr/bin/rclone mount /srv/stortree/tree/home/stortree-user-jd "
+        "ExecStart=/usr/bin/bindfs /srv/stortree/tree/home/stortree-user-jd "
         "/srv/stortree/tree/home/jd \\" in unit
     )
-    assert "--uid 10001 \\" in unit  # jd
-    assert "--gid 900 \\" in unit  # stortree_gid -- the container is group-neutral
-    assert "--dir-perms 0750 \\" in unit
-    assert "--file-perms 0640 \\" in unit
-    # A wrapper only re-presents ownership; caching it would be pure
-    # duplication of the outer mount's own VFS cache.
-    assert "--vfs-cache-mode off" in unit
+    assert "-u 10001 \\" in unit  # jd
+    assert "-g 900 \\" in unit  # stortree_gid -- the container is group-neutral
+    # The exact equivalent of the --file-perms 0640 / --dir-perms 0750
+    # pair this replaced: capital X adds the execute bit to directories
+    # only, so a bare 0750 here would mark every file executable.
+    assert "-p 0640,ug+X \\" in unit
+    # Presentation-only: an in-tree chown/chgrp/chmod must not reach the
+    # rclone mount underneath, where it could not have persisted anyway.
+    # All three, because bindfs treats chown and chgrp as separate
+    # policies and --chown-ignore alone still lets a chgrp through.
+    assert "--chown-ignore \\" in unit
+    assert "--chgrp-ignore \\" in unit
+    assert "--chmod-ignore" in unit
+    # libfuse has no sd_notify; fuse_daemonize() runs only after the
+    # mount syscall succeeds, so forking *is* the readiness signal.
+    assert "Type=forking" in unit
+    assert "Type=notify" not in unit
 
 
 def test_user_mount_unit_is_partof_the_mount_its_staging_dir_lives_in(

@@ -173,10 +173,17 @@
 # and the schema doesn't let you write anything broader than that
 # (_normalize_access() rejects a list).
 
-- name: Install rclone and fuse
+- name: Install rclone, bindfs and fuse
+  # bindfs is the presentation layer for per-user containers
+  # (stortree-user-mount@.service.j2): it re-presents an already-mounted
+  # local path under a forced owner, which is all a container needs and
+  # which rclone was doing at ~47MB of resident memory per wrapper
+  # against bindfs's ~1.6MB. See docs/layered-mounts.md "Why bindfs for
+  # layer 2".
   ansible.builtin.apt:
     name:
       - rclone
+      - bindfs
       - fuse
     state: present
     update_cache: true
