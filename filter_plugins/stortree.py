@@ -170,14 +170,24 @@ _NODE_KEYS = frozenset(
 )
 _RCLONE_KEYS = frozenset({"remote", "args"})
 _ACCESS_KEYS = frozenset({"group", "owner", "permissions"})
-_SAMBA_KEYS = frozenset({"name"})
+_SAMBA_KEYS = frozenset({"name", "hidden"})
 # A client-defaults block, or one entry of `clients`, carries `rclone`
-# (either `false` or a `{args: ...}` mapping) and/or `access` (the same
+# (either `false` or a `{args: ...}` mapping), `access` (the same
 # {group?, owner?, permissions?} object a node itself takes, replacing
 # the node's own grant for this client's copy -- docs/config-schema.md
-# "Client-side access").
-_CLIENT_BLOCK_KEYS = frozenset({"rclone", "access"})
+# "Client-side access") and/or `samba` (the same share settings a node
+# itself takes, replacing the node's own export on this one host --
+# docs/config-schema.md "Per-host shares", and the only way to export a
+# node on some hosts and not others).
+_CLIENT_BLOCK_KEYS = frozenset({"rclone", "access", "samba"})
 _CLIENT_RCLONE_KEYS = frozenset({"args"})
+
+# "this block didn't set the key at all", as against setting it to
+# something falsy -- `rclone: false` disables a mount, `access:` with
+# nothing in it deliberately drops a grant, and both are statements the
+# absence of the key is not. Defined up here because _normalize_samba()
+# below needs it too, for the same distinction on `samba`.
+_UNSET = object()
 
 
 def _reject_unknown_keys(mapping, allowed, block, node_path):
@@ -198,7 +208,7 @@ def _reject_unknown_keys(mapping, allowed, block, node_path):
     )
 
 
-def _reject_samba_subpath(node, node_path):
+def _reject_samba_subpath(samba, node_path, block="samba"):
     """`samba.subpath` used to be written in config.yml and no longer is
     -- it's derived from the node's own shape (_normalize_samba()).
 
@@ -206,10 +216,9 @@ def _reject_samba_subpath(node, node_path):
     unknown-key error, because a config that sets it isn't a typo: it
     was valid, it did what it said, and the fix is to delete the line
     rather than to correct it."""
-    samba = node.get("samba")
     if isinstance(samba, dict) and "subpath" in samba:
         raise ValueError(
-            f"stortree: {node_path!r} sets `samba.subpath`, which is no longer "
+            f"stortree: {node_path!r} sets `{block}.subpath`, which is no longer "
             f"written in config.yml -- it is derived from the node: one with a "
             f"`user-subdirs` key gets the per-user {PER_USER_PLACEHOLDER!r} "
             f"path, one without serves the node itself. Delete the line. See "
@@ -240,7 +249,7 @@ def _validate_node(node, node_path):
     _reject_unknown_keys(node, _NODE_KEYS, "", node_path)
     _reject_unknown_keys(node.get("rclone"), _RCLONE_KEYS, "rclone", node_path)
     _reject_unknown_keys(node.get("access"), _ACCESS_KEYS, "access", node_path)
-    _reject_samba_subpath(node, node_path)
+    _reject_samba_subpath(node.get("samba"), node_path)
     _reject_unknown_keys(node.get("samba"), _SAMBA_KEYS, "samba", node_path)
 
     for block in ("subdirs", "user-subdirs", "clients"):
@@ -267,6 +276,17 @@ def _validate_node(node, node_path):
                 entry.get("access"),
                 _ACCESS_KEYS,
                 f"{name}.access",
+                node_path,
+            )
+            # Likewise `samba`: a client block's is the same object a
+            # node's own is, held to the same keys and the same
+            # derived-`subpath` rule, so a typo here drops a per-host
+            # share exactly as silently as one on the node.
+            _reject_samba_subpath(entry.get("samba"), node_path, f"{name}.samba")
+            _reject_unknown_keys(
+                entry.get("samba"),
+                _SAMBA_KEYS,
+                f"{name}.samba",
                 node_path,
             )
 
@@ -345,10 +365,20 @@ def _share_name(raw, node_path):
     return raw
 
 
-def _normalize_samba(node, node_path):
-    """Normalize a node's `samba` into either None (not shared) or the
+def _normalize_samba(raw, node_path, per_user_parent):
+    """Normalize one `samba` value into either None (not shared) or the
     share's own settings dict, with its resolved share `name` filled in
     (docs/config-schema.md "Samba sharing is universal").
+
+    `raw` is the value as written -- `_UNSET` where the block didn't set
+    the key at all -- and `per_user_parent` is whether the *node* it
+    belongs to has a `user-subdirs` key, which is what decides the
+    derived `subpath` below. Both are passed in rather than read off a
+    raw config node, because the value can come from either of two
+    places now: the node's own `samba:`, or a `samba:` inside one of its
+    `client-defaults`/`clients.<host>` blocks (_client_samba()). The
+    node's shape decides the subpath identically either way -- a
+    per-host share of a per-user node is still per-user.
 
     Presence, not truthiness, is what marks a node for export: `samba:`
     written bare (which YAML parses as None), `samba: {}`, and
@@ -358,9 +388,8 @@ def _normalize_samba(node, node_path):
     an AttributeError further downstream. Only an explicit
     `samba: false` opts a node back out, which is the one falsy value
     that ever plausibly meant it."""
-    if "samba" not in node:
+    if raw is _UNSET:
         return None
-    raw = node["samba"]
     if raw is False:
         return None
     if raw is None or raw is True:
@@ -375,6 +404,13 @@ def _normalize_samba(node, node_path):
     # write a resolved default back into.
     samba = dict(raw)
     samba["name"] = _share_name(samba.get("name"), node_path)
+    # Keeps the share out of a host's browse list (`browseable = no`,
+    # roles/stortree_samba/templates/smb.conf.j2). Not access control --
+    # `valid users` is that, and it is untouched by this -- just a way
+    # to keep a share nobody browses for by hand (an appliance's backup
+    # target, a camera recorder's spool) out of the list a person sees.
+    # The share stays mountable by its exact name.
+    samba["hidden"] = bool(samba.get("hidden", False))
     # Derived, never written (_reject_samba_subpath()). A node with
     # `user-subdirs` keeps its per-user folders as its own immediate
     # children (docs/config-schema.md "`subdirs` vs `user-subdirs`"), so
@@ -397,7 +433,7 @@ def _normalize_samba(node, node_path):
     # declares no substructure. Reading them as "not per-user" would
     # make emptying a node's `user-subdirs` silently widen its share
     # from one user's folder to the directory holding everyone's.
-    samba["subpath"] = PER_USER_PLACEHOLDER if "user-subdirs" in node else None
+    samba["subpath"] = PER_USER_PLACEHOLDER if per_user_parent else None
     return samba
 
 
@@ -534,7 +570,7 @@ def _walk_tree(tree):
     top-level subtree's mount up first, unlike when everything hung off
     one shared root).
 
-    Returns (roots, nodes, client_chains, children). `roots` is the
+    Returns (roots, nodes, client_chains, children, own_client_blocks). `roots` is the
     path of each top-level subtree, in config order (each is also an
     ordinary entry in `nodes`). `nodes` is a flat list of
     every node in the whole forest, top-level entries included (unlike
@@ -566,6 +602,14 @@ def _walk_tree(tree):
     a block contribute an entry, so the common chain is short (usually
     one, often none).
 
+    `own_client_blocks` is {path: raw node} for the nodes that carry a
+    block of their own -- the chain's last element, but identified
+    rather than guessed at. `samba` is read from this and not from the
+    chain, because unlike `rclone`/`access` it does not inherit
+    (_client_samba()). Kept beside the resolved nodes rather than on
+    them: a node dict is returned from resolve() and serialized into
+    Ansible facts, and raw config has no business travelling there.
+
     A node that resolves with `remote: None` isn't a separate mounted
     subtree -- see docs/config-schema.md "Node inheritance" for what that
     means downstream (plan_mounts() below turns it into a plain directory
@@ -575,6 +619,7 @@ def _walk_tree(tree):
     nodes = []
     client_chains = {}
     children = {}
+    own_client_blocks = {}
 
     def _visit(node, path_parts, host, per_user, root_path, client_chain, parent_path):
         path = "/".join(path_parts)
@@ -584,12 +629,15 @@ def _walk_tree(tree):
             children[parent_path].append(path)
         if "client-defaults" in node or "clients" in node:
             client_chain = client_chain + [node]
+            own_client_blocks[path] = node
         client_chains[path] = client_chain
         h = node.get("host", host)
         r = (node.get("rclone") or {}).get("remote")
         args = (node.get("rclone") or {}).get("args") or {}
         access = _normalize_access(node.get("access"))
-        samba = _normalize_samba(node, path)
+        samba = _normalize_samba(
+            node.get("samba", _UNSET), path, "user-subdirs" in node
+        )
         nodes.append(
             {
                 "path": path,
@@ -599,6 +647,12 @@ def _walk_tree(tree):
                 "access": access,
                 "samba": samba,
                 "per_user": per_user,
+                # Whether this node's *own* shape is per-user (it has a
+                # `user-subdirs` key), as against `per_user` above,
+                # which says it *sits under* one. Kept by name so a
+                # client block's `samba:` can derive the same `%U`
+                # subpath later, without the raw config node in hand.
+                "per_user_parent": "user-subdirs" in node,
                 "root_path": root_path,
                 "requires": _normalize_requires(node.get("requires"), path),
             }
@@ -628,7 +682,7 @@ def _walk_tree(tree):
         _visit(root_node or {}, [name], None, False, name, [], None)
         roots.append(name)
 
-    return roots, nodes, client_chains, children
+    return roots, nodes, client_chains, children, own_client_blocks
 
 
 def _validate_requires(nodes):
@@ -699,24 +753,34 @@ def _samba_nodes(nodes):
     return [n for n in nodes if n["samba"] is not None]
 
 
-def _validate_share_names(samba_nodes):
+def _validate_share_names(named, hostname=None):
     """Two shares can't answer to one name: smb.conf keeps the first
     stanza and drops the second, so half the tree is quietly unreachable
     over SMB. Reachable both by two `samba.name`s written the same and
     by two node paths folding onto one derived name (`a/b c` and
-    `a/b_c`), which is why this checks resolved names rather than what
-    the config wrote."""
+    `a/b_c`), which is why this checks resolved names -- `named`, an
+    iterable of (node path, share name) -- rather than what the config
+    wrote.
+
+    Checked twice, at two different scopes, because a collision can now
+    arise at either. Two nodes whose *own* `samba:` blocks land on one
+    name collide on every host, so _index_tree() catches that tree-wide
+    with no `hostname` to name. A per-host share (docs/config-schema.md
+    "Per-host shares") only exists on the hosts it was written for, so a
+    name it collides with may be free everywhere else -- that one is
+    caught by _host_samba_nodes(), which passes the `hostname` whose
+    rendered smb.conf could not have represented both."""
     by_name = {}
-    for n in samba_nodes:
-        name = n["samba"]["name"]
+    for path, name in named:
         clash = by_name.get(name)
         if clash is not None:
+            where = f" on {hostname!r}" if hostname else ""
             raise ValueError(
-                f"stortree: {clash!r} and {n['path']!r} both export the Samba "
-                f"share name {name!r} -- set a distinct `samba.name` on one of "
-                f"them. See docs/config-schema.md \"Share names\""
+                f"stortree: {clash!r} and {path!r} both export the Samba "
+                f"share name {name!r}{where} -- set a distinct `samba.name` on "
+                f"one of them. See docs/config-schema.md \"Share names\""
             )
-        by_name[name] = n["path"]
+        by_name[name] = path
 
 
 def _descendants_of(samba_node, nodes):
@@ -755,9 +819,6 @@ def _dedupe(items, key):
             seen.add(k)
             result.append(item)
     return result
-
-
-_UNSET = object()
 
 
 def _rclone_setting(container):
@@ -843,10 +904,43 @@ def _client_policy(chain, hostname):
     return enabled, args, access
 
 
+def _client_samba(own, hostname):
+    """The raw `samba` a client block written *on this node* sets for
+    `hostname`, or `_UNSET` where none does. `own` is the node's own raw
+    config where it carries a `client-defaults`/`clients` block at all
+    (_TreeIndex.own_client_blocks), else None.
+
+    Within the node, `clients.<hostname>` beats `client-defaults` and
+    nothing merges -- the same two rules `access` follows in
+    _client_policy(), and for the same reason: a share is a single
+    object an operator reads off one place in the config, and half a
+    share assembled from two blocks would be no more readable than half
+    a grant.
+
+    Across nodes there is deliberately no rule at all, because `samba`
+    does not inherit -- a node's own `samba:` never has. It marks the
+    one node it is written on for export and says nothing about that
+    node's descendants. Reading it off the inherited chain
+    _client_policy() walks would export *every* descendant of a node
+    that carried one, all under that one name: a share-name collision by
+    construction, and any per-user descendant silently shared along with
+    it."""
+    if not own:
+        return _UNSET
+    found = _UNSET
+    for container in (
+        own.get("client-defaults"),
+        (own.get("clients") or {}).get(hostname),
+    ):
+        if isinstance(container, dict) and "samba" in container:
+            found = container["samba"]
+    return found
+
+
 _TreeIndex = collections.namedtuple(
     "_TreeIndex",
-    "roots nodes nodes_by_path children client_chains samba_nodes "
-    "samba_descendants requires_by_path",
+    "roots nodes nodes_by_path children client_chains own_client_blocks "
+    "requires_by_path",
 )
 
 
@@ -862,23 +956,71 @@ def _index_tree(tree):
     error everywhere, not only on whichever host happens to resolve the
     node it was written on into a real mount.
 
-    `samba_descendants` maps each `samba:` node's path to the nodes it
-    exports (_descendants_of()), computed once here because all three
-    samba-facing projections below ask for the same answer."""
-    roots, nodes, client_chains, children = _walk_tree(_expand_dotted(tree))
+    The samba projections are the one thing that can *not* be settled
+    here any more: which nodes a host exports depends on the host
+    (_host_samba_nodes()). What stays tree-wide is the half that is
+    genuinely host-independent -- a name collision between two nodes'
+    own `samba:` blocks, which no host could render."""
+    roots, nodes, client_chains, children, own_client_blocks = _walk_tree(
+        _expand_dotted(tree)
+    )
     _validate_requires(nodes)
-    samba_nodes = _samba_nodes(nodes)
-    _validate_share_names(samba_nodes)
+    _validate_share_names(
+        [(n["path"], n["samba"]["name"]) for n in _samba_nodes(nodes)]
+    )
     return _TreeIndex(
         roots=roots,
         nodes=nodes,
         nodes_by_path={n["path"]: n for n in nodes},
         children=children,
         client_chains=client_chains,
-        samba_nodes=samba_nodes,
-        samba_descendants={s["path"]: _descendants_of(s, nodes) for s in samba_nodes},
+        own_client_blocks=own_client_blocks,
         requires_by_path={n["path"]: n["requires"] for n in nodes},
     )
+
+
+def _host_samba_nodes(index, hostname):
+    """(node, samba, descendants) for every node `hostname` exports as a
+    Samba share.
+
+    A node's own `samba:` applies on every host -- that is what "Samba
+    sharing is universal" has always meant and still means for every
+    config that writes nothing else. A `samba:` inside one of the node's
+    `client-defaults`/`clients.<host>` blocks replaces it for that one
+    host: on a node with no `samba:` of its own it *adds* a share there
+    and nowhere else, and on one that has a `samba:` it renames, hides,
+    or (with `samba: false`) withdraws that host's copy.
+
+    Why a share list can be per-host at all, having been fleet-wide
+    since the beginning: a share is only usable where the principals it
+    admits can be resolved, and identity is not always fleet-wide. A
+    service account that exists only on the host running the appliance
+    that writes there -- a local Unix user, never in LDAP, deliberately
+    -- cannot be named in a share on any other host. Exporting such a
+    node everywhere leaves only bad options: name a principal most hosts
+    cannot resolve, or export a share nobody can connect to.
+
+    The owning host is never read out of a client block, the same rule
+    `rclone` and `access` already follow (docs/config-schema.md
+    "Per-client mount opt-out", "Client-side access"): those blocks
+    describe a host holding a *copy* of the node, and the owner holds
+    the original."""
+    out = []
+    for n in index.nodes:
+        raw = (
+            _UNSET
+            if n["host"] == hostname
+            else _client_samba(index.own_client_blocks.get(n["path"]), hostname)
+        )
+        samba = (
+            n["samba"]
+            if raw is _UNSET
+            else _normalize_samba(raw, n["path"], n["per_user_parent"])
+        )
+        if samba is not None:
+            out.append((n, samba, _descendants_of(n, index.nodes)))
+    _validate_share_names([(n["path"], sb["name"]) for n, sb, _d in out], hostname)
+    return out
 
 
 def _client_mount_targets(index, root_path, host):
@@ -927,25 +1069,51 @@ def _client_mount_targets(index, root_path, host):
     return targets
 
 
-def _samba_share_entries(index):
-    """Every `samba:` node in the tree as one exported share.
+def _samba_share_entries(index, hostname):
+    """Every node `hostname` exports as a share.
 
-    Host-independent on purpose -- it takes no `hostname` and there is
-    nothing here to vary by one. Samba sharing is universal (spec.md
-    §1): every host exports every share in the tree, so a client reaches
-    the same share whichever host it connects to, and the smb.conf
-    stanza has to come out identical everywhere."""
+    Universal by default and per-host only where a config says so
+    (_host_samba_nodes()): with nothing but node-level `samba:` blocks
+    written, every host resolves the same list, a client reaches the
+    same share whichever host it connects to, and the stanza comes out
+    identical everywhere -- which is what this always did. A `samba:` in
+    a client block is what makes the list, and the stanza, differ."""
     shares = []
-    for s in index.samba_nodes:
-        descendants = index.samba_descendants[s["path"]]
+    for s, samba, descendants in _host_samba_nodes(index, hostname):
 
         # Each descendant carries at most one access grant now (never a
         # list, see _normalize_access()) -- the union across descendants
         # is still a list, just of (at most) one grant per descendant
         # rather than several from any single one.
+        #
+        # The grant taken is the one *this host* actually enforces on its
+        # own copy of the descendant: the node's own where this host owns
+        # it (a client block never describes the owner), and otherwise
+        # whatever `client-defaults`/`clients.<host>` set for it -- the
+        # same resolution _samba_peer_dependencies() below applies to the
+        # mount itself, so `valid users` and the filesystem underneath it
+        # can't disagree.
+        #
+        # This is the half of "the stanza is identical everywhere" that
+        # host-local identity really does break, and it has to break: a
+        # grant naming a principal only one host can resolve belongs in
+        # that host's `valid users` and nowhere else. Naming it fleet-wide
+        # would put an unresolvable name in every other host's smb.conf;
+        # omitting it there too would leave the one host that *does*
+        # enforce it exporting a share nobody may enter.
         access_union = []
         for d in descendants:
-            a = d.get("access")
+            if d["host"] == hostname:
+                a = d.get("access")
+            else:
+                _enabled, _args, client_access = _client_policy(
+                    index.client_chains[d["path"]], hostname
+                )
+                a = (
+                    d.get("access")
+                    if client_access is _UNSET
+                    else _normalize_access(client_access)
+                )
             if a and a not in access_union:
                 access_union.append(a)
 
@@ -953,8 +1121,9 @@ def _samba_share_entries(index):
             {
                 "node_path": s["path"],
                 "local_path": s["path"],
-                "name": s["samba"]["name"],
-                "subpath": s["samba"]["subpath"],
+                "name": samba["name"],
+                "subpath": samba["subpath"],
+                "hidden": samba["hidden"],
                 "access": access_union,
                 "descendants": [
                     {
@@ -984,8 +1153,8 @@ def _samba_peer_dependencies(index, hostname):
     remote (spec.md §3's scoping: a host never holds credentials for a
     remote it doesn't own)."""
     peers = []
-    for s in index.samba_nodes:
-        for d in index.samba_descendants[s["path"]]:
+    for s, _samba, descendants in _host_samba_nodes(index, hostname):
+        for d in descendants:
             if d["host"] == hostname or not _has_own_content(d, index.nodes):
                 continue
             # The descendant's own chain, not just its top-level
@@ -1145,8 +1314,8 @@ def _peer_served_by_entries(index, hostname, all_hosts, samba_hosts=None):
                     )
         if not other_serves_samba:
             continue
-        for s in index.samba_nodes:
-            for d in index.samba_descendants[s["path"]]:
+        for s, _samba, descendants in _host_samba_nodes(index, other):
+            for d in descendants:
                 if d["host"] == hostname and _has_own_content(d, index.nodes):
                     enabled, _args, _access = _client_policy(
                         index.client_chains[d["path"]], other
@@ -1226,7 +1395,7 @@ def resolve(
     return {
         "server_subtrees": [n for n in index.nodes if n["host"] == hostname],
         "client_mounts": client_mounts,
-        "samba_shares": _samba_share_entries(index) if serves_samba else [],
+        "samba_shares": _samba_share_entries(index, hostname) if serves_samba else [],
         "peer_dependencies": _dedupe(
             samba_peers + client_peers,
             lambda p: (p["owning_host"], p["local_path"]),

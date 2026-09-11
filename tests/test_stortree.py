@@ -2470,6 +2470,254 @@ def test_two_node_paths_folding_onto_one_name_are_rejected_too():
         resolve(tree, "h1", ["h1", "h2"])
 
 
+# -- samba.hidden ----------------------------------------------------------
+
+
+def test_a_share_is_not_hidden_unless_it_says_so():
+    tree = {"a": {"host": "h1", "samba": None}}
+    (share,) = resolve(tree, "h1", ["h1"])["samba_shares"]
+    assert share["hidden"] is False
+
+
+def test_samba_hidden_reaches_the_resolved_share():
+    tree = {"a": {"host": "h1", "samba": {"hidden": True}}}
+    (share,) = resolve(tree, "h1", ["h1"])["samba_shares"]
+    assert share["hidden"] is True
+
+
+def test_samba_hidden_does_not_change_who_may_connect():
+    # `hidden` is browse-list suppression, not access control: the
+    # share's own grant is untouched by it.
+    tree = {"a": {"host": "h1", "access.group": "ops", "samba": {"hidden": True}}}
+    (share,) = resolve(tree, "h1", ["h1"])["samba_shares"]
+    assert [g["group"] for g in share["access"]] == ["ops"]
+
+
+# -- per-host shares (a `samba:` inside a client block) --------------------
+
+
+def _appliance_tree():
+    """`spool` is exported on h2 alone -- the host whose local service
+    account writes to it. h1 owns the data and exports nothing."""
+    return {
+        "tree": {
+            "host": "h1",
+            "rclone.remote": "r:/",
+            "subdirs": {
+                "spool": {
+                    "clients.h2": {
+                        "samba": {"name": "spool", "hidden": True},
+                        "access.owner": "svc",
+                    }
+                }
+            },
+        }
+    }
+
+
+def test_a_client_block_samba_exports_the_node_on_that_host_alone():
+    tree = _appliance_tree()
+    assert resolve(tree, "h1", ["h1", "h2"])["samba_shares"] == []
+    (share,) = resolve(tree, "h2", ["h1", "h2"])["samba_shares"]
+    assert (share["name"], share["node_path"], share["hidden"]) == (
+        "spool",
+        "tree/spool",
+        True,
+    )
+
+
+def test_a_per_host_shares_grant_comes_from_the_block_that_declared_it():
+    # The whole point of the per-host share: `svc` is a local Unix user
+    # on h2 and exists nowhere else, so its grant reaches h2's own
+    # `valid users` and no other host's.
+    tree = _appliance_tree()
+    (share,) = resolve(tree, "h2", ["h1", "h2"])["samba_shares"]
+    assert [g["owner"] for g in share["access"]] == ["svc"]
+    assert needed_users(resolve(tree, "h1", ["h1", "h2"])) == []
+    assert needed_users(resolve(tree, "h2", ["h1", "h2"])) == ["svc"]
+
+
+def test_a_per_host_share_peer_sources_its_content_on_that_host_only():
+    # And the serving side agrees: h1 provisions SSH trust for exactly
+    # the mount h2 will make to back the share, and for nothing else.
+    tree = _appliance_tree()
+    h2 = resolve(tree, "h2", ["h1", "h2"])
+    assert ("h1", "tree/spool") in [
+        (p["owning_host"], p["local_path"]) for p in h2["peer_dependencies"]
+    ]
+    h1 = resolve(tree, "h1", ["h1", "h2"])
+    assert ("h2", "tree/spool") in [
+        (p["serving_host"], p["local_path"]) for p in h1["peer_served_by"]
+    ]
+
+
+def test_client_defaults_samba_exports_on_every_host_but_the_owner():
+    tree = {"a": {"host": "h1", "client-defaults": {"samba": {"name": "a"}}}}
+    hosts = ["h1", "h2", "h3"]
+    assert resolve(tree, "h1", hosts)["samba_shares"] == []
+    for h in ("h2", "h3"):
+        assert [s["name"] for s in resolve(tree, h, hosts)["samba_shares"]] == ["a"]
+
+
+def test_the_owning_host_ignores_a_client_block_written_for_itself():
+    # `clients`/`client-defaults` describe a host holding a *copy*; the
+    # owner holds the original. Same rule `rclone` and `access` follow.
+    tree = {"a": {"host": "h1", "clients.h1": {"samba": {"name": "nope"}}}}
+    assert resolve(tree, "h1", ["h1", "h2"])["samba_shares"] == []
+
+
+def test_a_client_block_samba_renames_that_hosts_copy_of_a_universal_share():
+    tree = {
+        "a": {"host": "h1", "samba": {"name": "shared"}, "clients.h2": {"samba": {"name": "local"}}}
+    }
+    hosts = ["h1", "h2"]
+    assert [s["name"] for s in resolve(tree, "h1", hosts)["samba_shares"]] == ["shared"]
+    assert [s["name"] for s in resolve(tree, "h2", hosts)["samba_shares"]] == ["local"]
+
+
+def test_a_client_block_samba_false_withdraws_a_universal_share_on_that_host():
+    tree = {"a": {"host": "h1", "samba": {"name": "a"}, "clients.h2": {"samba": False}}}
+    hosts = ["h1", "h2"]
+    assert [s["name"] for s in resolve(tree, "h1", hosts)["samba_shares"]] == ["a"]
+    assert resolve(tree, "h2", hosts)["samba_shares"] == []
+
+
+def test_a_client_block_samba_does_not_cascade_to_descendants():
+    # `samba` marks the one node it is written on, never that node's
+    # subtree -- exactly as a node's own `samba:` does. Cascading would
+    # export every descendant under a single name.
+    tree = {
+        "a": {
+            "host": "h1",
+            "client-defaults": {"samba": {"name": "outer"}},
+            "subdirs": {"b": {}, "c": {}},
+        }
+    }
+    shares = resolve(tree, "h2", ["h1", "h2"])["samba_shares"]
+    assert [s["node_path"] for s in shares] == ["a"]
+
+
+def test_within_one_node_clients_host_beats_client_defaults_for_samba():
+    tree = {
+        "a": {
+            "host": "h1",
+            "client-defaults": {"samba": {"name": "default"}},
+            "clients": {"h2": {"samba": {"name": "specific"}}},
+        }
+    }
+    hosts = ["h1", "h2", "h3"]
+    assert [s["name"] for s in resolve(tree, "h2", hosts)["samba_shares"]] == ["specific"]
+    assert [s["name"] for s in resolve(tree, "h3", hosts)["samba_shares"]] == ["default"]
+
+
+def test_a_per_host_share_of_a_user_subdirs_node_keeps_the_per_user_path():
+    # The subpath is derived from the *node's* shape, not from where the
+    # `samba:` was written -- a per-host share of a per-user node is
+    # still per-user, or it would expose every user's folder to everyone.
+    tree = {
+        "a": {
+            "host": "h1",
+            "user-subdirs": {"x": {"access.group": "g"}},
+            "clients.h2": {"samba": {"name": "a"}},
+        }
+    }
+    (share,) = resolve(tree, "h2", ["h1", "h2"])["samba_shares"]
+    assert share["subpath"] == "%U"
+
+
+def test_a_share_name_collision_confined_to_one_host_fails_every_host():
+    # h2 is the only host that would export both, and its rendered
+    # smb.conf is the file that could not hold them -- so the message
+    # names h2. It is still a config error, though, and a config error
+    # fails the apply everywhere rather than only where it would bite
+    # (the same rule `requires` follows): resolving h1 walks what its
+    # peers export, to know what trust to provision, and finds it there.
+    tree = {
+        "a": {"host": "h1", "samba": {"name": "media"}},
+        "b": {"host": "h1", "clients.h2": {"samba": {"name": "media"}}},
+    }
+    for host in ("h1", "h2"):
+        with pytest.raises(ValueError, match="share name 'media' on 'h2'"):
+            resolve(tree, host, ["h1", "h2"])
+
+
+def test_a_per_host_share_name_is_free_on_hosts_that_do_not_export_it():
+    # The same two nodes, with the per-host share named distinctly:
+    # nothing collides, and only h2 sees the second share at all.
+    tree = {
+        "a": {"host": "h1", "samba": {"name": "media"}},
+        "b": {"host": "h1", "clients.h2": {"samba": {"name": "spool"}}},
+    }
+    hosts = ["h1", "h2"]
+    assert [s["name"] for s in resolve(tree, "h1", hosts)["samba_shares"]] == ["media"]
+    assert sorted(s["name"] for s in resolve(tree, "h2", hosts)["samba_shares"]) == [
+        "media",
+        "spool",
+    ]
+
+
+# -- valid users follows what this host actually enforces ------------------
+
+
+def test_a_client_side_grant_replaces_the_nodes_own_in_valid_users():
+    # A share's `valid users` names the principals the filesystem
+    # underneath it will admit -- which is the client-side grant on a
+    # host holding a copy, and the node's own on the host that owns it.
+    tree = {
+        "a": {
+            "host": "h1",
+            "samba": {"name": "a"},
+            "subdirs": {
+                "d": {"access.owner": "alice", "clients.h2": {"access.owner": "bob"}}
+            },
+        }
+    }
+    hosts = ["h1", "h2"]
+    (on_h1,) = resolve(tree, "h1", hosts)["samba_shares"]
+    (on_h2,) = resolve(tree, "h2", hosts)["samba_shares"]
+    assert [g["owner"] for g in on_h1["access"]] == ["alice"]
+    assert [g["owner"] for g in on_h2["access"]] == ["bob"]
+
+
+def test_valid_users_is_identical_everywhere_with_no_client_side_grant():
+    # The default is unchanged: without a client block saying otherwise,
+    # every host resolves the same share with the same grant.
+    tree = {"a": {"host": "h1", "access.group": "ops", "samba": {"name": "a"}}}
+    hosts = ["h1", "h2", "h3"]
+    grants = [
+        [g["group"] for g in resolve(tree, h, hosts)["samba_shares"][0]["access"]]
+        for h in hosts
+    ]
+    assert grants == [["ops"]] * 3
+
+
+# -- schema validation for the new keys ------------------------------------
+
+
+def test_a_misspelled_samba_hidden_is_rejected():
+    tree = {"a": {"host": "h1", "samba": {"hiden": True}}}
+    with pytest.raises(ValueError, match="unknown `samba` key 'hiden'"):
+        resolve(tree, "h1", ["h1"])
+
+
+def test_a_misspelled_key_inside_a_client_block_samba_is_rejected():
+    tree = {"a": {"host": "h1", "clients.h2": {"samba": {"nmae": "x"}}}}
+    with pytest.raises(ValueError, match=r"unknown `clients.h2.samba` key 'nmae'"):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_samba_subpath_inside_a_client_block_is_rejected_by_name():
+    tree = {"a": {"host": "h1", "clients.h2": {"samba": {"subpath": "%U"}}}}
+    with pytest.raises(ValueError, match=r"sets `clients.h2.samba.subpath`"):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_a_client_block_samba_name_is_held_to_the_same_alphabet():
+    tree = {"a": {"host": "h1", "clients.h2": {"samba": {"name": ".hidden"}}}}
+    with pytest.raises(ValueError, match="may contain only letters"):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
 def test_client_opt_out_also_withholds_peer_trust_from_the_serving_side():
     # The mirror of test_client_opt_out_beats_universal_samba_sharing,
     # seen from the host that owns the data: if no peer will ever mount

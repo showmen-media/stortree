@@ -39,6 +39,11 @@ its own, shaped exactly like any other node below it:
     access: {...}              # optional — the {group?, owner?, permissions?} object a
                                # node itself takes, replacing this node's own grant on
                                # every non-owning host; see "Client-side access" below
+    samba: {...}               # optional — the same share settings a node itself takes,
+                               # replacing this node's own export on every non-owning
+                               # host (and adding one where the node has none); see
+                               # "Per-host shares" below. Does not inherit — it marks
+                               # this node only, never its descendants
 
   clients:
     <hostname>:
@@ -49,6 +54,9 @@ its own, shaped exactly like any other node below it:
                                # see "Per-client mount opt-out" below
       access: {...}            # optional per-client override of client-defaults.access;
                                # see "Client-side access" below
+      samba: {...}             # optional per-client override of client-defaults.samba;
+                               # `samba: false` withdraws the share on this host alone.
+                               # See "Per-host shares" below
 
   requires: [<path>, ...]      # optional — other subtrees whose mounts must be up
                                # before this one starts; tree-relative paths, a bare
@@ -69,6 +77,9 @@ its own, shaped exactly like any other node below it:
                                # clients mount as //<host>/<name>; defaults to the
                                # node's path with everything outside [A-Za-z0-9_-]
                                # folded to `_` (`tree/home` → `tree_home`)
+    hidden: true               # optional — keep the share out of the host's browse
+                               # list (`browseable = no`). Not access control; the
+                               # share stays mountable by its exact name
   subdirs: {...}               # recurse — this and everything under it works exactly the
                                # same as it does at the top level, just nested
   user-subdirs: {...}          # recurse — see note below
@@ -410,11 +421,17 @@ Three things to know about it:
 - **The owning host is never affected.** `clients`/`client-defaults`
   only ever describe a host that doesn't own the node, so the node's own
   `access` is what its owner enforces, always.
-- **It doesn't change the Samba share.** A share's `valid users`/`write
-  list` stay derived from the nodes' own tree-wide grants and are
-  identical on every host that exports the share ("Samba sharing is
-  universal" below). Only what's enforced on this host's own filesystem
-  changes.
+- **It does change what the Samba share admits, on this host.** A
+  share's `valid users`/`write list` name the principals the filesystem
+  underneath will actually let in, so they follow the grant each host
+  enforces: the node's own on the host that owns it, the client-side one
+  everywhere it was written. With no client-side grant anywhere in a
+  share's subtree — the ordinary case — every host derives the same
+  list, exactly as before. This is what makes host-local identity work:
+  a service account that exists only on one host (a local Unix user,
+  never in LDAP) is named in that host's `valid users` and in no other,
+  where it could not be resolved. The share's *path* and the peer mounts
+  behind it are unchanged either way.
 
 A top-level subtree's client mount carries no grant at all unless a
 client block gives it one — the owning host is what enforces the node's
@@ -707,6 +724,13 @@ There's no "designated Samba host": if a node has a `samba:` block, every
 inventory host — server, client-only, or entirely unnamed in
 `config.yml` — ends up serving it.
 
+Two things narrow that, both opt-in and neither changing the default:
+`stortree_samba_hosts` takes a host out of exporting anything ("What
+universality costs" below), and a `samba:` written inside a
+`client-defaults`/`clients.<hostname>` block scopes one node's share to
+the hosts it names ("Per-host shares" below). A config that writes
+neither behaves exactly as this section describes.
+
 #### What universality costs, and how to opt a host out
 
 Universality is the default and stays it, but it is not free, and the
@@ -752,6 +776,63 @@ served shares gets its `smbd` stopped and disabled on the next apply
 (the package and `/etc/samba/smb.conf` are left alone) — otherwise it
 would keep exporting the last rendered config, whose share paths point
 at peer mounts that no longer resolve.
+
+#### Per-host shares
+
+`stortree_samba_hosts` above decides which hosts export *anything*. A
+`samba:` written inside a `client-defaults`/`clients.<hostname>` block
+decides which hosts export *this node* — the one way a share exists on
+some hosts and not others:
+
+```yaml
+tree:
+  host: storage-node-alpha
+  rclone.remote: storagebox:/
+  subdirs:
+    spool:
+      clients.storage-node-bravo:
+        samba:
+          name: spool
+          hidden: true
+        access.owner: nvr        # a local Unix user on bravo, not in LDAP
+```
+
+`storage-node-alpha` owns `tree/spool` and exports no share for it.
+`storage-node-bravo` exports `spool`, hidden, peer-sourcing the content
+from alpha the same way it would for any other Samba descendant. No
+other host exports it at all.
+
+The reason this exists is identity, not tidiness. A share is only usable
+where the principals it admits can be resolved, and identity is not
+always fleet-wide: an appliance's service account — a camera recorder's,
+a backup agent's — often exists as a local Unix user on the one host
+that appliance talks to, deliberately never in LDAP. Exported
+everywhere, that node's share would name a principal most hosts cannot
+resolve; exported nowhere, the host that *can* resolve it has no share
+to offer. Per-host is the only shape that is true.
+
+Four things to know about it:
+
+- **It doesn't inherit.** Unlike `rclone` and `access` in the same
+  blocks, a `samba:` marks the one node it's written on and says nothing
+  about that node's descendants — exactly as a node's own `samba:`
+  behaves. Cascading would export every descendant under a single name.
+- **The owning host never reads it.** `clients`/`client-defaults`
+  describe a host holding a *copy*; the owner holds the original. A node
+  is exported on its owner if, and only if, it carries its own `samba:`.
+- **It replaces the node's own export on that host**, rather than
+  merging with it. On a node with no `samba:` it adds a share there; on
+  one that has a `samba:` it renames or hides that host's copy, and
+  `samba: false` withdraws it there while leaving every other host's
+  intact. Within a node `clients.<hostname>` beats `client-defaults`,
+  the same precedence `rclone` and `access` follow.
+- **`valid users` follows the grant that host enforces** — see
+  "Client-side access" above. That is what lets the `nvr` grant reach
+  bravo's share and no other host's.
+
+Nothing else changes: the share path is still derived from the node
+("The share path" below), and the peer mounts behind it are provisioned
+exactly as for a universal share, on the hosts that actually export it.
 
 #### The share path
 
@@ -810,14 +891,21 @@ own meaning (`global`, `homes`, `printers`) are rejected outright: a
 share named `global` would merge into the generated `[global]` block and
 rewrite fleet-wide settings instead of adding a share.
 
-Names have to be unique across the tree, however they were arrived at:
-two nodes landing on one name — two `samba.name`s written the same, or
-two paths folding together (`tree/a b` and `tree/a_b`) — fail the run,
-because `smb.conf` would otherwise keep the first stanza and drop the
-second, leaving part of the tree silently unreachable over SMB. The name
-changes nothing else: the share's path, its `valid users`/`write list`,
-and the peer mounts behind it are all still derived from the node's real
-path.
+Names have to be unique, however they were arrived at: two nodes landing
+on one name — two `samba.name`s written the same, or two paths folding
+together (`tree/a b` and `tree/a_b`) — fail the run, because `smb.conf`
+would otherwise keep the first stanza and drop the second, leaving part
+of the tree silently unreachable over SMB. The name changes nothing
+else: the share's path, its `valid users`/`write list`, and the peer
+mounts behind it are all still derived from the node's real path.
+
+Uniqueness is checked per host, since a host's own `smb.conf` is the
+file that either can or can't hold both stanzas. Two nodes whose own
+`samba:` blocks collide are caught tree-wide, with no host named — they
+collide everywhere. A collision that only a per-host share creates ("Per-host
+shares" below) names the host whose file couldn't have held both. Either
+way it fails the run on *every* host, not only the one it would bite, so
+an apply limited to one host still reports it.
 
 ### Unknown keys are an error
 
@@ -825,7 +913,7 @@ Every key in a node is either one this schema defines or a mistake, and
 `resolve()` treats it as the latter: an unrecognized key anywhere in the
 tree — at the node level, or inside `rclone:`, `access:`, `samba:`,
 `client-defaults:` or a `clients:` entry (including the `rclone:`/
-`access:` objects nested in those) — fails the run, naming the node it's
+`access:`/`samba:` objects nested in those) — fails the run, naming the node it's
 on and, where there's a near match, the key it's probably meant to be.
 
 This matters more here than the usual argument for strictness, because

@@ -487,6 +487,7 @@ def test_smb_conf_section_header_is_the_resolved_share_name(render):
                     "node_path": "tree/home",
                     "name": "home",
                     "subpath": "%U",
+                    "hidden": False,
                     "access": [{"group": "ops", "permissions": "rwx"}],
                 }
             ]
@@ -533,6 +534,32 @@ def test_smb_conf_write_list_excludes_a_read_only_grant(smb_conf):
     assert '"jd"' in write_list
 
 
+def test_smb_conf_an_ordinary_share_emits_no_browseable_directive(smb_conf):
+    # The default is Samba's own, left unwritten -- adding `browseable =
+    # yes` everywhere would change nothing but the diff.
+    assert "browseable" not in smb_conf
+
+
+def test_smb_conf_a_hidden_share_is_not_browseable(render):
+    rendered = render(
+        SMB_CONF,
+        stortree={
+            "samba_shares": [
+                {
+                    "node_path": "tree/spool",
+                    "name": "spool",
+                    "subpath": None,
+                    "hidden": True,
+                    "access": [{"owner": "svc", "permissions": "rwx"}],
+                }
+            ]
+        },
+    )
+    assert "browseable = no" in rendered
+    # Hiding is not access control: the grant is still exported.
+    assert 'valid users = "svc"' in rendered
+
+
 def test_smb_conf_global_section_maps_no_one_to_guest(smb_conf):
     # Access is real Unix ownership; a guest mapping would route around
     # it entirely.
@@ -555,6 +582,7 @@ def test_smb_conf_share_without_a_subpath_uses_the_node_path_bare(render):
                     "node_path": "tree/backups",
                     "name": "tree_backups",
                     "subpath": None,
+                    "hidden": False,
                     "access": [{"group": "ops", "permissions": "rwx"}],
                 }
             ]

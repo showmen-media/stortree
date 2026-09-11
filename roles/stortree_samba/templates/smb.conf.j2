@@ -54,6 +54,15 @@
 [{{ share.name }}]
    path = {{ stortree_root }}/{{ share.node_path }}{{ '/' ~ share.subpath if share.subpath else '' }}
    read only = no
+{# `samba.hidden` keeps the share out of the host's browse list. It is
+   not access control -- `valid users` below is that, and this does not
+   touch it -- and the share stays mountable by its exact name. It's for
+   the shares no person browses for: an appliance's backup target, a
+   camera recorder's spool. Emitted only when set, so an ordinary share's
+   stanza is byte-identical to what it was before the key existed. #}
+{% if share.hidden %}
+   browseable = no
+{% endif %}
    {# stortree_samba_access_tokens (filter_plugins/stortree.py) quotes
       each principal -- smb.conf(5) "lists" are otherwise
       whitespace-delimited, and a name can contain a space (e.g. "Michael
