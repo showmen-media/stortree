@@ -5,6 +5,8 @@ import pytest
 import yaml
 
 from filter_plugins.stortree import (
+    _assign_plan_slugs,
+    _relate_plan_entries,
     DEFAULT_ACCESS_PERMISSIONS,
     PER_USER_PLACEHOLDER,
     _normalize_access,
@@ -2905,3 +2907,94 @@ def test_writing_samba_subpath_is_rejected_even_where_it_matched_the_derivation(
     }
     with pytest.raises(ValueError, match="no longer written"):
         resolve(tree, "h1", ["h1"])
+
+
+# -- the two passes over a finished plan -----------------------------------
+#
+# plan_mounts() builds its entries in three stages and then makes two
+# passes over the whole list. The passes are where everything that
+# depends on more than one entry lives -- unit-name collisions, what
+# nests inside what, which declared `requires` targets are really mounts
+# here -- and they take a plain list, so they can be asked directly
+# instead of through a tree that happens to produce the right shape.
+
+
+def _entries(*specs):
+    """Minimal plan entries: (local_path, remote) or (local_path, remote,
+    requires)."""
+    return [
+        {
+            "local_path": path,
+            "remote": remote,
+            "args": {},
+            "access": {},
+            "requires": list(requires[0]) if requires else [],
+        }
+        for path, remote, *requires in specs
+    ]
+
+
+def test_assign_plan_slugs_rejects_two_mounts_claiming_one_unit_name():
+    entries = _entries(("top/leaf", "r:/"), ("top/leaf", "other:/"))
+    with pytest.raises(ValueError, match="resolve to systemd unit slug"):
+        _assign_plan_slugs(entries)
+
+
+def test_assign_plan_slugs_ignores_a_clash_between_non_mounts():
+    # A plain directory has no unit to collide over, so the check only
+    # looks at entries with a remote.
+    entries = _entries(("top/leaf", None), ("top/leaf", None))
+    _assign_plan_slugs(entries)
+    assert [e["slug"] for e in entries] == ["top-leaf", "top-leaf"]
+
+
+def test_assign_plan_slugs_fills_in_the_fields_only_some_entries_set():
+    (entry,) = _entries(("top", "r:/"))
+    _assign_plan_slugs([entry])
+    assert entry["symlink_target"] is None
+    assert entry["peer"] is None
+
+
+def test_relate_plan_entries_skips_a_plain_directory_ancestor():
+    # `top/mid` is a directory, not a mount, so it has no unit for
+    # `top/mid/leaf` to order against -- the dependency has to reach past
+    # it to `top`, the nearest ancestor that really is a mount.
+    entries = _entries(("top", "r:/"), ("top/mid", None), ("top/mid/leaf", "r2:/"))
+    _assign_plan_slugs(entries)
+    _relate_plan_entries(entries)
+    by_path = {e["local_path"]: e for e in entries}
+    assert by_path["top/mid/leaf"]["requires_slug"] == "top"
+    assert by_path["top"]["requires_slug"] is None
+
+
+def test_relate_plan_entries_flags_the_mount_that_is_nested_inside():
+    # has_nested_children is requires_slug read backwards: whoever every
+    # other entry pointed at.
+    entries = _entries(("top", "r:/"), ("top/leaf", "r2:/"))
+    _assign_plan_slugs(entries)
+    _relate_plan_entries(entries)
+    by_path = {e["local_path"]: e for e in entries}
+    assert by_path["top"]["has_nested_children"]
+    assert not by_path["top/leaf"]["has_nested_children"]
+
+
+def test_relate_plan_entries_resolves_a_declared_requires_to_its_mount():
+    entries = _entries(("cache", "r:/"), ("top", "r2:/", ["cache"]))
+    _assign_plan_slugs(entries)
+    _relate_plan_entries(entries)
+    by_path = {e["local_path"]: e for e in entries}
+    assert by_path["top"]["requires_mounts"] == [
+        {"local_path": "cache", "slug": "cache"}
+    ]
+    assert "requires" not in by_path["top"]
+
+
+def test_relate_plan_entries_drops_a_requires_target_that_is_not_a_mount_here():
+    # Either a plain local directory this same apply creates before any
+    # unit starts, or a mount another host owns that this one doesn't
+    # peer -- neither has a unit to order against.
+    entries = _entries(("cache", None), ("top", "r:/", ["cache", "elsewhere"]))
+    _assign_plan_slugs(entries)
+    _relate_plan_entries(entries)
+    by_path = {e["local_path"]: e for e in entries}
+    assert by_path["top"]["requires_mounts"] == []

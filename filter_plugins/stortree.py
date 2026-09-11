@@ -1731,136 +1731,73 @@ def user_container_paths(resolved, group_members=None, mount_plan=None):
     return result
 
 
-def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROOT):
-    """Flatten this host's resolved server_subtrees/client_mounts/
-    peer_dependencies into one flat plan of every local path that has to
-    exist (spec.md §2), resolving a user-subdirs entry's %U-templated
-    path against its own `access` grant (interpretation call #2) using
-    `group_members` (e.g. `ansible_facts.getent_group |
-    stortree_group_members`): an `owner` grant (with or without `group`
-    alongside it) still gets one real mount at that one user's own path,
-    same as ever; a `group`-only grant instead gets exactly one real
-    mount, at `per_user_mount_path()`'s shared location, plus one
-    bind-mount entry per member fanning that single mount back out to
-    each member's own folder -- see per_user_mount_path() for why one
-    mount now serves every member instead of one full duplicate each.
+def _expand_per_user(node_path, access, remote_of, requires, group_members):
+    """Resolve one per-user node's %U-templated `node_path` against its
+    own `access` into (real entry, [bind-mount entries]), or (None, [])
+    if nobody's actually granted access to it at all
+    (access_grant_usernames() returns no one).
 
-    Not every entry is an rclone mount: a server_subtrees entry with
-    `remote: None` (a node with no `rclone.remote` of its own -- it never
-    inherits one, see _walk_tree()/docs/config-schema.md "Node
-    inheritance") is a plain directory that has to exist, not a mount;
-    a per-user bind-mount entry (`symlink_target` set) is neither an
-    rclone mount nor a plain directory left alone, just a kernel bind
-    mount back onto the one real mount its node resolved to -- callers
-    should render an rclone unit only for entries with a truthy `remote`,
-    e.g. `stortree_mounts_plan | selectattr('remote')`, and a bind-mount
-    unit only for entries with a truthy `symlink_target` (the field name
-    predates the switch from a real symlink to a bind mount -- see this
-    field's own note below for why a symlink doesn't work here -- kept
-    as-is rather than renamed everywhere a per-user fan-out is read).
-    A client_mounts entry always has a remote (the root `rclone.remote`)
-    and is never per-user.
+    An `owner` grant (with or without `group` alongside it) gets one real
+    mount at that one user's own path. A `group`-only grant instead gets
+    exactly one real mount, at per_user_mount_path()'s shared location,
+    plus one bind-mount entry per member fanning that single mount back
+    out to each member's own folder -- see per_user_mount_path() for why
+    one mount now serves every member instead of one full duplicate each.
 
-    Every peer_dependencies entry becomes a mount too -- a samba
-    descendant this host doesn't own is data this host's local tree still
-    has to contain (spec.md §1 "Samba sharing is universal"), sourced
-    directly from its actual owning host exactly like a client mount of a
-    whole top-level subtree is (a mesh: each peer_dependency already names
-    its own real owning host, rather than everything funnelling through
-    one shared root). An entry with no `samba_node` is skipped here since
-    it's a top-level subtree's own peer mount, already planned as the
-    client_mounts entry above; every other entry gets its own mount,
-    per-user-resolved the same way as a per-user server_subtrees entry
-    (including the shared-mount-plus-bind-mounts case -- the owning
-    host's own plan_mounts() run collapses its `group`-only node to that
-    exact same shared path first, so a peer sourcing it has to sftp from
-    that real path, not a per-user one nothing lives at), using its own
-    `access`/`args` (never the owning host's).
-
-    Each returned entry: {local_path, remote, args, slug, requires_slug,
-    requires_mounts, symlink_target}. `requires_mounts` is the node's own
-    declared `requires` (docs/config-schema.md "Requires") resolved
-    against this host's own mounts -- one {local_path, slug} per target
-    that really is a mount here, for the unit template to render a hard
-    dependency on; see the resolution step at the bottom of this function
-    for why a target can legitimately drop out. Unlike `requires_slug`
-    below, nothing about it is derived from the tree's shape -- it's the
-    escape hatch for a dependency path nesting can't express, a sibling
-    top-level subtree's mount being the case it exists for.
-    `symlink_target` is the real entry's `local_path`
-    for a per-user bind-mount entry, else None -- a real symlink would be
-    a directory entry the *target* directory's own backend has to be
-    able to represent, which not every remote backend can (an SMB share,
-    in production, flatly refused with an I/O error trying to create one
-    at all: SMB has no native symlink representation without extensions
-    this fleet's Storage Box remote doesn't support); a bind mount is a
-    kernel VFS relationship instead, entirely local to this host, so it
-    works regardless of what the underlying remote can store. `requires_
-    slug` names the nearest ancestor entry that's an actual mount (truthy
-    `remote`) whose local_path is the longest proper-prefix ancestor of
-    this one, if any -- for systemd RequiresMountsFor= so a nested mount
-    (or a per-user bind mount's own mountpoint, which lives at exactly
-    this kind of nested path) starts after the mount it nests under,
-    skipping over any non-mounted (plain-directory) ancestor in between,
-    which has no unit of its own to require (spec.md §2). A per-user
-    bind-mount entry's own unit additionally orders after and requires
-    `symlink_target`'s mount directly (stortree_mounts renders this),
-    since that's the *content* it's fanning out, not just a path it's
-    nested under.
-    """
-    group_members = group_members or {}
-    entries = []
-
-    # A client mount's `remote` was already synthesized by resolve()
-    # (_peer_remote_ref()), so the provenance plan_remote_sections()
-    # needs -- which host that reference points at, and the path on it --
-    # is joined back on from the matching peer_dependencies entry rather
-    # than rebuilt here from a second reading of the same tree. Keyed on
-    # local_path alone: a node's `host` is a single value, so a path has
-    # exactly one owning host and resolve()'s own dedupe leaves at most
-    # one entry per path.
-    peer_by_path = {p["local_path"]: p for p in resolved.get("peer_dependencies", [])}
-
-    def _expand_per_user(node_path, access, remote_of, requires):
-        """Shared by the server_subtrees and peer_dependencies loops
-        below: resolves one per-user node's %U-templated `node_path`
-        against its own `access` into (real entry, [symlink entries]),
-        or (None, []) if nobody's actually granted access to it at all
-        (access_grant_usernames() returns no one). `remote_of(path)`
-        builds the real entry's `remote` from its resolved real path --
-        different for a server_subtrees node (its own literal `remote`,
-        unaffected by which path it ends up at) versus a peer_dependency
-        (`_peer_remote_ref`, which bakes the resolved path into the
-        synthesized sftp reference itself)."""
-        users = access_grant_usernames(access, group_members)
-        if not users:
-            return None, []
-        real_path = per_user_mount_path(node_path, access)
-        real_entry = {
-            "local_path": real_path,
-            "remote": remote_of(real_path),
-            "access": access,
-            "requires": requires,
+    `remote_of(path)` builds the real entry's `remote` from its resolved
+    real path -- different for a server_subtrees node (its own literal
+    `remote`, unaffected by which path it ends up at) versus a
+    peer_dependency (`_peer_remote_ref`, which bakes the resolved path
+    into the synthesized sftp reference itself)."""
+    users = access_grant_usernames(access, group_members)
+    if not users:
+        return None, []
+    real_path = per_user_mount_path(node_path, access)
+    real_entry = {
+        "local_path": real_path,
+        "remote": remote_of(real_path),
+        "access": access,
+        "requires": requires,
+    }
+    if access.get("owner"):
+        return real_entry, []
+    symlinks = [
+        {
+            "local_path": node_path.replace(PER_USER_PLACEHOLDER, user),
+            "remote": None,
+            "args": {},
+            "access": {},
+            "symlink_target": real_path,
+            # The node's `requires` belongs to the one real mount
+            # above, not to each bind mount fanning it back out --
+            # a bind already orders after that mount, which in turn
+            # orders after whatever it requires.
+            "requires": [],
         }
-        if access.get("owner"):
-            return real_entry, []
-        symlinks = [
-            {
-                "local_path": node_path.replace(PER_USER_PLACEHOLDER, user),
-                "remote": None,
-                "args": {},
-                "access": {},
-                "symlink_target": real_path,
-                # The node's `requires` belongs to the one real mount
-                # above, not to each bind mount fanning it back out --
-                # a bind already orders after that mount, which in turn
-                # orders after whatever it requires.
-                "requires": [],
-            }
-            for user in users
-        ]
-        return real_entry, symlinks
+        for user in users
+    ]
+    return real_entry, symlinks
 
+
+def _plan_client_mounts(resolved):
+    """This host's own copy of each top-level subtree it doesn't own, one
+    entry each. Never per-user, so there's no %U fan-out to resolve here
+    the way the two stages below have to. Usually a mount -- but a
+    subtree whose node carries no `rclone.remote` has nothing to peer
+    for, and resolve() still gives it a client_mounts entry so the local
+    directory gets created, which arrives here as `remote: None` and
+    plans as a plain directory like any other.
+
+    A client mount's `remote` was already synthesized by resolve()
+    (_peer_remote_ref()), so the provenance plan_remote_sections() needs
+    -- which host that reference points at, and the path on it -- is
+    joined back on from the matching peer_dependencies entry rather than
+    rebuilt here from a second reading of the same tree. Keyed on
+    local_path alone: a node's `host` is a single value, so a path has
+    exactly one owning host and resolve()'s own dedupe leaves at most one
+    entry per path."""
+    peer_by_path = {p["local_path"]: p for p in resolved.get("peer_dependencies", [])}
+    entries = []
     for m in resolved.get("client_mounts", []):
         peer = peer_by_path.get(m["local_path"])
         entries.append(
@@ -1868,16 +1805,25 @@ def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROO
                 "local_path": m["local_path"],
                 "remote": m["remote"],
                 "args": m["args"],
-                "peer": None if peer is None else _peer_provenance(peer, peer["remote_path"]),
+                "peer": (
+                    None if peer is None else _peer_provenance(peer, peer["remote_path"])
+                ),
                 # Whatever this host's own client policy granted for its
-                # copy, `{}` (the plain ungranted default) otherwise --
-                # never per-user, so there's no %U fan-out to resolve
-                # here the way the two loops below have to.
+                # copy, `{}` (the plain ungranted default) otherwise.
                 "access": m.get("access") or {},
                 "requires": m.get("requires") or [],
             }
         )
+    return entries
 
+
+def _plan_server_subtrees(resolved, group_members):
+    """Every node this host owns. A node with no `rclone.remote` of its
+    own -- it never inherits one, see _walk_tree()/docs/config-schema.md
+    "Node inheritance" -- is a plain directory that has to exist rather
+    than a mount, and plans as `remote: None`. A per-user node fans out
+    through _expand_per_user()."""
+    entries = []
     for n in resolved.get("server_subtrees", []):
         if not n.get("per_user"):
             entries.append(
@@ -1891,16 +1837,41 @@ def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROO
             )
             continue
         real_entry, symlinks = _expand_per_user(
-            n["path"], n["access"], lambda _p: n["remote"], n.get("requires") or []
+            n["path"],
+            n["access"],
+            lambda _p: n["remote"],
+            n.get("requires") or [],
+            group_members,
         )
         if real_entry is not None:
             real_entry["args"] = n["args"]
             entries.append(real_entry)
         entries.extend(symlinks)
+    return entries
 
+
+def _plan_peer_dependencies(resolved, group_members, stortree_root):
+    """Every samba descendant this host doesn't own, as a mount of its
+    own.
+
+    Such a descendant is data this host's local tree still has to contain
+    (spec.md §1 "Samba sharing is universal"), sourced directly from its
+    actual owning host exactly like a client mount of a whole top-level
+    subtree is -- a mesh: each peer_dependency already names its own real
+    owning host, rather than everything funnelling through one shared
+    root. It uses its own `access`/`args`, never the owning host's.
+
+    An entry with no `samba_node` is skipped: it's a top-level subtree's
+    own peer mount, already planned by _plan_client_mounts(). A per-user
+    one resolves the same way a per-user server_subtrees node does,
+    including the shared-mount-plus-bind-mounts case -- the owning host's
+    own plan_mounts() run collapses its `group`-only node to that exact
+    same shared path first, so a peer sourcing it has to sftp from that
+    real path, not a per-user one nothing lives at."""
+    entries = []
     for p in resolved.get("peer_dependencies", []):
         if p.get("samba_node") is None:
-            continue  # a top-level subtree's own peer mount, already the client_mounts entry above
+            continue
         if not p.get("per_user"):
             entries.append(
                 {
@@ -1920,13 +1891,14 @@ def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROO
             continue
         access = p.get("access") or {}
         # local_path and remote_path are always the same string pre-expansion
-        # (resolve() sets both from the same node path, see peer_dependencies
-        # above) -- per_user_mount_path() only needs to run once.
+        # (resolve() sets both from the same node path) -- per_user_mount_path()
+        # only needs to run once.
         real_entry, symlinks = _expand_per_user(
             p["local_path"],
             access,
             lambda rp: _peer_remote_ref(p["owning_host"], rp, rp, stortree_root),
             p.get("requires") or [],
+            group_members,
         )
         if real_entry is not None:
             real_entry["args"] = p["args"]
@@ -1938,16 +1910,32 @@ def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROO
             real_entry["peer"] = _peer_provenance(p, real_entry["local_path"])
             entries.append(real_entry)
         entries.extend(symlinks)
+    return entries
 
+
+def _assign_plan_slugs(entries):
+    """Give every entry its systemd instance name, and fail the run if
+    two mounts want the same one.
+
+    A slug collision means one unit file rendered twice, with whichever
+    entry the role's loop reaches last silently winning -- so it's raised
+    here rather than discovered as a mount serving the wrong thing.
+    _slug() is injective over paths, so two *different* paths can't
+    collide; what this catches is the same path planned twice, which is a
+    resolve()-level mistake reaching the plan. Only mounts are checked:
+    a plain directory has no unit to collide over.
+
+    Also fills in the two fields only some entries set, so everything
+    downstream can read them off any entry unconditionally."""
     for e in entries:
         e.setdefault("symlink_target", None)
         e.setdefault("peer", None)
         e["slug"] = _slug(e["local_path"])
 
-    mount_entries = [e for e in entries if e["remote"]]
-
     seen_slugs = {}
-    for e in mount_entries:
+    for e in entries:
+        if not e["remote"]:
+            continue
         clash = seen_slugs.get(e["slug"])
         if clash is not None:
             raise ValueError(
@@ -1956,42 +1944,64 @@ def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROO
             )
         seen_slugs[e["slug"]] = e["local_path"]
 
+
+def _relate_plan_entries(entries):
+    """Resolve the three fields that describe how entries stand to each
+    other, rather than what any one of them is on its own. Needs the
+    whole plan, which is why it runs once here over the finished list
+    instead of inside any of the stages that built it.
+
+    `requires_slug` names the nearest ancestor entry that's an actual
+    mount (truthy `remote`) whose local_path is the longest proper-prefix
+    ancestor of this one, if any -- for systemd RequiresMountsFor= so a
+    nested mount (or a per-user bind mount's own mountpoint, which lives
+    at exactly this kind of nested path) starts after the mount it nests
+    under, skipping over any non-mounted (plain-directory) ancestor in
+    between, which has no unit of its own to require (spec.md §2).
+
+    `has_nested_children` is the same relation read backwards: something
+    else nests inside this mount. Such a mount needs consistent,
+    predictable stortree:stortree ownership regardless of its own
+    `access` grant -- every nested mount always runs as User=stortree
+    (stortree-mount@.service.j2, unconditionally), so fusermount's own
+    same-owner check for a *new* mount only ever succeeds against a
+    parent path it can see itself owning. An *ungranted* parent has no
+    such guarantee: its reported ownership, once actually mounted, is
+    whatever its own remote backend happens to report (a third-party
+    storage box's own arbitrary account, or -- for a peer-sftp mount --
+    the numeric uid the owning host's `stortree` account happens to have
+    been allocated, never guaranteed to match this host's own) -- neither
+    is reliably `stortree` from this host's point of view, and fusermount
+    refuses ("bad mount point ... Permission denied") the moment it
+    isn't. The unit template forces --uid/--gid for exactly the entries
+    flagged here, on top of (never instead of) whatever their own
+    `access` grant already pins.
+
+    `requires_mounts` is the node's own declared `requires`
+    (_normalize_requires(), validated tree-wide by _validate_requires())
+    resolved against *this host's* own mounts: each target path that
+    really is a mount here becomes a {local_path, slug} pair the unit
+    template renders an After= + Requires= + RequiresMountsFor= for.
+    Unlike the two above, nothing about it is derived from the tree's
+    shape -- it's the escape hatch for a dependency path nesting can't
+    express, a sibling top-level subtree's mount being the case it exists
+    for. A target that isn't a mount on this host drops out silently --
+    it's either a plain local directory (nothing to order against, this
+    same apply creates it before any unit starts) or a mount some other
+    host owns and this one doesn't peer (a per-client opt-out, most often
+    the very cache subtree that only its own host mounts). The raw
+    declaration doesn't survive into the entry: everything downstream
+    wants the resolved units."""
+    mount_entries = [e for e in entries if e["remote"]]
+
     for e in entries:
         others = [other for other in mount_entries if other is not e]
         e["requires_slug"] = _nearest_mount_slug(e["local_path"], others)
 
-    # A mount that something else nests inside (any entry's requires_slug
-    # pointing back at it) needs consistent, predictable stortree:stortree
-    # ownership regardless of its own `access` grant -- every nested mount
-    # always runs as User=stortree (stortree-mount@.service.j2,
-    # unconditionally), so fusermount's own same-owner check for a *new*
-    # mount only ever succeeds against a parent path it can see itself
-    # owning. An *ungranted* parent has no such guarantee: its reported
-    # ownership, once actually mounted, is whatever its own remote backend
-    # happens to report (a third-party storage box's own arbitrary
-    # account, or -- for a peer-sftp mount -- the numeric uid the owning
-    # host's `stortree` account happens to have been allocated, never
-    # guaranteed to match this host's own) -- neither is reliably
-    # `stortree` from this host's point of view, and fusermount refuses
-    # ("bad mount point ... Permission denied") the moment it isn't. The
-    # unit template forces --uid/--gid for exactly the entries flagged
-    # here, on top of (never instead of) whatever their own `access` grant
-    # already pins.
     parent_slugs = {e["requires_slug"] for e in entries if e["requires_slug"]}
     for e in entries:
         e["has_nested_children"] = e["slug"] in parent_slugs
 
-    # Declared `requires` (_normalize_requires(), validated tree-wide by
-    # _validate_requires()) resolved against *this host's* own mounts:
-    # each target path that really is a mount here becomes a
-    # {local_path, slug} pair the unit template renders an After= +
-    # Requires= + RequiresMountsFor= for. A target that isn't a mount on
-    # this host drops out silently -- it's either a plain local directory
-    # (nothing to order against, this same apply creates it before any
-    # unit starts) or a mount some other host owns and this one doesn't
-    # peer (a per-client opt-out, most often the very cache subtree that
-    # only its own host mounts). The raw declaration doesn't survive into
-    # the entry: everything downstream wants the resolved units.
     mounts_by_path = {e["local_path"]: e for e in mount_entries}
     for e in entries:
         e["requires_mounts"] = [
@@ -2000,16 +2010,66 @@ def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROO
             if path in mounts_by_path
         ]
 
-    # Shallowest paths first (stable sort -- ties keep their original
-    # relative order): stortree_mounts creates every path one directory
-    # level at a time, in this order, never relying on implicit
-    # multi-level recursive creation for a path whose own ancestors don't
-    # exist yet -- not every backend's mkdir handles that the way a local
-    # filesystem or SFTP does (an SMB share, in production, silently
-    # errored trying to create two missing levels -- `home` and the
-    # synthetic `.mounts` segment beneath it -- in one implicit step,
-    # while creating either one alone, from an already-existing parent,
-    # worked fine).
+
+def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROOT):
+    """Flatten this host's resolved client_mounts/server_subtrees/
+    peer_dependencies into one flat plan of every local path that has to
+    exist (spec.md §2).
+
+    One stage per source scope, in the order their entries appear in the
+    result, then two passes over the finished list: _assign_plan_slugs()
+    names every entry, _relate_plan_entries() works out how they stand to
+    each other. `group_members` (e.g. `ansible_facts.getent_group |
+    stortree_group_members`) resolves a user-subdirs entry's %U-templated
+    path against its own `access` grant (interpretation call #2) --
+    see _expand_per_user().
+
+    Not every entry is an rclone mount. One with `remote: None` is a
+    plain directory that has to exist, not a mount; one with
+    `symlink_target` set is neither, just a kernel bind mount back onto
+    the real mount its node resolved to. Callers should render an rclone
+    unit only for entries with a truthy `remote`, e.g.
+    `stortree_mounts_plan | selectattr('remote')`, and a bind-mount unit
+    only for entries with a truthy `symlink_target` (the field name
+    predates the switch from a real symlink to a bind mount -- see below
+    for why a symlink doesn't work here -- kept as-is rather than renamed
+    everywhere a per-user fan-out is read).
+
+    Each returned entry: {local_path, remote, args, access, peer, slug,
+    requires_slug, has_nested_children, requires_mounts, symlink_target}.
+    `peer` is {owning_host, remote_path} for an entry whose remote is a
+    synthesized peer reference and None otherwise (_peer_provenance());
+    the last four are settled by the two passes above, which document
+    them. `symlink_target` is the real entry's `local_path` for a
+    per-user bind-mount entry, else None -- a real symlink would be a
+    directory entry the *target* directory's own backend has to be able
+    to represent, which not every remote backend can (an SMB share, in
+    production, flatly refused with an I/O error trying to create one at
+    all: SMB has no native symlink representation without extensions this
+    fleet's Storage Box remote doesn't support); a bind mount is a kernel
+    VFS relationship instead, entirely local to this host, so it works
+    regardless of what the underlying remote can store."""
+    group_members = group_members or {}
+
+    entries = (
+        _plan_client_mounts(resolved)
+        + _plan_server_subtrees(resolved, group_members)
+        + _plan_peer_dependencies(resolved, group_members, stortree_root)
+    )
+
+    _assign_plan_slugs(entries)
+    _relate_plan_entries(entries)
+
+    # Shallowest paths first (stable sort -- ties keep the order the
+    # stages above produced them in): stortree_mounts creates every path
+    # one directory level at a time, in this order, never relying on
+    # implicit multi-level recursive creation for a path whose own
+    # ancestors don't exist yet -- not every backend's mkdir handles that
+    # the way a local filesystem or SFTP does (an SMB share, in
+    # production, silently errored trying to create two missing levels --
+    # `home` and the synthetic `.mounts` segment beneath it -- in one
+    # implicit step, while creating either one alone, from an
+    # already-existing parent, worked fine).
     entries.sort(key=lambda e: e["local_path"].count("/"))
 
     return entries
