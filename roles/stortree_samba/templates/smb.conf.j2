@@ -84,7 +84,11 @@
    {% set include_self = share.subpath is not none %}
    valid users = {{ share.access | stortree_samba_access_tokens(include_self) | join(' ') }}
 
-   write list = {{ share.access | selectattr('permissions', 'search', 'w') | list | stortree_samba_access_tokens(include_self) | join(' ') }}
+   {# Narrowed per principal rather than per grant
+      (stortree_samba_write_tokens): a grant's owner and its group can
+      carry different levels, so "who may write here" is a question
+      about each token, not about the grant it came from. #}
+   write list = {{ share.access | stortree_samba_write_tokens(include_self) | join(' ') }}
 
 
 {% endfor %}

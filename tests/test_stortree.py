@@ -6,6 +6,7 @@ import yaml
 
 from filter_plugins.stortree import (
     _assign_plan_slugs,
+    samba_write_tokens,
     _check_slug_collisions,
     _layer_plan_entries,
     _plan_user_containers,
@@ -633,11 +634,13 @@ def test_client_defaults_access_grants_a_client_mount_its_own_ownership():
     assert needed_groups(r) == ["Readers"]
 
 
-def test_a_client_access_replaces_the_nodes_own_grant_rather_than_merging():
-    # Deliberately not a merge (_client_policy): the nearest, most
-    # specific block that sets `access` supplies the whole grant for
-    # this host's copy. Half a grant assembled from two places would be
-    # unreadable off the config.
+def test_a_client_access_merges_over_the_nodes_own_grant():
+    # One key at a time (_client_policy, _client_grant), the same rule
+    # an ancestor and its descendant follow: `clients.<host>` wins the
+    # keys it sets, `client-defaults` the ones only it sets, and the
+    # node's own grant supplies the rest. Overriding the owner used to
+    # drop the group with it, which is how a grant meant to hold
+    # fleet-wide stopped at whichever host also named a local principal.
     tree = {
         "top": {
             "host": "h1",
@@ -663,17 +666,21 @@ def test_a_client_access_replaces_the_nodes_own_grant_rather_than_merging():
         for p in resolve(tree, host, ["h1", "h2", "h3"])["peer_dependencies"]
         if p["local_path"] == "top/share/leaf"
     )
-    # clients.<host> beats client-defaults, and neither keeps anything
-    # of the node's own `group`/`permissions`
+    # h2 gets its own `owner`, `client-defaults`' group (the node's
+    # `Owners` overridden by the nearer block that set that key), and
+    # the node's own explicit level, which nothing in the chain touched.
     assert leaf_access("h2") == {
         "owner": "jd",
-        "permissions": DEFAULT_ACCESS_PERMISSIONS,
-        "permissions_explicit": False,
+        "group": "Readers",
+        "permissions": "rwx",
+        "permissions_explicit": True,
     }
+    # h1 has no `clients` entry of its own, so it stops at
+    # client-defaults over the node.
     assert leaf_access("h1") == {
         "group": "Readers",
-        "permissions": DEFAULT_ACCESS_PERMISSIONS,
-        "permissions_explicit": False,
+        "permissions": "rwx",
+        "permissions_explicit": True,
     }
     # the owning host is untouched: `clients`/`client-defaults` only ever
     # describe a host that doesn't own the node
@@ -714,7 +721,14 @@ def test_an_empty_client_access_drops_the_nodes_grant_on_that_client():
         p for p in r["peer_dependencies"] if p["local_path"] == "top/share/leaf"
     )
     assert leaf(kept)["access"]["group"] == "Owners"
-    assert leaf(dropped)["access"] == {}
+    # Marked as a drop rather than left blank: h2 holds a mounted copy,
+    # where "no grant" is not the absence of one but the plain default,
+    # and something has to present it (_dropped_access()). Everything
+    # that reads ownership out of a grant still reads the default.
+    assert leaf(dropped)["access"] == {"reset": True}
+    assert access_owner(leaf(dropped)["access"], "stortree") == "stortree"
+    assert access_group(leaf(dropped)["access"], "stortree") == "stortree"
+    assert access_mode(leaf(dropped)["access"]) == "0751"
     assert needed_groups(dropped) == []
 
 
@@ -1285,6 +1299,41 @@ def test_access_mode_default_permissions_from_normalize_access_gets_public_execu
     assert access_mode(access) == "0750"
 
 
+def test_access_mode_per_class_permissions_give_owner_and_group_their_own():
+    # The thing one shared level could not say: the owner writes, the
+    # group reads. Plain Unix mode bits, no ACL involved -- the
+    # single-object restriction on `access` is about naming two *groups*,
+    # which is what a mode really can't express.
+    access = _normalize_access(
+        {"owner": "jd", "group": "g", "permissions": {"owner": "rwx", "group": "r-x"}}
+    )
+    assert access_mode(access) == "0751"
+    assert bindfs_perms(access) == "0640,ugo+X"
+
+
+def test_access_mode_a_class_left_out_of_the_mapping_keeps_its_default():
+    # A mapping settles the classes it names and nothing else, which is
+    # what makes it safe to write one about the group alone: `other`
+    # keeps the traversal bit a deeper grant needs unless the mapping
+    # says otherwise, where a scalar level would have taken it away as a
+    # side effect (test above).
+    group_only = _normalize_access({"group": "g", "permissions": {"group": "r-x"}})
+    assert access_mode(group_only) == "0751"
+
+    spelled_out = _normalize_access(
+        {"group": "g", "permissions": {"group": "r-x", "other": "---"}}
+    )
+    assert access_mode(spelled_out) == "0750"
+
+
+def test_access_mode_a_mapping_can_grant_others_more_than_traversal():
+    # `other` is a class like any other in this form -- the "even the
+    # others if need be" case, for a node meant to be readable by
+    # anyone who can reach it.
+    access = _normalize_access({"group": "g", "permissions": {"other": "r-x"}})
+    assert access_mode(access) == "0775"
+
+
 def test_bindfs_perms_puts_the_execute_bits_on_directories_only():
     # bindfs takes one -p spec for files and directories both, where
     # rclone took --dir-perms and --file-perms separately. The octal is
@@ -1334,10 +1383,58 @@ def test_samba_access_tokens_one_grant_with_both_owner_and_group_yields_two_toke
     assert samba_access_tokens(access) == ['"@IT Admins"', '"jd"']
 
 
+def test_samba_access_tokens_name_each_principal_once():
+    # The ordinary shape now that `access` inherits: a share whose
+    # descendants all carry the group written above them, inside grants
+    # that differ elsewhere and so survive the union's own dedupe.
+    access = [
+        {"group": "IT Admins", "permissions": "rwx"},
+        {"group": "IT Admins", "owner": "svc-one", "permissions": "rwx"},
+        {"group": "IT Admins", "owner": "svc-two", "permissions": "rwx"},
+    ]
+    assert samba_access_tokens(access) == [
+        '"@IT Admins"',
+        '"svc-one"',
+        '"svc-two"',
+    ]
+    assert samba_write_tokens(access) == ['"@IT Admins"', '"svc-one"', '"svc-two"']
+
+
 def test_samba_access_tokens_include_self_prepends_percent_u():
     assert samba_access_tokens([], include_self=True) == ['"%U"']
     access = [{"group": "g", "permissions": "rwx"}]
     assert samba_access_tokens(access, include_self=True) == ['"%U"', '"@g"']
+
+
+def test_samba_write_tokens_follow_each_principals_own_level():
+    # The reason `write list` is computed per token rather than by
+    # filtering whole grants: these two principals are on one grant and
+    # only one of them may write.
+    access = [
+        _normalize_access(
+            {
+                "owner": "jd",
+                "group": "IT Admins",
+                "permissions": {"owner": "rwx", "group": "r-x"},
+            }
+        )
+    ]
+    assert samba_access_tokens(access) == ['"@IT Admins"', '"jd"']
+    assert samba_write_tokens(access) == ['"jd"']
+
+
+def test_samba_write_tokens_keep_the_owner_slot_of_a_group_only_grant():
+    # A group-only grant leaves `stortree` owning the path with full
+    # control (access_mode()), and there is no owner token to emit for
+    # it -- but the group's own level still decides its token, and %U
+    # still rides along on a per-user share.
+    read_only = [_normalize_access({"group": "g", "permissions": "r-x"})]
+    assert samba_access_tokens(read_only) == ['"@g"']
+    assert samba_write_tokens(read_only) == []
+    assert samba_write_tokens(read_only, include_self=True) == ['"%U"']
+
+    writable = [_normalize_access({"group": "g"})]
+    assert samba_write_tokens(writable) == ['"@g"']
 
 
 def test_access_grant_usernames_owner_only_pins_a_single_user():
@@ -1768,12 +1865,14 @@ def test_a_nodes_own_grant_is_applied_on_a_host_that_mounts_it_without_owning_it
     assert client["top/shared"]["kind"] == "mount"
     assert client["top/shared"]["transport_slug"] == "top"
 
-    # Only the granted node. An ungranted one below it is a real
-    # directory on the host that owns it, and on the client is not
-    # planned at all -- it arrives as content inside the mount, through
-    # whichever presentation is above it.
-    assert owner["top/shared/inner"]["kind"] == "dir"
-    assert "top/shared/inner" not in client
+    # The node below inherits that same grant (_walk_tree()) and needs
+    # nothing of its own to apply it on either host: the owner chowns a
+    # real directory, and on the client the presentation above already
+    # shows every path inside it as `jd` (_grant_presented_above()), so
+    # one bindfs covers the whole subtree.
+    for plan in (owner, client):
+        assert access_owner(plan["top/shared/inner"]["access"], "stortree") == "jd"
+        assert plan["top/shared/inner"]["kind"] == "dir"
 
 
 def test_a_top_level_subtrees_own_grant_reaches_the_hosts_that_client_mount_it():
@@ -1856,6 +1955,336 @@ def test_an_opt_out_below_a_mounted_ancestor_does_not_drop_that_nodes_grant():
     client = plan_index(plan_mounts(resolve(tree, "client", GRANT_HOSTS), {}))
     assert client["top/shared"]["kind"] == "mount"
     assert access_owner(client["top/shared"]["access"], "stortree") == "jd"
+
+
+# A grant written once, at the top of a subtree, and everything a node
+# below it can say about that grant: nothing (inherit it), another key
+# (merge over it), the same key again (narrow it), or an empty `access:`
+# (drop it).
+INHERIT_TREE = {
+    "top": {
+        "host": "owner",
+        "access.group": "Storage Data",
+        "subdirs": {
+            "backups": {"subdirs": {"nightly": {}}},
+            "notes": {"access.owner": "jd"},
+            "readonly": {"access.permissions": "rx"},
+            "ungoverned": {"access": None},
+        },
+    },
+}
+
+
+def test_a_grant_inherits_down_to_every_node_beneath_it():
+    # What a grant on a subtree's top node means: the whole subtree, not
+    # that one directory. Left uninherited, `Storage Data` could traverse
+    # `top` (access_mode()'s public-execute bit) and read nothing in it,
+    # which is essentially never what writing the group meant.
+    plan = plan_index(plan_mounts(resolve(INHERIT_TREE, "owner", GRANT_HOSTS), {}))
+    for path in ("top", "top/backups", "top/backups/nightly"):
+        assert access_group(plan[path]["access"], "stortree") == "Storage Data"
+        # Nothing is mounted anywhere in this tree, so every one of them
+        # is a real local directory and a plain chown applies the grant
+        # (roles/stortree_mounts "Own every genuinely local granted
+        # path").
+        assert plan[path]["kind"] == "dir"
+        assert plan[path]["transport_slug"] is None
+
+
+def test_an_inherited_grant_costs_one_presentation_for_the_whole_subtree():
+    # The same tree seen by a host that mounts it: `top` is a peer mount,
+    # so ownership inside it is whatever a presentation shows. One
+    # presentation shows it for every path beneath, since bindfs is
+    # uniform over its subtree -- so the nodes that inherited the grant
+    # unchanged stay plain directories inside that one mount.
+    plan = plan_mounts(resolve(INHERIT_TREE, "client", GRANT_HOSTS), {})
+    indexed = plan_index(plan)
+    for path in ("top/backups", "top/backups/nightly"):
+        assert access_group(indexed[path]["access"], "stortree") == "Storage Data"
+        assert indexed[path]["kind"] == "dir"
+        assert indexed[path]["transport_slug"] == _slug("top")
+
+    # Only the nodes saying something different from the mount above
+    # them: `top` itself, and the three that added to, narrowed or
+    # dropped its grant.
+    assert sorted(e["local_path"] for e in plan if e["kind"] == "mount") == [
+        "top",
+        "top/notes",
+        "top/readonly",
+        "top/ungoverned",
+    ]
+
+
+def test_a_nodes_own_access_merges_over_the_inherited_grant():
+    # Key by key, from the nearest ancestor that set each one. `notes`
+    # names an owner and keeps the group above it; `readonly` narrows
+    # that group's level and keeps the group itself. Neither has to
+    # restate what it isn't changing -- restating it is how two lines
+    # that were meant to agree drift apart later.
+    for host in GRANT_HOSTS:
+        plan = plan_index(plan_mounts(resolve(INHERIT_TREE, host, GRANT_HOSTS), {}))
+
+        notes = plan["top/notes"]["access"]
+        assert access_owner(notes, "stortree") == "jd"
+        assert access_group(notes, "stortree") == "Storage Data"
+
+        readonly = plan["top/readonly"]["access"]
+        assert access_group(readonly, "stortree") == "Storage Data"
+        assert access_mode(readonly) == "0750"
+
+        # An ancestor's *defaulted* permissions must not arrive looking
+        # like one the config wrote out: `top` wrote no level, so it
+        # keeps the traversal bit a deeper grant needs, and `readonly`
+        # writing one does not reach back up and change that.
+        assert access_mode(plan["top"]["access"]) == "0771"
+
+
+def test_a_null_takes_back_one_inherited_key():
+    # The fine-grained half of the escape hatch: with every key merging,
+    # `null` is what says "not this one", and an empty `access:` (tested
+    # above) is the same thing said about all of them at once.
+    tree = {
+        "top": {
+            "host": "owner",
+            "access": {"group": "Storage Data", "owner": "jd"},
+            "subdirs": {"shared": {"access.owner": None}},
+        },
+    }
+    for host in GRANT_HOSTS:
+        plan = plan_index(plan_mounts(resolve(tree, host, GRANT_HOSTS), {}))
+        shared = plan["top/shared"]["access"]
+        assert access_group(shared, "stortree") == "Storage Data"
+        assert access_owner(shared, "stortree") == "stortree"
+
+
+def test_an_empty_access_drops_an_inherited_grant_on_every_host():
+    # The escape hatch, and the reason a drop is marked rather than
+    # blank (_dropped_access()): on the owning host it is a chown back to
+    # the default, but on a host that mounts the subtree the default has
+    # to be *presented*, or the grant above would keep applying to a path
+    # that just said it doesn't.
+    owner = plan_index(plan_mounts(resolve(INHERIT_TREE, "owner", GRANT_HOSTS), {}))
+    client = plan_index(plan_mounts(resolve(INHERIT_TREE, "client", GRANT_HOSTS), {}))
+    for plan in (owner, client):
+        assert access_group(plan["top/ungoverned"]["access"], "stortree") == "stortree"
+        assert access_mode(plan["top/ungoverned"]["access"]) == "0751"
+    assert owner["top/ungoverned"]["kind"] == "dir"
+    assert client["top/ungoverned"]["kind"] == "mount"
+
+
+def test_a_grant_is_compared_against_the_nearest_presentation_above_it():
+    # `leaf` grants what `top` grants, but `mid` in between grants
+    # something else -- and `mid` is what the path actually shows. So
+    # `leaf` needs its own presentation to get back to `top`'s grant,
+    # even though an ancestor already applies it somewhere above.
+    tree = {
+        "top": {
+            "host": "owner",
+            "access.group": "Storage Data",
+            "subdirs": {
+                "mid": {
+                    "access.group": "Media Production",
+                    "subdirs": {"leaf": {"access.group": "Storage Data"}},
+                },
+            },
+        },
+    }
+    client = plan_index(plan_mounts(resolve(tree, "client", GRANT_HOSTS), {}))
+    assert [client[p]["kind"] for p in ("top", "top/mid", "top/mid/leaf")] == [
+        "mount",
+        "mount",
+        "mount",
+    ]
+
+
+def test_an_inherited_grant_reaches_a_per_user_node():
+    # Inheritance crosses a `user-subdirs` boundary like any other, and
+    # it has to: a per-user node resolves against its own grant
+    # (_expand_per_user()), so one that inherited nothing resolved to
+    # nobody and dropped out of the plan entirely -- an empty per-user
+    # folder nobody could reach, under a subtree whose whole point was
+    # the group written at the top of it.
+    tree = {
+        "top": {
+            "host": "owner",
+            "access.group": "Media Production",
+            "user-subdirs": {"docs": {}},
+        },
+    }
+    plan = plan_index(
+        plan_mounts(
+            resolve(tree, "owner", GRANT_HOSTS),
+            {"Media Production": ["jd", "mw"]},
+        )
+    )
+    real = per_user_mount_path(f"top/{PER_USER_PLACEHOLDER}/docs", {"group": "x"})
+    assert access_group(plan[real]["access"], "stortree") == "Media Production"
+    for user in ("jd", "mw"):
+        assert plan[f"top/{user}/docs"]["symlink_target"] == real
+
+
+def test_an_inherited_grant_is_named_once_in_a_shares_valid_users():
+    # `valid users` is a union over the share's descendants, and with
+    # `access` inheriting, most of those descendants now carry the same
+    # grant the share itself does. It is one principal either way -- and
+    # a descendant that dropped the grant contributes nothing at all,
+    # since a drop names nobody to admit (_dropped_access()).
+    tree = {
+        "top": {
+            "host": "h1",
+            "samba": None,
+            "access.group": "Storage Data",
+            "subdirs": {"a": {}, "b": {}, "c": {"access": None}},
+        }
+    }
+    share = resolve(tree, "h1", ["h1"])["samba_shares"][0]
+    assert [g["group"] for g in share["access"]] == ["Storage Data"]
+
+
+def test_a_client_grants_principals_are_looked_up_on_that_host():
+    # The lookup list is what `getent` is run for, and the presentation
+    # unit reads the resulting uid/gid maps by name -- so a principal
+    # that reaches a host only through a client grant, and is named
+    # nowhere else in its facts, has to be in it. Missing, the unit
+    # template resolves `stortree_group_gids[<name>]` against a map that
+    # never had the name and the apply fails on that host alone.
+    tree = {
+        "top": {
+            "host": "owner",
+            "rclone.remote": "r:/",
+            "subdirs": {"shared": {"access.group": "Only Here"}},
+        },
+    }
+    resolved = resolve(tree, "client", GRANT_HOSTS)
+    assert [g["local_path"] for g in resolved["client_grants"]] == ["top/shared"]
+    assert needed_groups(resolved) == ["Only Here"]
+
+    tree["top"]["subdirs"]["shared"] = {"access.owner": "only-here"}
+    assert needed_users(resolve(tree, "client", GRANT_HOSTS)) == ["only-here"]
+
+
+def test_permissions_merge_one_class_at_a_time():
+    # The mapping form merges a level further down than the keys around
+    # it: `readonly` restates the group's level and keeps the owner's,
+    # rather than starting the mapping over. Same rule, one nesting
+    # level deeper -- each class from the nearest ancestor that set it.
+    tree = {
+        "top": {
+            "host": "owner",
+            "access": {
+                "owner": "jd",
+                "group": "Storage Data",
+                "permissions": {"owner": "rwx", "group": "rwx"},
+            },
+            "subdirs": {"readonly": {"access": {"permissions": {"group": "r-x"}}}},
+        },
+    }
+    for host in GRANT_HOSTS:
+        plan = plan_index(plan_mounts(resolve(tree, host, GRANT_HOSTS), {}))
+        assert access_mode(plan["top"]["access"]) == "0771"
+        assert access_mode(plan["top/readonly"]["access"]) == "0751"
+        assert access_owner(plan["top/readonly"]["access"], "stortree") == "jd"
+
+    # `null` takes the whole level back the way it takes any other key
+    # back, leaving the principals with the plain default.
+    tree["top"]["subdirs"]["reset"] = {"access": {"permissions": None}}
+    plan = plan_index(plan_mounts(resolve(tree, "owner", GRANT_HOSTS), {}))
+    assert access_mode(plan["top/reset"]["access"]) == "0771"
+
+
+def test_a_clients_permissions_narrow_that_hosts_copy_alone():
+    # The two merges meeting: a client block writes one class, keeps the
+    # rest of the node's grant, and says nothing about any other host.
+    tree = {
+        "top": {
+            "host": "owner",
+            "rclone.remote": "r:/",
+            "access.group": "Storage Data",
+            "clients": {"client": {"access": {"permissions": {"group": "r-x"}}}},
+        },
+    }
+    client = plan_index(plan_mounts(resolve(tree, "client", GRANT_HOSTS), {}))
+    assert access_group(client["top"]["access"], "stortree") == "Storage Data"
+    assert access_mode(client["top"]["access"]) == "0751"
+
+    owner = plan_index(plan_mounts(resolve(tree, "owner", GRANT_HOSTS), {}))
+    assert access_mode(owner["top"]["access"]) == "0771"
+
+
+def test_a_permissions_level_is_held_to_the_alphabet_it_is_read_with():
+    # _permission_bits() looks for `r`, `w` and `x` and ignores the
+    # rest, so an unchecked typo is a grant quietly missing a bit.
+    with pytest.raises(ValueError, match="must be an rwx-style string"):
+        resolve({"top": {"host": "h1", "access": {"group": "g", "permissions": "rwz"}}},
+                "h1", ["h1"])
+
+    # The numeric mode this schema deliberately isn't. YAML has already
+    # turned it into an integer by the time it gets here (and `0750`
+    # into an entirely different one), so the check is also what stops
+    # it failing later with nothing pointing back at the line.
+    with pytest.raises(ValueError, match="not a numeric mode"):
+        resolve({"top": {"host": "h1", "access": {"owner": "jd", "permissions": 750}}},
+                "h1", ["h1"])
+
+    with pytest.raises(ValueError, match=r"unknown `access\.permissions` key 'world'"):
+        resolve(
+            {"top": {"host": "h1", "access": {"group": "g", "permissions": {"world": "r"}}}},
+            "h1",
+            ["h1"],
+        )
+
+    # A class named in a client block is held to the same alphabet.
+    with pytest.raises(ValueError, match=r"`clients\.h2\.access\.permissions\.group`"):
+        resolve(
+            {
+                "top": {
+                    "host": "h1",
+                    "access.group": "g",
+                    "clients": {"h2": {"access": {"permissions": {"group": "rwq"}}}},
+                }
+            },
+            "h1",
+            ["h1", "h2"],
+        )
+
+
+def test_a_permissions_level_granted_to_nobody_is_rejected():
+    # A level narrows a grant (`readonly` above). With no grant to
+    # narrow it grants nobody anything, and resolves to the same `{}` as
+    # the empty `access:` that means the plain default -- the opposite of
+    # what writing a level out says. Refused while the line that caused
+    # it is still in hand.
+    node = {"top": {"host": "h1", "access": {"permissions": "rx"}}}
+    with pytest.raises(ValueError, match="a level on its own grants nothing"):
+        resolve(node, "h1", ["h1"])
+
+    # Nulling the principal and leaving its level behind is the same
+    # mistake written across two nodes, and is caught at the one that
+    # ends up ungranted.
+    nulled = {
+        "top": {
+            "host": "h1",
+            "access": {"group": "Storage Data", "permissions": "rx"},
+            "subdirs": {"shared": {"access.group": None}},
+        }
+    }
+    with pytest.raises(ValueError, match="'top/shared'"):
+        resolve(nulled, "h1", ["h1"])
+
+    # A client block's level narrows that host's copy of the node's
+    # grant (test above), so the mistake there is this same one: a level
+    # over a node that grants nobody anything. Checked against the
+    # merged grant, which makes it a per-host error like a share-name
+    # collision (_validate_share_names()) rather than a tree-wide one --
+    # it is raised on the host whose copy it describes.
+    client = {
+        "top": {
+            "host": "h1",
+            "clients": {"h2": {"access": {"permissions": "rx"}}},
+        }
+    }
+    with pytest.raises(ValueError, match="`access for h2` leaves a "):
+        resolve(client, "h2", ["h1", "h2"])
 
 
 def test_a_per_user_grant_still_fans_out_rather_than_planning_one_path():

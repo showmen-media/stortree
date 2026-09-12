@@ -194,7 +194,7 @@ subtree's local path — see the `cache-dir` fields in the example config in
 whatever its own value resolves to is passed to `rclone mount` exactly as
 written, never combined with the node's position in the tree, and never
 inherited from an ancestor (`rclone` — both `remote` and `args` — is
-never inherited; only `host` is). See "Node inheritance" and
+never inherited; `host` and `access` are). See "Node inheritance" and
 "`rclone.remote` is verbatim" in
 [docs/config-schema.md](config-schema.md) for the full rule and what a
 node with no `rclone.remote` of its own resolves to instead.
@@ -275,9 +275,10 @@ rather than tree inheritance:
   from, or inherited from any ancestor or descendant subdir's `rclone`. A
   node without its own `rclone` resolves to no remote and no args at all,
   even if an ancestor sets some; a node's own `rclone`, once set, isn't
-  affected by what its children set either. `host` still inherits down
-  the tree as usual (Node inheritance, config-schema.md) — `rclone` is the
-  one field, at every level, that's exempt.
+  affected by what its children set either. `host` and `access` still
+  inherit down the tree as usual (Node inheritance and Access
+  inheritance, config-schema.md) — `rclone` is the one field, at every
+  level, that's exempt.
 
 ### 2. Mount management (rclone)
 
@@ -584,23 +585,32 @@ just a syntax restriction: a remote-backed node (directly, or
 peer-sourced from whichever host owns it, §1/§2) is always an rclone FUSE
 mount, and rclone's FUSE mount never implements `setxattr` — it can't
 carry a POSIX ACL at all, on any host, ever. What it *can* carry is plain
-Unix ownership and mode: one owner, one group, one shared permissions
-level applied to both. That's exactly what one `access` object expresses
-and no more, so the schema doesn't let you write anything a remote-backed
-node couldn't actually enforce (`_normalize_access()` raises if it's
-ever given a list). A plain local node (no `rclone.remote` of its own)
-gets the same treatment for a simpler reason: consistency, not
+Unix ownership and mode: one owner, one group, and a permissions level
+for each of them (and for everyone else). That's exactly what one
+`access` object expresses and no more, so the schema doesn't let you
+write anything a remote-backed node couldn't actually enforce
+(`_normalize_access()` raises if it's ever given a list). A plain local
+node (no `rclone.remote` of its own) gets the same treatment for a
+simpler reason: consistency, not
 necessity — it could carry a real POSIX ACL, but there's no reason for
 its enforcement to work differently from a remote-backed sibling's.
 
-A node's own `access` is what its owning host enforces, and it's what
-every other host enforces on its own copy too, unless a
-`client-defaults`/`clients` block on that node (or an ancestor) hands
-that host a different grant to apply instead — one `access` object in,
-one out, nothing below this point can tell which of the two it came from
-(config-schema.md "Client-side access"; `resolve()` settles it, and the
-Samba share's own `valid users`/`write list` deliberately stay on the
-node's tree-wide grant either way).
+A node's own `access` is what it wrote merged over what it inherited,
+key by key, down the tree the way `host` is inherited (config-schema.md
+"Access inheritance"): a grant describes the subtree under the node it
+is written on — one that stopped at that node would leave the principal
+able to traverse into the subtree and read nothing in it — and a
+descendant refines it a key at a time, `null` taking a key back and an
+empty `access:` the whole grant. That grant is what the owning host
+enforces, and it's what every other host enforces on its own copy too,
+unless a `client-defaults`/`clients` block on that node (or an ancestor)
+adjusts it for that host, which merges over the resolved grant the same
+key-by-key way the tree inheritance does. One `access` object in, one
+out, nothing below this point can tell which of the two it came from
+(config-schema.md "Client-side access"; `resolve()` settles it, per
+host, and the Samba share's own `valid users`/`write list` follow the
+same resolution — a principal only one host can resolve belongs in that
+host's share and nowhere else, §4).
 
 `stortree_mounts` applies `access` directly, for every resolved path —
 mount point or plain directory alike — via three pure filters
@@ -618,6 +628,13 @@ mount point or plain directory alike — via three pure filters
   the granted group gets `permissions`.
 - **Both**: the path is pinned to that one `owner` (no group-driven
   expansion — see below), who and whose group both get `permissions`.
+
+Written as a mapping instead of a string, `permissions` gives each Unix
+class its own level (`{owner: rwx, group: r-x, other: "---"}`,
+config-schema.md "Access"), overriding the defaults above for exactly
+the classes it names. This needs no POSIX ACL and never did: one owner
+and one group at two different levels is plain mode bits. What still
+needs one — and so is still unwritable — is a *second* group.
 
 Every one of these except an *explicit* `permissions` (one the config
 actually wrote out, tracked as `permissions_explicit` by
@@ -725,12 +742,15 @@ folder per member, against real group membership (interpretation call
 anywhere in an access grant first — same lookup `stortree_group_gids`
 needs for the gid-owned-mount case above, just reading the member list
 instead of the numeric id. `stortree_needed_groups()`/`needed_users()`
-compute that set once each (covering both `server_subtrees`' own nodes
-and `peer_dependencies`' — a peer-sourced descendant's grant expands the
-exact same way, §2/§3, and unlike the old per-user-only scoping, both now
+compute that set once each, over every scope a resolved grant can turn
+up in — `server_subtrees`' own nodes, `peer_dependencies`' (a
+peer-sourced descendant's grant expands the exact same way, §2/§3),
+`client_mounts`' and `client_grants`' (a node inside something this host
+mounts, presented by this host under a grant that may be named nowhere
+else in its facts) — and, unlike the old per-user-only scoping, they
 cover every node with a grant, not just per-user ones, since a plain
-shared node's own `access.group`/`access.owner` still needs its
-id resolved to own its mount); the `stortree_secrets` role — first among
+shared node's own `access.group`/`access.owner` still needs its id
+resolved to own its mount; the `stortree_secrets` role — first among
 the roles that need it in `site.yml`'s order (§8) — runs the `getent`
 lookups and sets the `stortree_group_members`/`stortree_group_gids`/
 `stortree_user_uids` facts from them, which `stortree_mounts` then

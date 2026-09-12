@@ -63,7 +63,13 @@ its own, shaped exactly like any other node below it:
                                # string accepted for one. See "Requires" below
   access: {group: <name>, owner: <name>, permissions: <rwx-string>}  # see Access below
                                # — a single object, all three optional; dotted shorthand
-                               # (access.group:/access.owner:/access.permissions:) works too
+                               # (access.group:/access.owner:/access.permissions:) works too.
+                               # `permissions` also takes one level per Unix class:
+                               # {owner: rwx, group: r-x, other: "---"}
+                               # Inherits: it grants this node and everything under it,
+                               # and a descendant's own keys merge over it (see
+                               # "Access inheritance"); `<key>: null` takes one key
+                               # back, an empty `access:` the whole grant
   samba:                       # presence marks this node for export — write it bare
                                # (or `samba: true`/`samba: {}`) to share with the
                                # defaults, `samba: false` to opt back out
@@ -408,16 +414,22 @@ mechanism (spec.md §6).
 
 Three things to know about it:
 
-- **It replaces the node's own grant, it doesn't merge with it.** Set
-  `access` in a client block and that object is the whole grant for that
-  host's copy; the node's own `group`/`owner`/`permissions` contribute
-  nothing to it. Write `access:` with nothing in it to drop the node's
-  grant on that host entirely, which is different from writing no
-  `access` at all (which keeps whatever the copy would otherwise have
-  carried). Precedence is "nearest wins", exactly as for `rclone` above,
-  and unlike `rclone.args` there's no accumulation: a partial grant
-  assembled from two different places in the tree would be unreadable
-  off the config.
+- **It merges over the node's own grant, key by key** — the same rule
+  an ancestor and its descendant follow down the tree ("Access
+  inheritance" below), and it composes with it: the node's grant is
+  whatever it inherited and wrote, and this is written over that. So
+  `clients.<host>.access.owner: some-service-account` hands that host's
+  copy to that account and leaves the node's group in place, which is
+  usually what naming a host-local principal was for. Between blocks,
+  nearest and most specific wins each key it sets:
+  `clients.<hostname>` over `client-defaults`, deeper node over
+  shallower. To take something back rather than add to it, write `null`
+  for that key, or `access:` with nothing in it to drop the whole grant
+  on that host — both different from writing no `access` at all, which
+  keeps whatever the copy would otherwise have carried. On a host that
+  mounts the node rather than owning it, dropping the grant means
+  *presenting* the default there, which takes a bindfs mount of its own;
+  stortree plans one ("Access inheritance" below).
 - **The owning host is never affected.** `clients`/`client-defaults`
   only ever describe a host that doesn't own the node, so the node's own
   `access` is what its owner enforces, always.
@@ -517,7 +529,9 @@ Some details:
 Every node — top-level or nested under `subdirs`/`user-subdirs` — inherits
 `host` from its nearest ancestor unless it overrides it (a top-level node
 has no ancestor to inherit from, so it always sets its own `host`
-explicitly). `rclone` — both `remote` and `args` — is different: it
+explicitly). `access` inherits the same way, with its own rules for
+replacing and dropping an inherited grant — see "Access inheritance"
+below. `rclone` — both `remote` and `args` — is different: it
 **never** inherits, from an ancestor node or from a top-level one. A
 node's `rclone` config is used exactly as set on that node, full stop; a
 node with no `rclone.remote` of its own resolves to no remote at all,
@@ -635,10 +649,36 @@ access.owner: jd
 
 Both `group` and `owner` can be set at once — the node is then pinned to
 that one `owner`'s folder (see "`subdirs` vs `user-subdirs`" above), with
-`group` granting *shared* access to that same folder at the same
-`permissions` level, not a second, differently-permissioned tier. There's
-no way to express two different principals at two different permission
-levels on one node — see why below.
+`group` granting *shared* access to that same folder.
+
+`permissions` is an `rwx`-style string: any of `r`, `w` and `x`, with `-`
+for a bit not granted, so `rwx`, `r-x` and `rx` are all read the same
+way. It is **not** a numeric mode, and writing one is an error rather
+than a surprise — `permissions: 750` is an integer by the time YAML is
+done with it, and `0750` a different integer again. A typo in the
+letters is an error too (`rwz`), since the alternative is a grant
+quietly missing a bit.
+
+Written as one string it is the level for the whole grant. Written as a
+mapping it is one level per Unix class:
+
+```yaml
+access:
+  owner: jd
+  group: "Michael Whitfield Family"
+  permissions:
+    owner: rwx        # jd writes
+    group: r-x        # the family reads
+    other: "---"      # and nobody else gets even the traversal bit
+```
+
+The classes are the three a Unix mode has, named the way `access` already
+names the first two. Each one you write is enforced exactly; each one you
+leave out keeps the default it would have had (below) — including
+`other`'s traversal bit, so a mapping about the group alone does not
+quietly close the path to a grant nested deeper. That is the difference
+between the two forms: a string settles the whole mode, a mapping settles
+the classes it mentions.
 
 A node's `access` is what its *owning* host enforces. A host that only
 holds a copy of the node — a client mount, or a peer-sourced Samba
@@ -648,21 +688,21 @@ different one with an `access` inside `client-defaults`/`clients`; see
 
 `group`/`owner` names are resolved against POSIX identities provided by
 SSSD (backed by the configured LDAP server — see `ldap.yml` below).
-`permissions` is a `rwx`-style string, applied as plain Unix ownership +
-mode (spec.md §6) — not a POSIX ACL, and there's no way to write one:
-`access` was deliberately restricted to a single object, one owner + one
-group + one shared permissions level, exactly what a remote-backed node
-can ever actually carry. A remote-backed node (directly, or peer-sourced
-from whichever host owns it) is always an rclone FUSE mount, and rclone's
-FUSE mount never implements `setxattr` — it can't carry a POSIX ACL on
-any host, full stop, so the old list-of-grants form (letting a node like
-`whitfield-media` grant two different groups two different permission
-levels) could describe configurations that were never actually
-enforceable for such a node; the schema no longer lets you write one. A
-plain local node (`sys-configs` here) gets the same treatment for
-consistency, not necessity — it could carry a real POSIX ACL, but there's
-no reason for its enforcement to work differently from a remote-backed
-sibling's.
+Everything above is applied as plain Unix ownership + mode (spec.md §6),
+which is exactly why it stops where it does: **one** owner and **one**
+group. Per-class levels need no POSIX ACL — one owner and one group at
+two different levels is what a mode has always been able to say — but a
+second group at a third level is not, and there's no way to write one.
+A remote-backed node (directly, or peer-sourced from whichever host owns
+it) is always an rclone FUSE mount, and rclone's FUSE mount never
+implements `setxattr`: it cannot carry a POSIX ACL on any host, full
+stop. The old list-of-grants form (letting a node like `whitfield-media`
+grant two different groups two different levels) could describe
+configurations that were never enforceable for such a node, so the
+schema no longer lets you write one. A plain local node (`sys-configs`
+here) gets the same treatment for consistency, not necessity — it could
+carry a real POSIX ACL, but there's no reason for its enforcement to
+work differently from a remote-backed sibling's.
 
 With neither `group` nor `owner` granted, a node gets the plain default:
 owned by the `stortree` service account with full control, group
@@ -675,10 +715,83 @@ it private to that one user instead (no group fallback); granting only a
 `group` leaves `stortree` itself with full control and gives the group
 `permissions`. That same traversal-only bit for everyone else is also
 added whenever `permissions` is left at its default rather than written
-out explicitly in config.yml — an explicit `permissions:` is enforced
-exactly as written instead. See spec.md §6 for exactly how this becomes
-real, symmetric enforcement over both Samba and SSH alike, for every node
-with any `access` at all.
+out explicitly in config.yml — an explicit `permissions:` *string* is
+enforced exactly as written instead, other bits included, while the
+per-class mapping settles `other` only if it names it. See spec.md §6
+for exactly how this becomes real, symmetric enforcement over both Samba
+and SSH alike, for every node with any `access` at all.
+
+#### Access inheritance
+
+A node with no `access` key of its own inherits its nearest ancestor's
+grant, exactly as it inherits `host`. So `access.group` written on a
+subtree's top node grants that group the subtree, not one directory:
+
+```yaml
+project-data:
+  host: storage-node-alpha
+  access.group: Media Production  # and everything below is this group's
+  subdirs:
+    footage:                      # inherits it
+      subdirs:
+        raw: {}                   # so does this
+    notes:
+      access.owner: jd            # jd's, still Media Production's group
+    readonly:
+      access.permissions: rx      # same group, narrower level
+    scratch:
+      access:                     # drops it — back to the plain default
+```
+
+Four rules, and a client block's `access` follows all four over the
+result ("Client-side access" above):
+
+- **No `access` key at all: inherit.** The whole grant, from the nearest
+  ancestor that has one. A node with no granted ancestor gets the plain
+  default, exactly as it always did.
+- **A key of its own: merge over it.** Each of `group`, `owner` and
+  `permissions` comes from the nearest ancestor that set it. `notes`
+  above names an owner and keeps `Media Production` alongside it;
+  `readonly` narrows that group's level to `rx` and keeps the group. A
+  node never has to restate the keys it isn't changing — restating them
+  is how two lines that were meant to agree drift apart later. A
+  per-class `permissions` mapping merges one level further down, class
+  by class, so a descendant can restate what the group gets and leave
+  the owner's level alone.
+- **`null` for a key: take that key back.** `access.owner: null` under a
+  granted ancestor leaves the group and drops the owner. With every key
+  merging, this is the only way to remove one.
+- **An empty `access:`: drop the whole grant.** The same thing said
+  about every key at once, and the shorthand you'll actually write.
+
+A `permissions` with nobody to apply it to is refused: on its own a
+level grants nothing, and resolves to the same empty grant as the
+`access:` that drops one — the opposite of what writing a level out
+means. So `access.permissions: rx` is right under a granted ancestor and
+an error without one, and nulling a principal while leaving its level
+behind (`access: {group: null}` under `{group: G, permissions: rx}`) is
+the same error written across two nodes.
+
+Inheriting is what makes a grant describe a subtree. Without it,
+`access.group` on a subtree's top node let that group traverse the
+directory and read nothing inside it (every node below stayed at the
+ungranted default, reachable only through the public-execute bit under
+"Access" above), which is essentially never what writing the group
+meant. It crosses a `user-subdirs` boundary like any other, so a
+per-user node under a granted ancestor now resolves against that grant
+instead of resolving to nobody.
+
+What it costs depends on which host you ask. On the host that owns the
+subtree these are real directories, so each inherited grant is one more
+`chown`. On a host that mounts the subtree, ownership is whatever the
+bindfs presentation above the path shows — and bindfs shows one owner,
+group and mode over its whole subtree — so a node that inherited its
+grant unchanged needs nothing of its own: one presentation covers every
+node beneath it, however deep. Only the nodes that say something
+*different* from the mount above them get a presentation of their own —
+`notes`, `readonly` and `scratch` in the example, and `scratch`
+precisely because "the plain default" is something to present, not the
+absence of something. See spec.md §2 for the two layers this is talking about.
 
 ### Every inventory host participates
 

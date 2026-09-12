@@ -172,6 +172,13 @@ _NODE_KEYS = frozenset(
 )
 _RCLONE_KEYS = frozenset({"remote", "args"})
 _ACCESS_KEYS = frozenset({"group", "owner", "permissions"})
+# `permissions` is either one `rwx`-style level for the whole grant, or
+# one per Unix class -- the three classes a mode has, named the way
+# `access` already names the first two (docs/config-schema.md "Access").
+_PERMISSION_CLASSES = frozenset({"owner", "group", "other"})
+# The alphabet a level is read with: _permission_bits() looks for `r`,
+# `w` and `x`, and `-` is the conventional filler for a bit not granted.
+_PERMISSION_LEVEL = re.compile(r"^[rwx-]*$")
 _SAMBA_KEYS = frozenset({"name", "hidden"})
 # A client-defaults block, or one entry of `clients`, carries `rclone`
 # (either `false` or a `{args: ...}` mapping), `access` (the same
@@ -240,6 +247,79 @@ def _require_mapping(value, block, node_path):
         )
 
 
+def _reject_ungranted_permissions(access, block, node_path):
+    """Reject a grant that carries a `permissions` level with no `group`
+    or `owner` for it to apply to.
+
+    A level on its own grants nothing to anybody, so _normalize_access()
+    reads the whole grant as empty -- which is a statement of its own now
+    that `access` inherits: it means the plain ungranted default at this
+    path (docs/config-schema.md "Access inheritance"). An operator who
+    wrote a level out means the opposite, and the two are
+    indistinguishable by the time anything downstream sees `{}`.
+
+    Asked of the *resolved* grant, not of the block as written, because
+    under merging those differ: `access.permissions: rx` written under a
+    group-granted ancestor is the ordinary way to narrow that group's
+    level and is exactly right, while the same line with nothing granted
+    above it is the mistake this catches. It also catches the other way
+    in: nulling an inherited principal (`access.group: null`) while
+    leaving its level behind, which reads as deliberate and grants
+    nobody anything."""
+    if not isinstance(access, dict) or "permissions" not in access:
+        return
+    if access.get("group") or access.get("owner"):
+        return
+    raise ValueError(
+        f"stortree: {node_path!r}'s `{block}` leaves a `permissions` level "
+        f"with no `group` or `owner` to apply it to -- a level on its own "
+        f"grants nothing. Name the principal alongside it, or write "
+        f"`access:` with nothing in it to drop the grant here entirely. "
+        f"See docs/config-schema.md \"Access inheritance\""
+    )
+
+
+def _validate_permissions(access, block, node_path):
+    """Check the `permissions` inside one `access` block: an `rwx`-style
+    level, or a mapping of one per Unix class.
+
+    Every level is held to the alphabet it is read with, because
+    _permission_bits() looks for `r`, `w` and `x` and silently ignores
+    everything else: unchecked, `permissions: rwz` is a grant quietly
+    missing a bit rather than the typo it is. It also catches the mode
+    string this schema deliberately isn't -- `permissions: 750` is an
+    integer by the time YAML is done with it (`0750` an entirely
+    different one), and would otherwise fail somewhere down in the mode
+    arithmetic with nothing pointing back at the line that caused it."""
+    if not isinstance(access, dict) or "permissions" not in access:
+        return
+    permissions = access["permissions"]
+    if isinstance(permissions, dict):
+        _reject_unknown_keys(
+            permissions, _PERMISSION_CLASSES, f"{block}.permissions", node_path
+        )
+        levels = [
+            (f"{block}.permissions.{klass}", level)
+            for klass, level in permissions.items()
+        ]
+    else:
+        levels = [(f"{block}.permissions", permissions)]
+    for name, level in levels:
+        # `null` is how a merge takes a key back (_merge_access()), not a
+        # level to check.
+        if level is None:
+            continue
+        if not isinstance(level, str) or not _PERMISSION_LEVEL.match(level):
+            raise ValueError(
+                f"stortree: {node_path!r}'s `{name}` must be an rwx-style "
+                f"string -- any of `r`, `w`, `x`, with `-` for a bit not "
+                f"granted (`rwx`, `r-x`, `rx`) -- got {level!r}. It is not a "
+                f"numeric mode: which class each level applies to is said by "
+                f"writing one per class (`permissions: {{owner: rwx, group: "
+                f"r-x}}`). See docs/config-schema.md \"Access\""
+            )
+
+
 def _validate_node(node, node_path):
     """Reject anything in this node the schema doesn't define, before
     any of it is read."""
@@ -251,6 +331,7 @@ def _validate_node(node, node_path):
     _reject_unknown_keys(node, _NODE_KEYS, "", node_path)
     _reject_unknown_keys(node.get("rclone"), _RCLONE_KEYS, "rclone", node_path)
     _reject_unknown_keys(node.get("access"), _ACCESS_KEYS, "access", node_path)
+    _validate_permissions(node.get("access"), "access", node_path)
     _reject_samba_subpath(node.get("samba"), node_path)
     _reject_unknown_keys(node.get("samba"), _SAMBA_KEYS, "samba", node_path)
 
@@ -280,6 +361,7 @@ def _validate_node(node, node_path):
                 f"{name}.access",
                 node_path,
             )
+            _validate_permissions(entry.get("access"), f"{name}.access", node_path)
             # Likewise `samba`: a client block's is the same object a
             # node's own is, held to the same keys and the same
             # derived-`subpath` rule, so a typo here drops a per-host
@@ -291,6 +373,22 @@ def _validate_node(node, node_path):
                 f"{name}.samba",
                 node_path,
             )
+
+
+def _access_mapping(raw):
+    """An `access` value as a plain mapping: `None` (a bare `access:`) is
+    the empty one, and anything that isn't a mapping is a config error --
+    a list most of all, since that was the old multi-grant form and the
+    reason there is a check here at all (_normalize_access())."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        kind = "a list" if isinstance(raw, list) else f"{raw!r}"
+        raise ValueError(
+            "access must be a single object ({group?, owner?, permissions?}), "
+            f"not {kind} -- see docs/config-schema.md \"Access\""
+        )
+    return raw
 
 
 def _normalize_access(raw):
@@ -310,20 +408,131 @@ def _normalize_access(raw):
     gets it enforced exactly, other-bits included; a default is free to
     also carry the public-execute safety net that keeps a distinct grant
     nested underneath this node still reachable, see access_mode())."""
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        kind = "a list" if isinstance(raw, list) else f"{raw!r}"
-        raise ValueError(
-            "access must be a single object ({group?, owner?, permissions?}), "
-            f"not {kind} -- see docs/config-schema.md \"Access\""
-        )
-    entry = dict(raw)
+    entry = dict(_access_mapping(raw))
+    if entry.get("permissions") is None:
+        entry.pop("permissions", None)
     if not (entry.get("group") or entry.get("owner")):
         return {}
-    entry["permissions_explicit"] = "permissions" in entry
+    # Only a *scalar* level settles the whole mode, other bits included
+    # (access_mode()). A per-class mapping settles exactly the classes it
+    # names and leaves the rest at their defaults, so it is not
+    # "explicit" in this sense however much of it was written out.
+    entry["permissions_explicit"] = "permissions" in entry and not isinstance(
+        entry["permissions"], dict
+    )
     entry.setdefault("permissions", DEFAULT_ACCESS_PERMISSIONS)
     return entry
+
+
+def _access_raw(access):
+    """A resolved grant back as the config keys it was written from --
+    where a merge of another block over it has to start.
+
+    Normalizing adds two things: a defaulted `permissions` and the
+    `permissions_explicit` flag recording whether the config really
+    wrote one (_normalize_access()). Both come off again before a merge,
+    or a level nobody wrote arrives in the merged grant looking like one
+    somebody did, and access_mode() drops the traversal bit a deeper
+    grant needs. A per-class `permissions` mapping is kept as written,
+    since writing one is never a default."""
+    access = access or {}
+    raw = {
+        key: value
+        for key, value in access.items()
+        if key not in ("permissions", "permissions_explicit", "reset")
+    }
+    permissions = access.get("permissions")
+    if access.get("permissions_explicit") or isinstance(permissions, dict):
+        raw["permissions"] = permissions
+    return raw
+
+
+def _merge_access(inherited, own):
+    """`own`'s keys over `inherited`'s, one key at a time -- both raw
+    (_access_raw()).
+
+    A `null` value removes the inherited key rather than merging an
+    empty one over it: with every key merging there would otherwise be
+    no way to take one back. A per-class `permissions` mapping merges
+    the same way one level further down, so a descendant can restate one
+    class and keep the others; a scalar level and a mapping replace each
+    other whole, since they say different kinds of thing."""
+    merged = dict(inherited)
+    for key, value in own.items():
+        if value is None:
+            merged.pop(key, None)
+        elif (
+            key == "permissions"
+            and isinstance(value, dict)
+            and isinstance(merged.get("permissions"), dict)
+        ):
+            merged["permissions"] = {
+                klass: level
+                for klass, level in {**merged["permissions"], **value}.items()
+                if level is not None
+            }
+        else:
+            merged[key] = value
+    return merged
+
+
+def _dropped_access(previous):
+    """What an explicitly empty `access:` resolves to, written against
+    the `previous` grant it replaces -- an ancestor's, where `access`
+    inherits down the tree (_walk_tree()), or the node's own, where a
+    client block replaces it for one host (_client_grant()).
+
+    With nothing to replace it is the plain ungranted `{}` this has
+    always been. Where it really does drop a grant it is `{reset: True}`
+    instead: still granted to nobody, and still `0751` stortree:stortree
+    everywhere ownership is read from it (access_owner(), access_group(),
+    access_mode() all ignore the key), but no longer indistinguishable
+    from a node that simply never had a grant.
+
+    The difference is worth a key because dropping a grant is not free
+    on a host that holds a *mounted* copy of the path. There, ownership
+    is whatever the presentation above it shows over its whole subtree,
+    so a node that has genuinely dropped its ancestor's grant needs a
+    presentation of its own to show anything else -- and asking for one
+    is exactly what this marker does (_layer_plan_entries()). Without
+    it, the drop would be honoured on the owning host, where a real
+    chown settles it, and quietly ignored on every host that mounts the
+    subtree instead."""
+    return {"reset": True} if previous else {}
+
+
+def _client_grant(node_access, client_access, node_path, hostname):
+    """The grant a host actually applies to its own copy of a node: the
+    node's own (which every host enforces by default, spec.md §6) with
+    whatever a `client-defaults`/`clients.<host>` block wrote for this
+    host merged over it, key by key -- the same rule an ancestor and its
+    descendant follow down the tree (_merge_access()).
+
+    So a client block naming an `owner` and nothing else hands that
+    host's copy to that user and leaves the node's group in place. It
+    used to replace the whole grant, on the reasoning that a client
+    block describes another host's copy and so states it outright; what
+    that meant in practice was that overriding one key silently dropped
+    the others, and a grant meant to hold fleet-wide stopped at the one
+    host that also had a host-local principal to name. The blocks that
+    really do mean "and nothing else" say so the same way a node does,
+    with an empty `access:` (_dropped_access()) or a `null` on the key
+    they are taking back.
+
+    `node_path`/`hostname` name the grant in an error, and are the
+    reason the merged result is checked here rather than each block
+    where it is written: a block writing only `permissions` is the
+    ordinary way to narrow this host's copy of an inherited grant, and
+    whether that leaves anyone granted is a question about the merge,
+    not about the block."""
+    if client_access is _UNSET:
+        return node_access
+    own = _access_mapping(client_access)
+    if not own:
+        return _dropped_access(node_access)
+    merged = _merge_access(_access_raw(node_access), own)
+    _reject_ungranted_permissions(merged, f"access for {hostname}", node_path)
+    return _normalize_access(merged) or _dropped_access(node_access)
 
 
 # A share name is an smb.conf section header and the name a client
@@ -533,24 +742,49 @@ def access_mode(access):
     private to that group with no separate stortree-group carve-out,
     since it was deliberately scoped to someone else.
 
-    When `access` carries an *explicit* `permissions` (`permissions_
-    explicit`, set by `_normalize_access()` before it defaults the field)
-    that choice is honored exactly, other-bits included -- an operator
-    who wrote out `permissions:` themselves gets it enforced literally,
-    even if that happens to make a deeper, differently-scoped descendant
-    grant unreachable through this node. Only the *default* permissions
-    level (no `permissions` written in config.yml at all) carries the
-    public-execute safety net; a hand-built `access` dict with no
-    `permissions_explicit` key at all (e.g. in a test) is treated the
-    same as an unset default, which is the safer assumption."""
+    When `access` carries an *explicit* scalar `permissions`
+    (`permissions_explicit`, set by `_normalize_access()` before it
+    defaults the field) that choice is honored exactly, other-bits
+    included -- an operator who wrote out `permissions:` themselves gets
+    it enforced literally, even if that happens to make a deeper,
+    differently-scoped descendant grant unreachable through this node.
+    Only the *default* permissions level (no `permissions` written in
+    config.yml at all) carries the public-execute safety net; a
+    hand-built `access` dict with no `permissions_explicit` key at all
+    (e.g. in a test) is treated the same as an unset default, which is
+    the safer assumption.
+
+    `permissions` written as a mapping instead names its levels one Unix
+    class at a time (`{owner: rwx, group: r-x, other: "---"}`,
+    docs/config-schema.md "Access"). Every class it names is enforced
+    exactly as written and every class it doesn't keeps the default
+    above -- including `other`'s traversal bit, which a mapping
+    therefore has to remove deliberately rather than as a side effect of
+    saying something about the group. That is the whole difference
+    between the two forms: a scalar settles the mode, a mapping settles
+    the classes it mentions.
+
+    Nothing here needs a POSIX ACL: one owner and one group at two
+    different levels is what a Unix mode has always been able to say.
+    The single-object restriction on `access` (_normalize_access()) is
+    about naming two *groups*, which a mode cannot express and rclone's
+    FUSE mount cannot carry."""
     access = access or {}
     if not (access.get("owner") or access.get("group")):
         return "0751"
-    bits = _permission_bits(access.get("permissions", DEFAULT_ACCESS_PERMISSIONS))
-    owner_bits = bits if access.get("owner") else 7
-    group_bits = bits if access.get("group") else 0
-    other_bit = 0 if access.get("permissions_explicit") else 1
-    return f"0{owner_bits}{group_bits}{other_bit}"
+    permissions = access.get("permissions", DEFAULT_ACCESS_PERMISSIONS)
+    classes = permissions if isinstance(permissions, dict) else {}
+    bits = _permission_bits(
+        DEFAULT_ACCESS_PERMISSIONS if classes else permissions
+    )
+    digits = {
+        "owner": bits if access.get("owner") else 7,
+        "group": bits if access.get("group") else 0,
+        "other": 0 if access.get("permissions_explicit") else 1,
+    }
+    for klass, level in classes.items():
+        digits[klass] = _permission_bits(level)
+    return "0{owner}{group}{other}".format(**digits)
 
 
 def bindfs_perms(access):
@@ -616,10 +850,45 @@ def _walk_tree(tree):
     every node in the whole forest, top-level entries included (unlike
     the old single root, a top-level entry *is* an ordinary mountable
     node now -- see resolve()) -- each also carries `root_path`, the
-    top-level entry it's nested under. `host` inherits down the tree;
-    `rclone` -- both `remote` and `args` -- never inherits (spec.md §1):
-    a node with no `rclone.remote` of its own resolves to
+    top-level entry it's nested under. `host` and `access` inherit down
+    the tree; `rclone` -- both `remote` and `args` -- never inherits
+    (spec.md §1): a node with no `rclone.remote` of its own resolves to
     `remote: None`, regardless of what any ancestor sets.
+
+    `access` inherits key by key (docs/config-schema.md "Access
+    inheritance"). A node's own `access` merges *over* whatever it
+    inherited rather than replacing it, so each of `group`, `owner` and
+    `permissions` comes from the nearest ancestor that set it: a
+    descendant narrowing an inherited group's level writes only
+    `permissions`, and one handing a subdirectory to a single person
+    writes only `owner`. Writing `null` for a key removes what was
+    inherited for that key alone, and an empty `access:` drops the whole
+    inherited grant -- the two escape hatches merging needs, since with
+    everything else merging there would otherwise be no way down.
+
+    A `client-defaults`/`clients` block's `access` then merges over the
+    result the same way, for the one host it describes (_client_grant(),
+    _client_policy()) -- so the two axes compose rather than one
+    cancelling the other, and a block naming a host-local service
+    account as `owner` keeps the fleet-wide group the node granted
+    instead of dropping it.
+
+    Raw values are what carry down, normalized once per node, so an
+    ancestor's *defaulted* `permissions` never reaches a descendant
+    looking like one the config wrote out -- `permissions_explicit`
+    (_normalize_access()) has to stay true only where somebody really
+    did write a level, or access_mode() drops the traversal bit a
+    deeper grant needs.
+
+    Inheriting is what makes a grant describe a *subtree* rather than
+    one directory. The alternative, and what this used to do, is that
+    `access.group: G` on a node left every subdirectory under it back at
+    the ungranted default: the group could traverse into the subtree
+    (access_mode()'s public-execute bit) and read nothing inside it,
+    which is essentially never what the grant meant. It crosses a
+    `user-subdirs` boundary like any other, so a granted node's per-user
+    children resolve against that grant (_expand_per_user()) instead of
+    resolving to nobody and dropping out of the plan.
 
     `children` is {path: [child path, ...]} -- the tree's own shape,
     kept explicitly rather than re-derived from path prefixes downstream,
@@ -661,7 +930,19 @@ def _walk_tree(tree):
     children = {}
     own_client_blocks = {}
 
-    def _visit(node, path_parts, host, per_user, root_path, client_chain, parent_path):
+    def _visit(
+        node,
+        path_parts,
+        host,
+        per_user,
+        root_path,
+        client_chain,
+        parent_path,
+        inherited_access,
+    ):
+        # The inherited grant travels as the raw config keys it was
+        # written from, not as a resolved one -- see the note on
+        # `permissions_explicit` in the docstring above.
         path = "/".join(path_parts)
         _validate_node(node, path)
         children[path] = []
@@ -674,7 +955,14 @@ def _walk_tree(tree):
         h = node.get("host", host)
         r = (node.get("rclone") or {}).get("remote")
         args = (node.get("rclone") or {}).get("args") or {}
-        access = _normalize_access(node.get("access"))
+        own_access = node.get("access", _UNSET)
+        if own_access is _UNSET:
+            raw_access = inherited_access
+        else:
+            own = _access_mapping(own_access)
+            raw_access = _merge_access(inherited_access, own) if own else {}
+        _reject_ungranted_permissions(raw_access, "access", path)
+        access = _normalize_access(raw_access) or _dropped_access(inherited_access)
         samba = _normalize_samba(
             node.get("samba", _UNSET), path, "user-subdirs" in node
         )
@@ -706,6 +994,7 @@ def _walk_tree(tree):
                 root_path,
                 client_chain,
                 path,
+                raw_access,
             )
         for name, child in (node.get("user-subdirs") or {}).items():
             _visit(
@@ -716,10 +1005,11 @@ def _walk_tree(tree):
                 root_path,
                 client_chain,
                 path,
+                raw_access,
             )
 
     for name, root_node in tree.items():
-        _visit(root_node or {}, [name], None, False, name, [], None)
+        _visit(root_node or {}, [name], None, False, name, [], None, {})
         roots.append(name)
 
     return roots, nodes, client_chains, children, own_client_blocks
@@ -882,6 +1172,55 @@ def _transport_covers(inner, outer):
     return inner["args"] == outer["args"]
 
 
+def _grant_presented_above(entry, presentations):
+    """Whether some presentation already above `entry` applies exactly
+    the grant `entry` carries, so `entry` needs no presentation of its
+    own.
+
+    A bindfs mount presents one uniform owner, group and mode over its
+    whole subtree (bindfs_perms()) -- that uniformity is the constraint
+    the presentation layer exists to work within, and here it pays: a
+    path inside a presentation is *already* shown as that presentation's
+    grant, so a node whose own grant is the same one has nothing left to
+    apply. Since `access` inherits (_walk_tree()), that is the ordinary
+    case rather than a corner: one `access.group` on a subtree's top
+    node now grants every node beneath it, and without this each of
+    those would mount a second bindfs over the first to present what it
+    already presented.
+
+    Only the *nearest* presentation above is compared, because it is the
+    only one whose ownership is visible at this path -- an intervening
+    presentation with a different grant is what the path actually shows,
+    and a node matching its grandparent through that is a node that does
+    need its own mount to get back to it.
+
+    Two grants are the same one here when they render the same mount --
+    the owner, the group and the mode the unit template passes to
+    bindfs's `-u`, `-g` and `-p` (roles/stortree_mounts/templates/
+    stortree-mount@.service.j2). Nothing else about a grant reaches the
+    presentation, so nothing else can distinguish two of them at this
+    path; comparing the dicts instead would keep a mount for a
+    difference that renders identically, such as an explicit drop
+    (_dropped_access()) underneath an ungranted mount."""
+    above = [
+        pres
+        for pres in presentations
+        if entry["local_path"].startswith(pres["local_path"] + "/")
+    ]
+    if not above:
+        return False
+    nearest = max(above, key=lambda pres: len(pres["local_path"]))
+    return _presented_as(nearest.get("access")) == _presented_as(entry.get("access"))
+
+
+def _presented_as(access):
+    """The (owner, group, mode) triple a presentation mount of `access`
+    actually shows -- everything the bindfs command line takes from a
+    grant, and nothing else."""
+    access = access or {}
+    return access.get("owner"), access.get("group"), bindfs_perms(access)
+
+
 def _dedupe(items, key):
     seen = set()
     result = []
@@ -947,16 +1286,16 @@ def _client_policy(chain, hostname):
     client-defaults first, then `clients.<hostname>`, shallowest node to
     deepest.
 
-    `access` does *not* merge: the nearest, most specific block that
-    sets one replaces the node's own grant wholesale for this host's
-    copy (docs/config-schema.md "Client-side access"), rather than
-    layering a partial override over it -- half a grant is not a grant,
-    and an `access` that inherited a `group` from one place and
-    `permissions` from another would be hard to read off the config at
-    all. `_UNSET` when no block in the chain sets one, which is the
-    signal to keep the node's own `access` untouched (as against an
-    explicit `access:` with nothing in it, which deliberately drops the
-    node's grant on this host)."""
+    `access` accumulates like `args`, one key at a time (_merge_access())
+    rather than one block at a time: every block in the chain
+    contributes, nearest and most specific winning each key it sets, and
+    the result then merges over the node's own grant (_client_grant()).
+    An empty `access:` anywhere in the chain drops what the blocks above
+    it built, the same statement it makes on a node.
+
+    `_UNSET` when no block in the chain sets one at all, which is the
+    signal to leave the node's own grant untouched -- distinct from the
+    `{}` an explicit empty block resolves to, which drops it."""
     enabled = True
     args = {}
     access = _UNSET
@@ -972,7 +1311,12 @@ def _client_policy(chain, hostname):
         _deep_merge(args, _rclone_args(client_setting))
         for container in (defaults, entry):
             if isinstance(container, dict) and "access" in container:
-                access = container["access"]
+                block = _access_mapping(container["access"])
+                access = (
+                    _merge_access({} if access is _UNSET else access, block)
+                    if block
+                    else {}
+                )
     return enabled, args, access
 
 
@@ -1181,12 +1525,17 @@ def _samba_share_entries(index, hostname):
                 _enabled, _args, client_access = _client_policy(
                     index.client_chains[d["path"]], hostname
                 )
-                a = (
-                    d.get("access")
-                    if client_access is _UNSET
-                    else _normalize_access(client_access)
+                a = _client_grant(
+                    d.get("access"), client_access, d["path"], hostname
                 )
-            if a and a not in access_union:
+            # A grant that names nobody says nothing about `valid users`
+            # -- and that includes an explicit drop, whose `reset` key is
+            # for the filesystem layer alone (_dropped_access()); left in
+            # the union it would put a principal-less entry in front of
+            # the template's own `selectattr('permissions', ...)`.
+            if not (a or {}).get("owner") and not (a or {}).get("group"):
+                continue
+            if a not in access_union:
                 access_union.append(a)
 
         shares.append(
@@ -1246,16 +1595,14 @@ def _samba_peer_dependencies(index, hostname):
                     "remote_path": d["path"],
                     "samba_node": s["path"],
                     "per_user": d["per_user"],
-                    # A client-side `access` replaces the node's own
-                    # for this host's copy only -- the enforcement
-                    # this host actually applies to it (rclone's
-                    # --uid/--gid/--dir-perms, and the directory's
-                    # own ownership/mode where it isn't a mount).
-                    # The share's own `valid users` is deliberately
-                    # left alone: it stays the node's tree-wide
-                    # grant, identical on every host.
-                    "access": (
-                        d["access"] if access is _UNSET else _normalize_access(access)
+                    # A client-side `access` merges over the node's
+                    # own for this host's copy only (_client_grant())
+                    # -- the enforcement this host actually applies to
+                    # it: the presentation's `-u`/`-g`/`-p`, and the
+                    # directory's own ownership and mode where it
+                    # isn't a mount.
+                    "access": _client_grant(
+                        d["access"], access, d["path"], hostname
                     ),
                     "args": args,
                     # The node's own declared dependency, not the
@@ -1294,10 +1641,10 @@ def _client_grant_entries(index, hostname, mounted_paths):
     entry, and a `user-subdirs` node is still %U-templated and fans out
     through _expand_per_user() rather than resolving to one path here.
 
-    A `clients.<host>.access` block replaces the node's own grant for the
-    host it names, the same way that block's `samba` and `rclone` keys
-    replace theirs -- read here from the node's own chain, so it applies
-    on a node that has no other reason to be planned. A node that does
+    A `clients.<host>.access` block merges over the node's own grant for
+    the host it names (_client_grant()) -- read here from the node's own
+    chain, so it applies on a node that has no other reason to be
+    planned. A node that does
     (a client block with `samba:`, say) reaches the plan through
     _samba_peer_dependencies()/_client_mount_entries() carrying the same
     grant already, and plan_mounts() keeps that entry rather than this
@@ -1319,7 +1666,7 @@ def _client_grant_entries(index, hostname, mounted_paths):
         _enabled, _args, access = _client_policy(
             index.client_chains[n["path"]], hostname
         )
-        grant = n["access"] if access is _UNSET else _normalize_access(access)
+        grant = _client_grant(n["access"], access, n["path"], hostname)
         if grant:
             grants.append({"local_path": n["path"], "access": grant})
     return grants
@@ -1375,7 +1722,7 @@ def _client_mount_entries(index, hostname, samba_sourced_paths, stortree_root):
             # applied; it doesn't (_client_grant_entries()), so what a
             # non-owning host showed was its own uniform default and the
             # grant stopped at the host that happened to own the node.
-            access = node["access"] if access is _UNSET else _normalize_access(access)
+            access = _client_grant(node["access"], access, path, hostname)
             peers.append(
                 {
                     "owning_host": node["host"],
@@ -1930,7 +2277,12 @@ def needed_groups(resolved):
     peer) and `client_mounts` (this host's own copy of a subtree it
     doesn't own -- which carries a grant only when a `client-defaults`/
     `clients.<hostname>` block gave it one, docs/config-schema.md
-    "Client-side access"). All computed once, together, by
+    "Client-side access") and `client_grants` (a node *inside* something
+    this host mounts, whose grant it applies with a presentation of its
+    own -- the scope that made this list four rather than three, and the
+    one most likely to name a group nothing else on the host does, since
+    the mount above it carries whatever grant was written higher up).
+    All computed once, together, by
     `stortree_facts` so every later role (`stortree_mounts`,
     `stortree_secrets`) shares one lookup and one consistent
     group_members/group_gids map, rather than each recomputing its own
@@ -1940,6 +2292,7 @@ def needed_groups(resolved):
         resolved.get("server_subtrees", [])
         + resolved.get("peer_dependencies", [])
         + resolved.get("client_mounts", [])
+        + resolved.get("client_grants", [])
     ):
         g = (entry.get("access") or {}).get("group")
         if g:
@@ -1951,7 +2304,8 @@ def needed_users(resolved, group_members=None):
     """Every username this host's resolved facts reference in an
     `access.owner` grant -- mirrors needed_groups() above, for the
     `getent passwd` lookup user_uids_from_getent() needs to uid-own a
-    remote-backed node's mount (spec.md §6). Also covers every per-user
+    remote-backed node's mount (spec.md §6) -- over the same four scopes,
+    `client_grants` included. Also covers every per-user
     container's own owner (`_resolved_user_containers()`, group-derived
     ones included) when `group_members` is given -- stortree_secrets
     needs those numeric UIDs too, for a wrapper mount's `--uid`
@@ -1965,6 +2319,7 @@ def needed_users(resolved, group_members=None):
         resolved.get("server_subtrees", [])
         + resolved.get("peer_dependencies", [])
         + resolved.get("client_mounts", [])
+        + resolved.get("client_grants", [])
     ):
         u = (entry.get("access") or {}).get("owner")
         if u:
@@ -2412,10 +2767,21 @@ def _layer_plan_entries(entries):
 
     A node gets a presentation when it has a remote of its own (so its
     content reaches the visible tree at all) or when it carries an
-    `access` grant and sits inside some transport (so that grant is
-    applied where nothing else can apply it). Everything else is a
-    `dir`: it appears through whichever presentation is above it, and
-    only has to exist.
+    `access` grant that nothing above it already applies and sits inside
+    some transport (so that grant is applied where nothing else can
+    apply it). Everything else is a `dir`: it appears through whichever
+    presentation is above it, and only has to exist.
+
+    "That nothing above it already applies" is what keeps an inherited
+    grant (_walk_tree()) from costing a mount per node it reaches: a
+    presentation is uniform over its whole subtree, so every node that
+    inherited its grant unchanged is already presented correctly and
+    stays a `dir` -- one bindfs at the node the grant was written on,
+    however deep the subtree beneath it goes. It still carries the grant
+    in the plan, and stortree_mounts still verifies the path against it
+    (roles/stortree_mounts/tasks/main.yml); what it does not do is mount
+    a second bindfs to re-present what the first one presents.
+    _grant_presented_above() has the details.
 
     One transport per declaring node, not per distinct remote spec. Two
     nodes naming the same `remote:path` would share a mount only if one
@@ -2470,7 +2836,14 @@ def _layer_plan_entries(entries):
         )
 
     roots = {t["local_path"]: t["slug"] for t in transports}
-    for e in entries:
+    presentations = []
+    # Shallowest first, so a presentation is decided before anything it
+    # covers is (_grant_presented_above()). The list itself keeps the
+    # order the stages built it in -- this only settles each entry's own
+    # fields, in place.
+    for e in sorted(
+        entries, key=lambda e: (e["local_path"].count("/"), e["local_path"])
+    ):
         # The deepest transport rooted at or above this path. Picked with
         # max() rather than by tracking a best-so-far, because a
         # best-so-far comparison is only ever exercised in one direction
@@ -2484,11 +2857,29 @@ def _layer_plan_entries(entries):
         e["transport_slug"] = max(above, key=lambda ps: len(ps[0]))[1] if above else None
 
         access = e.get("access") or {}
-        granted = bool(access.get("owner") or access.get("group"))
+        # A drop is a grant for this purpose: it asks for the plain
+        # default to be presented at this path, which inside somebody
+        # else's presentation takes a mount exactly like any other
+        # ownership does (_dropped_access()).
+        granted = bool(
+            access.get("owner") or access.get("group") or access.get("reset")
+        )
         if e["symlink_target"]:
             e["kind"] = "bind"
-        elif e["remote"] or (granted and e["transport_slug"]):
+        elif e["remote"] or (
+            granted
+            # Asked of every granted entry, inside a transport or not.
+            # Outside one there is never anything above to have applied
+            # the grant already -- a presentation only exists within
+            # layer 1 -- so the answer is "nothing does", and the
+            # `transport_slug` test below is left to decide what it
+            # always decided: a real local directory takes a chown, not a
+            # mount.
+            and not _grant_presented_above(e, presentations)
+            and e["transport_slug"]
+        ):
             e["kind"] = "mount"
+            presentations.append(e)
         else:
             e["kind"] = "dir"
         # The remote belongs to layer 1 now; a presentation reads a local
@@ -2612,14 +3003,56 @@ def samba_access_tokens(access_list, include_self=False):
     prepends `%U` itself (spec.md §6): a %U-templated share's own path
     already confines each connecting user to their own subtree, so their
     baseline access there shouldn't depend on any particular descendant's
-    `access` grant existing at all."""
+    `access` grant existing at all.
+
+    Deduped, in first-seen order: the list names principals, and one
+    principal named twice admits nobody new. The union it renders is
+    deduped by whole grant (_samba_share_entries()), which is not the
+    same thing -- since `access` inherits, a share's descendants
+    routinely carry the same group inside grants that differ elsewhere,
+    and each would otherwise contribute that group again."""
     tokens = ['"%U"'] if include_self else []
     for a in access_list:
         if a.get("group"):
             tokens.append(f'"@{a["group"]}"')
         if a.get("owner"):
             tokens.append(f'"{a["owner"]}"')
-    return tokens
+    return list(dict.fromkeys(tokens))
+
+
+def samba_write_tokens(access_list, include_self=False):
+    """samba_access_tokens() narrowed to the principals a grant actually
+    lets write -- smb.conf's `write list`, as against the `valid users`
+    the other renders.
+
+    Per principal, not per grant, because a grant can give its owner and
+    its group different levels now (access_mode(), docs/config-schema.md
+    "Access"): with `permissions: {owner: rwx, group: r-x}` the owner
+    writes and the group does not, and a `write list` naming both would
+    tell Samba the opposite of what the filesystem underneath enforces.
+    Read off the resolved mode rather than the `permissions` value, so
+    the answer is the same one the kernel will give -- including for the
+    owner slot of a group-only grant, which keeps full control whatever
+    level the group was given (access_mode() again).
+
+    `%U` rides along with `include_self` exactly as it does in
+    `valid users`: a per-user share's own path confines each connecting
+    user to their own subtree, which is theirs to write in.
+
+    Deduped like `valid users`, and for the same reason -- with one
+    difference worth knowing: a principal writable through any grant in
+    the union is in the list, so a group given `rwx` on one descendant
+    and `r-x` on another writes. The narrower grant is still enforced by
+    the filesystem underneath; `write list` only decides whether Samba
+    itself refuses first."""
+    tokens = ['"%U"'] if include_self else []
+    for a in access_list:
+        mode = access_mode(a)
+        if a.get("group") and int(mode[2]) & 2:
+            tokens.append(f'"@{a["group"]}"')
+        if a.get("owner") and int(mode[1]) & 2:
+            tokens.append(f'"{a["owner"]}"')
+    return list(dict.fromkeys(tokens))
 
 
 # Which unit family renders each kind of plan entry. A `dir` has no
@@ -2744,4 +3177,5 @@ class FilterModule(object):
             "stortree_path_masked": path_masked,
             "stortree_ownership_mismatch": ownership_mismatch,
             "stortree_samba_access_tokens": samba_access_tokens,
+            "stortree_samba_write_tokens": samba_write_tokens,
         }
