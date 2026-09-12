@@ -28,13 +28,22 @@ its own, shaped exactly like any other node below it:
                                # with host+remote both set, <hostname> self-mounts it,
                                # same rule as any other node (see "Node inheritance")
 
-  client-defaults:
+  client-defaults:            # applies to this node and everything under it — write it
+                               # on a subdirectory as readily as on a top-level subtree
     rclone.args: {...}        # base rclone mount args, merged into every non-owning
-                               # host's peer mount of this subtree — including one with
+                               # host's peer mount of this node — including one with
                                # no entry under clients: below
     rclone: false              # optional — set instead of/alongside .args to keep this
-                               # subtree off every non-owning host by default; see
+                               # node off every non-owning host by default; see
                                # "Per-client mount opt-out" below
+    access: {...}              # optional — the {group?, owner?, permissions?} object a
+                               # node itself takes, replacing this node's own grant on
+                               # every non-owning host; see "Client-side access" below
+    samba: {...}               # optional — the same share settings a node itself takes,
+                               # replacing this node's own export on every non-owning
+                               # host (and adding one where the node has none); see
+                               # "Per-host shares" below. Does not inherit — it marks
+                               # this node only, never its descendants
 
   clients:
     <hostname>:
@@ -43,18 +52,40 @@ its own, shaped exactly like any other node below it:
                                # "Every inventory host participates" below
       rclone: false            # optional per-client override of client-defaults.rclone;
                                # see "Per-client mount opt-out" below
+      access: {...}            # optional per-client override of client-defaults.access;
+                               # see "Client-side access" below
+      samba: {...}             # optional per-client override of client-defaults.samba;
+                               # `samba: false` withdraws the share on this host alone.
+                               # See "Per-host shares" below
 
   requires: [<path>, ...]      # optional — other subtrees whose mounts must be up
                                # before this one starts; tree-relative paths, a bare
                                # string accepted for one. See "Requires" below
   access: {group: <name>, owner: <name>, permissions: <rwx-string>}  # see Access below
                                # — a single object, all three optional; dotted shorthand
-                               # (access.group:/access.owner:/access.permissions:) works too
-  samba:
-    subpath: "<template>"     # e.g. "%U" for per-connecting-user substitution
+                               # (access.group:/access.owner:/access.permissions:) works too.
+                               # `permissions` also takes one level per Unix class:
+                               # {owner: rwx, group: r-x, other: "---"}
+                               # Inherits: it grants this node and everything under it,
+                               # and a descendant's own keys merge over it (see
+                               # "Access inheritance"); `<key>: null` takes one key
+                               # back, an empty `access:` the whole grant
+  samba:                       # presence marks this node for export — write it bare
+                               # (or `samba: true`/`samba: {}`) to share with the
+                               # defaults, `samba: false` to opt back out
                                # — every participating host exposes this node
                                # as a share, not just its resolved owner; see
-                               # "Samba sharing is universal" below
+                               # "Samba sharing is universal" below. The share
+                               # path is derived: a node with `user-subdirs`
+                               # gets Samba's per-user `%U`, one without serves
+                               # the node itself
+    name: "<share-name>"      # optional — the share's name in smb.conf, i.e. what
+                               # clients mount as //<host>/<name>; defaults to the
+                               # node's path with everything outside [A-Za-z0-9_-]
+                               # folded to `_` (`tree/home` → `tree_home`)
+    hidden: true               # optional — keep the share out of the host's browse
+                               # list (`browseable = no`). Not access control; the
+                               # share stays mountable by its exact name
   subdirs: {...}               # recurse — this and everything under it works exactly the
                                # same as it does at the top level, just nested
   user-subdirs: {...}          # recurse — see note below
@@ -108,7 +139,6 @@ tree:
     backups: {}
     home:
       samba:
-        subpath: "%U"
       user-subdirs:
         whitfield-media:
           access:
@@ -263,7 +293,169 @@ self-mounts via `server_subtrees`, never through this client-mount path
 at all. This applies uniformly to a top-level subtree's own peer mount
 and to any Samba descendant nested under it (see "Samba sharing is
 universal" below) — one setting governs everything a non-owning host
-would otherwise reach inside that subtree.
+would otherwise reach inside that subtree, unless a node further down
+says otherwise.
+
+#### At any depth
+
+`client-defaults`/`clients` are ordinary node keys, valid on a
+subdirectory exactly as on a top-level subtree, and a node that writes
+neither simply inherits whatever its nearest ancestor set. So a tree
+that only ever writes them at the top level behaves exactly as it always
+did — every node under a subtree gets that subtree's policy — while a
+node that does write one refines, or reverses, that policy for itself
+and everything under it, without touching its siblings.
+
+Two axes of precedence, composing the same way at every level:
+
+- **Within one node**, an explicit `clients.<hostname>` beats that same
+  node's `client-defaults` — the rule above, unchanged.
+- **Across nodes**, a nearer (deeper) node beats a more distant
+  ancestor.
+
+`rclone.args` are the exception to "nearest wins": they *accumulate*
+down the chain, every level contributing, with the nearest and most
+specific block winning any individual key conflict — so a subdirectory
+adds a couple of args to whatever its subtree already set for that
+client rather than replacing the lot.
+
+The most useful shape this buys is the allow-list idiom one level down —
+a subtree kept off every client, with a single node inside it handed to
+one host:
+
+```yaml
+research:
+  host: storage-node-alpha
+  rclone.remote: storagebox:/research
+  client-defaults:
+    rclone: false             # nothing under `research` reaches any other host...
+  subdirs:
+    published:
+      rclone.remote: storagebox:/research-published
+      clients:
+        some-storage-gadget:
+          rclone: true         # ...except this one node, on this one host
+    embargoed:
+      rclone.remote: storagebox:/research-embargoed
+```
+
+`some-storage-gadget` ends up with one mount, at `research/published`,
+peer-sourced from `storage-node-alpha` the same way a top-level client
+mount is — there's no ancestor mount left for it to reach the node
+through, so the node gets one of its own. Every other host gets nothing
+of `research` at all, and `research/embargoed` reaches nobody but
+`storage-node-alpha`.
+
+Note that "truthy means enabled" holds at every level too: a
+`clients.<hostname>.rclone.args` (or `client-defaults.rclone.args`)
+written on a node *under* an opted-out ancestor re-enables that node,
+since writing client-side mount args for it is taken to mean clients are
+meant to have it. Write `rclone: false` alongside the args if you meant
+to keep it off.
+
+#### What a nested opt-out can't do
+
+An *enabled* ancestor is a single peer-sftp mount of the owning host's
+whole copy of that node, and a subdirectory inside it is inside that one
+mount. A `rclone: false` written on that subdirectory carves no hole out
+of it — there's no such thing as unmounting part of a mount. What the
+block governs is the mounts that node gets **in its own right**:
+
+- its own separate peer mount as a Samba descendant its owning host
+  differs on (see "Samba sharing is universal" below) — the common case,
+  and the one where a nested opt-out really does remove something;
+- its own client mount as the shallowest enabled node of its branch,
+  which only exists when every ancestor is opted out.
+
+Where a node has neither, a block written on it resolves to nothing.
+That's host-dependent rather than a config error — the same node is
+typically a Samba descendant on one host and plain content inside an
+ancestor's mount on another — so nothing rejects it; it's just worth
+knowing which of the two you're writing.
+
+A `user-subdirs` descendant is never a client mount of the shallowest-
+enabled kind: its path is still `%U`-templated and fans out into one
+mount per granted user (see "`subdirs` vs `user-subdirs`" below), which
+a single client mount can't describe. It reaches a non-owning host
+through the Samba path instead, where the fan-out is resolved — and a
+client block on it governs that, exactly as on any other Samba
+descendant.
+
+### Client-side access
+
+`client-defaults`/`clients.<hostname>` also take an `access` object —
+the same `{group?, owner?, permissions?}` a node itself takes ("Access"
+below) — describing what a **non-owning** host applies to its own copy
+of the node:
+
+```yaml
+tree:
+  host: storage-node-alpha
+  rclone.remote: storagebox:/
+  subdirs:
+    home:
+      samba:
+      subdirs:
+        media-prod:
+          access.group: Media Production      # what the owner enforces
+          host: storage-node-bravo
+          rclone.remote: some-remote:/media
+          client-defaults:
+            access:                            # what every other host enforces
+              group: Media Production
+              permissions: rx
+```
+
+It becomes the `-u`/`-g`/`-p` of that host's presentation of the node
+(and, for a node that resolves to a plain directory rather than a mount,
+its ownership and mode) — real, kernel-enforced access on that host,
+applied exactly like the node's own grant is on its owner, via the same
+mechanism (spec.md §6).
+
+Three things to know about it:
+
+- **It merges over the node's own grant, key by key** — the same rule
+  an ancestor and its descendant follow down the tree ("Access
+  inheritance" below), and it composes with it: the node's grant is
+  whatever it inherited and wrote, and this is written over that. So
+  `clients.<host>.access.owner: some-service-account` hands that host's
+  copy to that account and leaves the node's group in place, which is
+  usually what naming a host-local principal was for. Between blocks,
+  nearest and most specific wins each key it sets:
+  `clients.<hostname>` over `client-defaults`, deeper node over
+  shallower. To take something back rather than add to it, write `null`
+  for that key, or `access:` with nothing in it to drop the whole grant
+  on that host — both different from writing no `access` at all, which
+  keeps whatever the copy would otherwise have carried. On a host that
+  mounts the node rather than owning it, dropping the grant means
+  *presenting* the default there, which takes a bindfs mount of its own;
+  stortree plans one ("Access inheritance" below).
+- **The owning host is never affected.** `clients`/`client-defaults`
+  only ever describe a host that doesn't own the node, so the node's own
+  `access` is what its owner enforces, always.
+- **It does change what the Samba share admits, on this host.** A
+  share's `valid users`/`write list` name the principals the filesystem
+  underneath will actually let in, so they follow the grant each host
+  enforces: the node's own on the host that owns it, the client-side one
+  everywhere it was written. With no client-side grant anywhere in a
+  share's subtree — the ordinary case — every host derives the same
+  list, exactly as before. This is what makes host-local identity work:
+  a service account that exists only on one host (a local Unix user,
+  never in LDAP) is named in that host's `valid users` and in no other,
+  where it could not be resolved. The share's *path* and the peer mounts
+  behind it are unchanged either way.
+
+Write no `access` in a client block and the copy carries the node's own
+grant, which is the whole point: a grant describes the node, so the same
+path is the same user's on every host that has it. It reached only the
+owning host until stortree presented these mounts at all — the reasoning
+was that a peer mount reports whatever the owner applied, which no mount
+in this tree has ever done. Layer 1 flattens every uid and gid to the
+mount's own, and layer 2 re-presents the result, so ownership does not
+survive the sftp boundary in either direction; what a non-owning host
+showed instead was the uniform default of whichever presentation covered
+it. A Samba share whose `valid users` named the grant's owner was a
+share that user could traverse and not read.
 
 ### Requires
 
@@ -337,7 +529,9 @@ Some details:
 Every node — top-level or nested under `subdirs`/`user-subdirs` — inherits
 `host` from its nearest ancestor unless it overrides it (a top-level node
 has no ancestor to inherit from, so it always sets its own `host`
-explicitly). `rclone` — both `remote` and `args` — is different: it
+explicitly). `access` inherits the same way, with its own rules for
+replacing and dropping an inherited grant — see "Access inheritance"
+below. `rclone` — both `remote` and `args` — is different: it
 **never** inherits, from an ancestor node or from a top-level one. A
 node's `rclone` config is used exactly as set on that node, full stop; a
 node with no `rclone.remote` of its own resolves to no remote at all,
@@ -393,12 +587,12 @@ Same map-of-`name -> node` shape, but they resolve differently:
   `user-subdirs` node are per-user folders, and the nodes listed
   (`whitfield-media`, `sys-configs`, `mw-fam`, `media-prod`) describe the
   substructure repeated inside each of those per-user folders, e.g.
-  `home/<username>/whitfield-media`, `home/<username>/sys-configs`. This
-  holds independent of `samba.subpath: "%U"` (set on `home` in the
-  example above) — that setting only templates the *Samba* path so
-  an SMB client lands in its own per-user folder, and is otherwise
-  irrelevant here; if `user-subdirs` is used without `samba.subpath`, the
-  per-user folders still have to be the immediate children of that node.
+  `home/<username>/whitfield-media`, `home/<username>/sys-configs`.
+  That shape is also what makes a `samba:` block on the same node a
+  per-user share: the Samba path picks up `%U` precisely when the node
+  has `user-subdirs` (see "Samba sharing is universal"), so an SMB
+  client lands in its own per-user folder rather than in the directory
+  holding everyone's.
   `access` on each descendant still applies per the usual rules, so
   `sys-configs` (`access.owner: jd`) only shows up inside `jd`'s own
   per-user folder, not everyone else's — an `owner` grant always pins
@@ -427,12 +621,14 @@ Same map-of-`name -> node` shape, but they resolve differently:
   which descendant triggered it changes who owns it. How that ownership
   actually gets applied depends on what's above the container: a plain
   `chown` for a genuinely local top-level subtree (`host` set, no
-  `rclone`), or a dedicated per-user mount for one nested inside a
+  `rclone`), or a **presentation mount** for one nested inside a
   remote-backed subtree like `tree` here, since a single rclone mount
   can't present two different paths under it with two different owners.
-  See spec.md §6 (`user_container_paths()`) for the mechanism, and its
-  own note there on what this means for a sibling like `mw-fam`'s bind
-  mount, which now has to wait for that per-user mount too.
+  The same mechanism applies to any node with an `access` grant and no
+  `rclone.remote` of its own, not only per-user containers. See spec.md
+  §6 ("The two layers") for the mechanism, and its own note there
+  on what this means for a sibling like `mw-fam`'s bind mount, which
+  has to wait for that presentation too.
 
 ### Access
 
@@ -453,28 +649,60 @@ access.owner: jd
 
 Both `group` and `owner` can be set at once — the node is then pinned to
 that one `owner`'s folder (see "`subdirs` vs `user-subdirs`" above), with
-`group` granting *shared* access to that same folder at the same
-`permissions` level, not a second, differently-permissioned tier. There's
-no way to express two different principals at two different permission
-levels on one node — see why below.
+`group` granting *shared* access to that same folder.
+
+`permissions` is an `rwx`-style string: any of `r`, `w` and `x`, with `-`
+for a bit not granted, so `rwx`, `r-x` and `rx` are all read the same
+way. It is **not** a numeric mode, and writing one is an error rather
+than a surprise — `permissions: 750` is an integer by the time YAML is
+done with it, and `0750` a different integer again. A typo in the
+letters is an error too (`rwz`), since the alternative is a grant
+quietly missing a bit.
+
+Written as one string it is the level for the whole grant. Written as a
+mapping it is one level per Unix class:
+
+```yaml
+access:
+  owner: jd
+  group: "Michael Whitfield Family"
+  permissions:
+    owner: rwx        # jd writes
+    group: r-x        # the family reads
+    other: "---"      # and nobody else gets even the traversal bit
+```
+
+The classes are the three a Unix mode has, named the way `access` already
+names the first two. Each one you write is enforced exactly; each one you
+leave out keeps the default it would have had (below) — including
+`other`'s traversal bit, so a mapping about the group alone does not
+quietly close the path to a grant nested deeper. That is the difference
+between the two forms: a string settles the whole mode, a mapping settles
+the classes it mentions.
+
+A node's `access` is what its *owning* host enforces. A host that only
+holds a copy of the node — a client mount, or a peer-sourced Samba
+descendant — enforces the same grant by default, and can be given a
+different one with an `access` inside `client-defaults`/`clients`; see
+"Client-side access" above.
 
 `group`/`owner` names are resolved against POSIX identities provided by
 SSSD (backed by the configured LDAP server — see `ldap.yml` below).
-`permissions` is a `rwx`-style string, applied as plain Unix ownership +
-mode (spec.md §6) — not a POSIX ACL, and there's no way to write one:
-`access` was deliberately restricted to a single object, one owner + one
-group + one shared permissions level, exactly what a remote-backed node
-can ever actually carry. A remote-backed node (directly, or peer-sourced
-from whichever host owns it) is always an rclone FUSE mount, and rclone's
-FUSE mount never implements `setxattr` — it can't carry a POSIX ACL on
-any host, full stop, so the old list-of-grants form (letting a node like
-`whitfield-media` grant two different groups two different permission
-levels) could describe configurations that were never actually
-enforceable for such a node; the schema no longer lets you write one. A
-plain local node (`sys-configs` here) gets the same treatment for
-consistency, not necessity — it could carry a real POSIX ACL, but there's
-no reason for its enforcement to work differently from a remote-backed
-sibling's.
+Everything above is applied as plain Unix ownership + mode (spec.md §6),
+which is exactly why it stops where it does: **one** owner and **one**
+group. Per-class levels need no POSIX ACL — one owner and one group at
+two different levels is what a mode has always been able to say — but a
+second group at a third level is not, and there's no way to write one.
+A remote-backed node (directly, or peer-sourced from whichever host owns
+it) is always an rclone FUSE mount, and rclone's FUSE mount never
+implements `setxattr`: it cannot carry a POSIX ACL on any host, full
+stop. The old list-of-grants form (letting a node like `whitfield-media`
+grant two different groups two different levels) could describe
+configurations that were never enforceable for such a node, so the
+schema no longer lets you write one. A plain local node (`sys-configs`
+here) gets the same treatment for consistency, not necessity — it could
+carry a real POSIX ACL, but there's no reason for its enforcement to
+work differently from a remote-backed sibling's.
 
 With neither `group` nor `owner` granted, a node gets the plain default:
 owned by the `stortree` service account with full control, group
@@ -487,10 +715,83 @@ it private to that one user instead (no group fallback); granting only a
 `group` leaves `stortree` itself with full control and gives the group
 `permissions`. That same traversal-only bit for everyone else is also
 added whenever `permissions` is left at its default rather than written
-out explicitly in config.yml — an explicit `permissions:` is enforced
-exactly as written instead. See spec.md §6 for exactly how this becomes
-real, symmetric enforcement over both Samba and SSH alike, for every node
-with any `access` at all.
+out explicitly in config.yml — an explicit `permissions:` *string* is
+enforced exactly as written instead, other bits included, while the
+per-class mapping settles `other` only if it names it. See spec.md §6
+for exactly how this becomes real, symmetric enforcement over both Samba
+and SSH alike, for every node with any `access` at all.
+
+#### Access inheritance
+
+A node with no `access` key of its own inherits its nearest ancestor's
+grant, exactly as it inherits `host`. So `access.group` written on a
+subtree's top node grants that group the subtree, not one directory:
+
+```yaml
+project-data:
+  host: storage-node-alpha
+  access.group: Media Production  # and everything below is this group's
+  subdirs:
+    footage:                      # inherits it
+      subdirs:
+        raw: {}                   # so does this
+    notes:
+      access.owner: jd            # jd's, still Media Production's group
+    readonly:
+      access.permissions: rx      # same group, narrower level
+    scratch:
+      access:                     # drops it — back to the plain default
+```
+
+Four rules, and a client block's `access` follows all four over the
+result ("Client-side access" above):
+
+- **No `access` key at all: inherit.** The whole grant, from the nearest
+  ancestor that has one. A node with no granted ancestor gets the plain
+  default, exactly as it always did.
+- **A key of its own: merge over it.** Each of `group`, `owner` and
+  `permissions` comes from the nearest ancestor that set it. `notes`
+  above names an owner and keeps `Media Production` alongside it;
+  `readonly` narrows that group's level to `rx` and keeps the group. A
+  node never has to restate the keys it isn't changing — restating them
+  is how two lines that were meant to agree drift apart later. A
+  per-class `permissions` mapping merges one level further down, class
+  by class, so a descendant can restate what the group gets and leave
+  the owner's level alone.
+- **`null` for a key: take that key back.** `access.owner: null` under a
+  granted ancestor leaves the group and drops the owner. With every key
+  merging, this is the only way to remove one.
+- **An empty `access:`: drop the whole grant.** The same thing said
+  about every key at once, and the shorthand you'll actually write.
+
+A `permissions` with nobody to apply it to is refused: on its own a
+level grants nothing, and resolves to the same empty grant as the
+`access:` that drops one — the opposite of what writing a level out
+means. So `access.permissions: rx` is right under a granted ancestor and
+an error without one, and nulling a principal while leaving its level
+behind (`access: {group: null}` under `{group: G, permissions: rx}`) is
+the same error written across two nodes.
+
+Inheriting is what makes a grant describe a subtree. Without it,
+`access.group` on a subtree's top node let that group traverse the
+directory and read nothing inside it (every node below stayed at the
+ungranted default, reachable only through the public-execute bit under
+"Access" above), which is essentially never what writing the group
+meant. It crosses a `user-subdirs` boundary like any other, so a
+per-user node under a granted ancestor now resolves against that grant
+instead of resolving to nobody.
+
+What it costs depends on which host you ask. On the host that owns the
+subtree these are real directories, so each inherited grant is one more
+`chown`. On a host that mounts the subtree, ownership is whatever the
+bindfs presentation above the path shows — and bindfs shows one owner,
+group and mode over its whole subtree — so a node that inherited its
+grant unchanged needs nothing of its own: one presentation covers every
+node beneath it, however deep. Only the nodes that say something
+*different* from the mount above them get a presentation of their own —
+`notes`, `readonly` and `scratch` in the example, and `scratch`
+precisely because "the plain default" is something to present, not the
+absence of something. See spec.md §2 for the two layers this is talking about.
 
 ### Every inventory host participates
 
@@ -509,7 +810,9 @@ owner's (`host:`'s) own copy of that subtree, provisioned by
 `stortree_peer_trust` the same way as any other peer dependency (spec.md
 §1/§7); a client never holds credentials for the subtree's remote itself.
 This applies independently to every top-level subtree — a host can own
-one, client-mount another, and be opted out of a third, all at once.
+one, client-mount another, and be opted out of a third, all at once —
+and, where a subtree's own nodes carry their own `client-defaults`/
+`clients`, independently within a subtree too ("At any depth" above).
 
 The same goes for "Samba sharing is universal" below and for cross-host
 peer dependencies (spec.md §1/§7): both apply to every inventory host
@@ -525,7 +828,10 @@ host" for the operator-facing side of this.
 
 ### Samba sharing is universal
 
-A `samba:` block marks a node for export as an SMB share. That export is
+A `samba:` block marks a node for export as an SMB share. It's the key's
+*presence* that marks it, not what's under it: `samba:` written bare,
+`samba: {}` and `samba: true` all mean "share this with the defaults".
+Only an explicit `samba: false` opts a node back out. That export is
 not limited to the node's own resolved `host` (or that host's usual peer
 dependencies, spec.md §1) — **every host in the Ansible inventory**
 exposes the share, including a host that owns no subtree of its own and
@@ -539,6 +845,227 @@ restricted to hosts that already serve some other part of the tree.
 There's no "designated Samba host": if a node has a `samba:` block, every
 inventory host — server, client-only, or entirely unnamed in
 `config.yml` — ends up serving it.
+
+Two things narrow that, both opt-in and neither changing the default:
+`stortree_samba_hosts` takes a host out of exporting anything ("What
+universality costs" below), and a `samba:` written inside a
+`client-defaults`/`clients.<hostname>` block scopes one node's share to
+the hosts it names ("Per-host shares" below). A config that writes
+neither behaves exactly as this section describes.
+
+#### What universality costs, and how to opt a host out
+
+Universality is the default and stays it, but it is not free, and the
+cost is paid per exporting host. A host that exports a share whose
+content it doesn't own peer-mounts that content over sftp from the
+owning host — so it runs its own rclone process and its own VFS cache of
+the same bytes, and a cold read traverses SMB → sftp → the owner's
+rclone → the third-party remote. Across N exporting hosts that is N
+independent caches of identical content. (This is the same duplication
+interpretation call #2 in [plan.md](plan.md) eliminated *within* a host,
+where one shared mount plus bind mounts replaced one full mount per
+group member. Across hosts the answer can't be a bind mount, so it has
+to be a choice instead.)
+
+`stortree_samba_hosts` (roles/stortree_facts/defaults/main.yml) is that
+choice: a fleet-level list, defaulting to every host, of the hosts that
+actually export shares. Narrow it in inventory or `group_vars` for a
+host that has no business serving SMB — one that is only a client of the
+tree, or one kept in the fleet purely to own a subtree others consume:
+
+```yaml
+# group_vars/all.yml
+stortree_samba_hosts:
+  - storage-node-alpha
+  - storage-node-bravo
+```
+
+An excluded host resolves no `samba_shares` **and** none of the peer
+dependencies that exist only to back them — the mount, not the smb.conf
+stanza, is what universality actually costs, so dropping only the stanza
+would save nothing. Its own client mounts are untouched: opting out of
+*exporting* the tree says nothing about wanting it locally. On the
+serving side, hosts that own that content stop provisioning SSH trust
+for mounts the excluded host will never make, because every host reads
+the same list and reaches the same conclusion.
+
+It is a fleet-level list rather than a per-host boolean deliberately.
+`resolve()` is a pure per-host function that has to reach the same
+conclusion about *other* hosts as they reach about themselves; a
+per-host variable would need `hostvars` cross-referencing to do that,
+which spec.md §1 rules out. A host removed from the list after having
+served shares gets its `smbd` stopped and disabled on the next apply
+(the package and `/etc/samba/smb.conf` are left alone) — otherwise it
+would keep exporting the last rendered config, whose share paths point
+at peer mounts that no longer resolve.
+
+#### Per-host shares
+
+`stortree_samba_hosts` above decides which hosts export *anything*. A
+`samba:` written inside a `client-defaults`/`clients.<hostname>` block
+decides which hosts export *this node* — the one way a share exists on
+some hosts and not others:
+
+```yaml
+tree:
+  host: storage-node-alpha
+  rclone.remote: storagebox:/
+  subdirs:
+    spool:
+      clients.storage-node-bravo:
+        samba:
+          name: spool
+          hidden: true
+        access.owner: nvr        # a local Unix user on bravo, not in LDAP
+```
+
+`storage-node-alpha` owns `tree/spool` and exports no share for it.
+`storage-node-bravo` exports `spool`, hidden, peer-sourcing the content
+from alpha the same way it would for any other Samba descendant. No
+other host exports it at all.
+
+The reason this exists is identity, not tidiness. A share is only usable
+where the principals it admits can be resolved, and identity is not
+always fleet-wide: an appliance's service account — a camera recorder's,
+a backup agent's — often exists as a local Unix user on the one host
+that appliance talks to, deliberately never in LDAP. Exported
+everywhere, that node's share would name a principal most hosts cannot
+resolve; exported nowhere, the host that *can* resolve it has no share
+to offer. Per-host is the only shape that is true.
+
+Four things to know about it:
+
+- **It doesn't inherit.** Unlike `rclone` and `access` in the same
+  blocks, a `samba:` marks the one node it's written on and says nothing
+  about that node's descendants — exactly as a node's own `samba:`
+  behaves. Cascading would export every descendant under a single name.
+- **The owning host never reads it.** `clients`/`client-defaults`
+  describe a host holding a *copy*; the owner holds the original. A node
+  is exported on its owner if, and only if, it carries its own `samba:`.
+- **It replaces the node's own export on that host**, rather than
+  merging with it. On a node with no `samba:` it adds a share there; on
+  one that has a `samba:` it renames or hides that host's copy, and
+  `samba: false` withdraws it there while leaving every other host's
+  intact. Within a node `clients.<hostname>` beats `client-defaults`,
+  the same precedence `rclone` and `access` follow.
+- **`valid users` follows the grant that host enforces** — see
+  "Client-side access" above. That is what lets the `nvr` grant reach
+  bravo's share and no other host's.
+
+Nothing else changes: the share path is still derived from the node
+("The share path" below), and the peer mounts behind it are provisioned
+exactly as for a universal share, on the hosts that actually export it.
+
+#### The share path
+
+Where a share points is derived from the node, not written:
+
+- a node with a `user-subdirs` key is exported at `<node>/%U` — Samba
+  expands `%U` to the connecting username, so each user lands in their
+  own folder;
+- a node without one is exported at `<node>` itself.
+
+There is no key for this. The node's shape already answers the question:
+`user-subdirs` means the node's immediate children *are* per-user
+folders, so a share of that node that didn't descend into one would be
+exposing every user's folder to every other user — over SMB, with
+nothing at apply time saying so. That was previously reachable two ways,
+by omitting the old `samba.subpath` key or by misspelling it, and is now
+unreachable.
+
+It's the key's *presence* that decides, exactly as with `samba:` itself.
+`user-subdirs: {}` and a bare `user-subdirs:` declare no substructure
+yet, but they still say the node has a per-user level — reading them as
+"not per-user" would mean emptying a node's `user-subdirs` silently
+widens its share from one user's own folder to the directory holding
+everyone's.
+
+`%U` also earns each connecting user a standing entry in the share's
+`valid users`, so their access to their own folder doesn't depend on any
+particular descendant carrying an `access` grant.
+
+A config that still writes `samba.subpath` fails with a message saying
+so — it was a real key once, so it's rejected specifically rather than
+as a typo. Delete the line; the derived value is the one it was almost
+certainly setting.
+
+#### Share names
+
+The share's name — its `smb.conf` section header, and what a client
+mounts as `//<host>/<name>` — is derived from the node's path by default,
+with every character outside `A-Za-z0-9_-` folded to `_`: `tree/home` is
+exported as `tree_home`. `samba.name` overrides that, on the node
+carrying the `samba:` block:
+
+```yaml
+tree:
+  subdirs:
+    home:
+      samba:
+        name: home
+```
+
+An explicit name is held to that same alphabet rather than sanitized
+silently — a name is what operators type into a mount command, so a
+`samba.name` that wouldn't survive the fold is a mistake worth reporting
+rather than quietly rewriting — and the three names `smb.conf` gives its
+own meaning (`global`, `homes`, `printers`) are rejected outright: a
+share named `global` would merge into the generated `[global]` block and
+rewrite fleet-wide settings instead of adding a share.
+
+Names have to be unique, however they were arrived at: two nodes landing
+on one name — two `samba.name`s written the same, or two paths folding
+together (`tree/a b` and `tree/a_b`) — fail the run, because `smb.conf`
+would otherwise keep the first stanza and drop the second, leaving part
+of the tree silently unreachable over SMB. The name changes nothing
+else: the share's path, its `valid users`/`write list`, and the peer
+mounts behind it are all still derived from the node's real path.
+
+Uniqueness is checked per host, since a host's own `smb.conf` is the
+file that either can or can't hold both stanzas. Two nodes whose own
+`samba:` blocks collide are caught tree-wide, with no host named — they
+collide everywhere. A collision that only a per-host share creates ("Per-host
+shares" below) names the host whose file couldn't have held both. Either
+way it fails the run on *every* host, not only the one it would bite, so
+an apply limited to one host still reports it.
+
+### Unknown keys are an error
+
+Every key in a node is either one this schema defines or a mistake, and
+`resolve()` treats it as the latter: an unrecognized key anywhere in the
+tree — at the node level, or inside `rclone:`, `access:`, `samba:`,
+`client-defaults:` or a `clients:` entry (including the `rclone:`/
+`access:`/`samba:` objects nested in those) — fails the run, naming the node it's
+on and, where there's a near match, the key it's probably meant to be.
+
+This matters more here than the usual argument for strictness, because
+the schema has no key whose absence is loud. A misspelled
+`rclone.remote` leaves the node a plain directory and the share on top
+of it serving an empty path; a misspelled `client-defaults` re-enables a
+subtree that was meant to stay off every other host, and provisions the
+SSH trust to go with it; a misspelled `subdirs` drops a whole subtree; a
+misspelled `access.group` drops the grant and leaves the path at its
+permissive default. All four resolve to something plausible, and none of
+them announce themselves at apply time.
+
+A rejected key is sometimes a setting that is real but belongs
+elsewhere. This file describes the *tree* — what exists, who owns it,
+who may read it — and `resolve()` is a pure per-host function whose
+conclusions about a host must match the ones that host reaches about
+itself. Operational policy that no other host depends on is not that,
+and lives in ordinary Ansible inventory instead: `stortree_samba_hosts`
+(above), the Samba `[global]` overrides in
+[runbook.md](runbook.md#changing-sambas-global-settings-eg-workgroup),
+and whether a host publishes rclone metrics
+([runbook.md](runbook.md) "Publishing rclone metrics"). See
+`inventory/group_vars/all.yml.example`.
+
+One consequence worth knowing: dotted shorthand splits on the *last* dot
+only (see below), so a three-segment key like
+`rclone.args.vfs-cache-mode:` expands to a key literally named
+`rclone.args`, which is not in the schema and is therefore rejected.
+Write it as `rclone.args: {vfs-cache-mode: ...}` or as a nested
+`rclone:` block.
 
 ### A dotted-path map key
 
@@ -555,6 +1082,52 @@ etc suffix — is different: it's a single literal key (this codebase's
 hidden-subtree naming convention, matching `.cache`'s own leading dot),
 not a two-segment shorthand with an empty first segment. It's left
 untouched rather than being expanded into `{"": {"bravo-cache": {...}}}`.
+
+## Names and identity
+
+Three things in a running fleet are named after a node's path, and all
+three use a *different* scheme. They look similar enough to be mistaken
+for one another when read side by side in a rendered file, so this is
+what each one is and why it isn't the others.
+
+| Name | Looks like | Escaping | On collision |
+| --- | --- | --- | --- |
+| systemd unit slug | `stortree-mount@tree-home-jd.service` | `\xHH` per segment | rejected |
+| rclone peer section | `[peer-storage-node-alpha-tree-home]` | none | rejected across hosts |
+| Samba share name | `[tree_home]` | fold to `_` | rejected |
+
+**systemd unit slugs** flatten `tree/home/jd` to `tree-home-jd` and are
+what `stortree-remote@`, `stortree-mount@` and `stortree-bind@` are
+instantiated with. Because a path segment may itself contain `-`, each
+segment is escaped on its own before the `-` join, in the same `\xHH`
+convention `systemd-escape` uses: a directory literally named
+`backups-mirror` becomes `backups\x2dmirror`, so it can't collide with
+nested `backups/mirror`. That makes the scheme injective — two paths
+cannot produce one unit name — and it is why unit names in
+`/etc/systemd/system` sometimes read oddly. Two mounts landing on one
+slug is still checked for and still fails the run, as a backstop.
+
+**rclone peer section names** flatten the same way and are deliberately
+*not* escaped, because they can't be: an rclone remote name may hold
+only letters, digits, `_`, `-`, `.` and space, so `\xHH` isn't
+available, and every readable alternative mangles ordinary names. The
+name stays legible instead — it's a string you read straight out of a
+rendered `rclone.conf` when a peer mount misbehaves — and the residual
+ambiguity is detected rather than encoded away. See "Peer section names"
+for the collision rule, which is narrower than the other two: only a
+collision between *different* owning hosts is an error.
+
+**Samba share names** don't escape either; they fold every character
+outside `A-Za-z0-9_-` to `_`, because that's the alphabet an operator
+types into a mount command. Unlike the other two, this one is
+overridable — `samba.name` on the node — and unlike the other two the
+name is a piece of config rather than purely derived. See "Share names".
+
+The common thread: a derived name that can't be made both injective and
+readable is made readable, and the collision is reported with both
+paths named rather than resolved silently. What differs is only how much
+room each target format leaves — systemd allows escapes, so slugs use
+them; rclone and Samba don't, so those two detect instead.
 
 ## ldap.yml
 
@@ -621,7 +1194,31 @@ nothing to translate between the two. Lives on the control node as the
 master copy with every remote's credentials, encrypted at rest with
 `ansible-vault` (`ansible-vault encrypt stortree/rclone.conf`) the same
 way as `ldap.yml`. A host only ever receives the filtered sections it's
-resolved to need (see spec.md §3), never the whole file.
+resolved to need (see spec.md §3), never the whole file. "Resolved to
+need" means the remotes that host *mounts with itself*: the ones behind
+subtrees it owns, plus any a `clients:` block hands it directly. A remote
+behind a subtree it doesn't own never reaches it, even though it exports
+that subtree over Samba — it peer-sources the owning host instead.
+
+### Peer section names
+
+Alongside the filtered real sections, each host's rendered `rclone.conf`
+gets one synthesized `sftp` section per peer dependency, named
+`peer-<owning host>-<path with "/" replaced by "-">` — e.g.
+`[peer-storage-node-alpha-tree-home-jd-sys-configs]`. Nothing in
+`config.yml` sets these names; they're derived, and they're what a mount
+unit's `ExecStart` references, so they're worth recognizing when reading
+a rendered file.
+
+Because that flattening is lossy, two entries can in principle land on
+one name — a hostname containing `-`, or a path segment containing one,
+can reconstruct another entry's name. Where both belong to the *same*
+owning host that's harmless (the section carries only that host's
+address and key, and each mount's real path travels in its own
+`remote:path` reference). Where they belong to *different* hosts it
+would silently point one mount at the wrong machine, so rendering the
+host's `rclone.conf` fails outright and names both paths — rename one of
+them, the same remedy as a duplicate `samba.name` (see "Share names").
 
 ```ini
 [storagebox]

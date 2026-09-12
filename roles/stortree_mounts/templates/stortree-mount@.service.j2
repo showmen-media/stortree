@@ -1,85 +1,111 @@
 {#
-Same nested-descendant-vs-wrapper-mount preference as
-stortree-bind@.service.j2 (see its own comment) -- a descendant with its
-own separate rclone.remote (not just a per-user bind-mount fan-out) can
-also sit directly under a per-user container that got its own wrapper
-mount, in which case this entry now nests inside that wrapper's own
-presented tree, not directly inside whatever plan_mounts() itself
-computed as entry.requires_slug.
+Layer 2, presentation: a bindfs mount that re-presents one node's raw
+content from the remotes root at the node's own path in the visible
+tree, under the owner, group and mode its `access` grant resolved to.
+See docs/spec.md §2 "The two layers".
+
+Source and target are the same directory on the backend reached by two
+different local paths, which is why this needs no data movement and
+cannot self-mount. It caches nothing, so every byte and every listing
+still comes from the transport underneath.
 #}
-{% set container_path = entry.local_path.rsplit('/', 1)[0] if '/' in entry.local_path else '' %}
-{% set wrapper = (stortree_user_containers | selectattr('local_path', 'equalto', container_path) | selectattr('requires_slug') | list) if container_path else [] %}
 [Unit]
-Description=rclone mount %i (managed by stortree, do not edit by hand)
-After=network-online.target
-Wants=network-online.target
+Description=stortree presentation mount %i (managed by stortree, do not edit by hand)
 {#
-PartOf= alongside every containment dependency below: this mount's own
-mountpoint lives *inside* that other mount's presented tree, so when it
-restarts, this mount is silently detached -- the rclone process keeps
-running and systemd keeps reporting the unit active, while the path it
-was serving quietly reverts to whatever sits underneath. After=/Requires=
-don't help: they propagate start ordering and stop, never restart.
-PartOf= is the one that does, so a parent remount takes its nested mounts
-with it and they come back in After= order. Deliberately not applied to
-declared `requires` below -- that's a sibling dependency (a cache
-directory), not a tree this mount's own path lives inside, and a cache
-blip shouldn't take a whole shared subtree down with it.
+Two containment edges, PartOf= on both. A remount of either underlying
+mount detaches this one while leaving the bindfs process alive and the
+unit reporting active -- observed in production on the wrapper mounts
+this replaces, where one of four survived an outer remount as a live
+process with no mount behind it, so the next apply's `state: started`
+was a no-op and that user's folder sat at the bare directory underneath
+while the other three were correct. After=/Requires= don't help: they
+propagate start ordering and stop, never restart.
 #}
-{% if wrapper %}
-After=stortree-user-mount@{{ wrapper[0].slug }}.service
-PartOf=stortree-user-mount@{{ wrapper[0].slug }}.service
-RequiresMountsFor={{ stortree_root }}/{{ container_path }}
-{% elif entry.requires_slug %}
-After=stortree-mount@{{ entry.requires_slug }}.service
-PartOf=stortree-mount@{{ entry.requires_slug }}.service
-RequiresMountsFor={{ stortree_root }}/{{ entry.local_path }}
+{% if entry.transport_slug %}
+After=stortree-remote@{{ entry.transport_slug }}.service
+Requires=stortree-remote@{{ entry.transport_slug }}.service
+PartOf=stortree-remote@{{ entry.transport_slug }}.service
+RequiresMountsFor={{ stortree_remotes_root }}/{{ entry.local_path }}
 {% endif %}
 {#
-Declared `requires` (docs/config-schema.md "Requires"), on top of
-whatever nesting already implied above -- a dependency the tree's shape
-can't express, most often a cache-dir pointing into a sibling top-level
-subtree's mount. Hard, not just ordered: without Requires= this mount
-would still start when its dependency is down, and rclone would then
-quietly fill the local disk at a path that gets shadowed the moment the
-real mount arrives -- exactly the failure the declaration exists to
-prevent.
+The nearest presentation above this one, if any -- it is what puts this
+mount's own mountpoint on screen, so it has to be up first. Found by
+searching for the deepest presented ancestor rather than by looking at
+the immediate parent: a granted node can sit several levels above the
+thing nested inside it.
 #}
-{% for req in entry.requires_mounts | default([]) %}
-After=stortree-mount@{{ req.slug }}.service
-Requires=stortree-mount@{{ req.slug }}.service
-RequiresMountsFor={{ stortree_root }}/{{ req.local_path }}
-{% endfor %}
+{% if entry.requires_slug %}
+After=stortree-mount@{{ entry.requires_slug }}.service
+PartOf=stortree-mount@{{ entry.requires_slug }}.service
+RequiresMountsFor={{ stortree_root }}/{{ entry.requires_slug_path }}
+{% endif %}
 
 [Service]
-Type=notify
+{#
+Type=forking, not the Type=notify the transport units use: bindfs is a
+libfuse program and libfuse has no sd_notify support, so there is no
+readiness protocol to wait on. Forking is not a downgrade here --
+libfuse calls fuse_daemonize() only *after* the mount syscall has
+succeeded, so the parent exiting is itself the readiness signal, and
+systemd holds ordering until it does. Verified on this fleet: the
+mountpoint is already in /proc/self/mountinfo by the time `systemctl
+start` returns.
+
+Type=simple with -f would start the unit before the mount exists and
+silently break every RequiresMountsFor= above it.
+#}
+Type=forking
 User={{ stortree_user }}
 Group={{ stortree_group }}
 {% set access = entry.access | default({}) %}
-{% set granted = access.owner is defined or access.group is defined %}
-{% set has_nested_children = entry.slug in stortree_mounts_parent_slugs %}
-{% set mount_path = (stortree_root ~ '/' ~ entry.local_path) if entry.local_path else stortree_root %}
-ExecStart=/usr/bin/rclone mount {{ entry.remote }} {{ mount_path }} \
-{% for k, v in entry.args.items() %}
-  --{{ k }}{{ ' ' ~ (v | string) if (v is not sameas true) else '' }} \
-{% endfor %}
-{% if granted or has_nested_children %}
-  --allow-other \
-  --dir-perms {{ access | stortree_access_mode }} \
-  --file-perms {{ access | stortree_access_mode }} \
-{% if access.owner is defined %}
-  --uid {{ stortree_user_uids[access.owner] }} \
-{% elif has_nested_children %}
-  --uid {{ stortree_uid }} \
-{% endif %}
-{% if access.group is defined %}
-  --gid {{ stortree_group_gids[access.group] }} \
-{% elif has_nested_children %}
-  --gid {{ stortree_gid }} \
-{% endif %}
-{% endif %}
-  --config {{ stortree_etc }}/rclone.conf
-ExecStop=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do mountpoint -q "{{ mount_path }}" || exit 0; /bin/fusermount -uz "{{ mount_path }}" || exit 0; done'
+{#
+-p takes chmod-style specs, not rclone's two separate --dir-perms and
+--file-perms, so stortree_bindfs_perms() hands over the *file* mode
+followed by `+X` for the classes whose execute bit belongs on
+directories only. Passing access_mode() straight through would mark
+every regular file in the subtree executable.
+
+--mirror is what lets a granted node contain anything else. Without it
+this mount presents its path as the granted owner to everyone,
+`stortree` included, and fusermount then refuses every nested mount
+underneath it -- a descendant's own presentation, or a transport
+mountpoint -- with "user has no write access to mountpoint", because the
+mounting account no longer appears to own the path it is mounting on.
+Verified on this fleet, both directions.
+
+The tree's previous answer was to force any mount with nested children
+to stortree:stortree outright and discard its grant, which is exactly
+the bug this whole layer exists to fix, so it could not be the answer
+here. --mirror keeps the grant real for every actual user and lets only
+the service account -- which already owns the raw content underneath,
+and already drives this mount -- see itself as owner.
+
+--chown-ignore/--chgrp-ignore/--chmod-ignore make this layer
+presentation-only: ownership and mode are what stortree resolved, and an
+in-tree chown or chmod fails silently rather than reaching the transport
+underneath, where it could not have persisted anyway. All three are
+needed -- chown and chgrp are separate policies in bindfs and
+--chown-ignore alone still lets a chgrp through. Samba with
+`inherit permissions = yes` will attempt these.
+
+`nonempty` is required, not defensive: Debian's bindfs links libfuse2,
+which refuses a non-empty mountpoint outright, and a presented node's
+mountpoint is routinely non-empty -- the per-user bind mountpoints sit
+inside it, and the transport below has already populated it. rclone
+mounted over that silently; libfuse2 will not. libfuse3 dropped the
+check and ignores the option, so this stays correct if the package is
+ever relinked.
+#}
+ExecStart=/usr/bin/bindfs {{ stortree_remotes_root }}/{{ entry.local_path }} {{ stortree_root }}/{{ entry.local_path }} \
+  -u {{ stortree_user_uids[access.owner] if access.owner is defined else stortree_uid }} \
+  -g {{ stortree_group_gids[access.group] if access.group is defined else stortree_gid }} \
+  -p {{ access | stortree_bindfs_perms }} \
+  --mirror={{ stortree_user }} \
+  -o allow_other,nonempty \
+  --chown-ignore \
+  --chgrp-ignore \
+  --chmod-ignore
+ExecStop=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do mountpoint -q "{{ stortree_root }}/{{ entry.local_path }}" || exit 0; /bin/fusermount -uz "{{ stortree_root }}/{{ entry.local_path }}" || exit 0; done'
 Restart=on-failure
 RestartSec=5
 

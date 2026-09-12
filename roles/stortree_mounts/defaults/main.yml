@@ -1,0 +1,26 @@
+---
+# Whether a directory this role was supposed to create, but which still
+# doesn't exist once the apply is otherwise finished, fails the play.
+#
+# Every directory-creation task in this role is `ignore_errors: true`,
+# for a reason that is real and load-bearing -- a stale mount must not
+# abort the play before the render/restart step that would fix it ever
+# runs (see tasks/main.yml's header). The cost of that is a run which
+# reports success whether the directories were created or not, so a
+# genuine failure (a full disk, a permission bug, a backend rejecting a
+# write) looks exactly like the transient it was meant to tolerate. The
+# verification step at the end of tasks/main.yml closes that: it re-stats
+# every path the plan expected and always *reports* what's still
+# missing, and this variable decides whether it also fails.
+#
+# Default false, because "missing on this apply" is not by itself an
+# error: a brand-new nested entry legitimately needs two runs (its own
+# parent mount has to exist and be reachable before anything can be
+# created inside it), and failing the first would break the documented
+# two-run pattern rather than catch a bug.
+#
+# Set it true where a *converged* fleet is the expectation and a second
+# apply should be clean -- CI, a post-deploy gate, or an operator's own
+# re-run after adding entries. There, a still-missing path is a real
+# failure and should stop the run rather than scroll past.
+stortree_mounts_strict: false

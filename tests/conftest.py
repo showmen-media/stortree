@@ -22,7 +22,6 @@ from filter_plugins.stortree import (  # noqa: E402  (needs sys.path above)
     FilterModule,
     plan_mounts,
     resolve,
-    user_container_paths,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -33,7 +32,7 @@ EXAMPLE_HOSTS = ["storage-node-alpha", "storage-node-bravo", "some-storage-gadge
 
 # What `getent group` returns on a host for the worked example's groups
 # -- resolve() is pure and never sees this, but everything downstream of
-# it (plan_mounts, user_container_paths, the templates) does.
+# it (plan_mounts, the templates) does.
 EXAMPLE_GROUP_MEMBERS = {
     "Whitfield Family & Friends": ["jd", "mw"],
     "Michael Whitfield Family": ["mw"],
@@ -47,6 +46,7 @@ EXAMPLE_GROUP_MEMBERS = {
 COMMON_VARS = {
     "stortree_root": "/srv/stortree",
     "stortree_etc": "/etc/stortree",
+    "stortree_remotes_root": "/srv/.stortree-remotes",
     "stortree_user": "stortree",
     "stortree_group": "stortree",
     "stortree_uid": 900,
@@ -140,20 +140,8 @@ def mount_plans(resolved):
 
 
 @pytest.fixture(scope="session")
-def containers(resolved, mount_plans):
-    """{hostname: user_container_paths(...)} -- stortree_user_containers."""
-    return {
-        h: user_container_paths(r, EXAMPLE_GROUP_MEMBERS, mount_plans[h])
-        for h, r in resolved.items()
-    }
+def containers(mount_plans):
+    """Kept as a fixture name because many tests take it; the plan is
+    now the single list, so this is just an alias for it."""
+    return mount_plans
 
-
-@pytest.fixture(scope="session")
-def parent_slugs(mount_plans):
-    """{hostname: stortree_mounts_parent_slugs} -- the set
-    roles/stortree_mounts/tasks/main.yml derives to decide which mounts
-    must force --uid/--gid/--allow-other regardless of their own grant."""
-    return {
-        h: sorted({e["requires_slug"] for e in plan if e["requires_slug"]})
-        for h, plan in mount_plans.items()
-    }

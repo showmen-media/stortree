@@ -1,0 +1,64 @@
+---
+# Fleet-wide operator settings. Ordinary Ansible group_vars -- nothing
+# here describes the *tree* (that's stortree/config.yml, and it is
+# resolved by a pure function that must reach the same conclusions on
+# every host); this is local operational policy, which is why it lives
+# in inventory instead.
+#
+# Copy to inventory/group_vars/all.yml and edit. Precedence runs
+# role defaults < this file < group_vars/<group>.yml <
+# host_vars/<host>.yml, so a setting here is the fleet default and any
+# of the narrower files overrides it for a subset. See
+# inventory/host_vars/storage-node-alpha.yml.example.
+
+# -- rclone metrics (docs/runbook.md "Publishing rclone metrics") ---------
+
+# Off by default; this is the fleet-wide switch. Every rclone mount then
+# publishes OpenMetrics/Prometheus counters on a port of its own -- one
+# endpoint per mount, because an rclone metrics server only ever reports
+# the process it runs in.
+stortree_metrics_enabled: true
+
+# Where those endpoints listen. Addresses, interface names, or both;
+# interface names are resolved against each host's own facts, so the
+# same name can mean a different address on every host.
+#
+# There is no firewall role in this repo: this list is the access
+# control. Loopback-only (the default) means a scraper reaches these
+# through an SSH tunnel, or through an agent running on the host.
+stortree_metrics_bind:
+  - 127.0.0.1
+  # - wg0
+
+# Ports are derived from each node's path within [base, base + span), so
+# they stay put when an unrelated part of config.yml changes. Narrow the
+# span if you would rather firewall a smaller range -- the derivation
+# collides more often as it shrinks, and a collision fails the apply
+# with both paths named rather than leaving a mount unable to start.
+# stortree_metrics_base_port: 20000
+# stortree_metrics_port_span: 10000
+
+# Pin one node's port, by tree path, to resolve a reported collision or
+# to match a firewall rule that already exists.
+# stortree_metrics_port_overrides:
+#   tree/home: 20500
+
+# `auto` reads `rclone version` on each host and picks: --metrics-addr
+# on 1.68 and newer, the older --rc --rc-enable-metrics below that
+# (Debian bookworm ships 1.60.1). Force one with "metrics-addr" or "rc"
+# if you would rather a mismatch fail loudly than be worked around.
+# stortree_metrics_flavour: auto
+
+# Mandatory for the `rc` flavour, loopback included: that endpoint
+# serves config/dump, which reads back the host's scoped rclone.conf and
+# every backend credential in it. stortree does not create this file --
+# put it on the host the way you manage other secrets, readable by the
+# stortree service account.
+# stortree_metrics_htpasswd: /etc/stortree/metrics.htpasswd
+
+# -- Samba -----------------------------------------------------------------
+
+# Merged over stortree's own built-in globals; see docs/runbook.md
+# "Changing Samba's [global] settings".
+# stortree_samba_globals:
+#   workgroup: EXAMPLE

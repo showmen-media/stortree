@@ -1,46 +1,40 @@
 {#
-Nested descendant vs. its own container's wrapper mount: this entry's
-local_path (e.g. tree/home/jd/mw-fam) sits one level under a per-user
-container (tree/home/jd). If that container has requires_slug set (it
-nests inside a remote-backed mount, so stortree_mounts rendered it a
-wrapper mount, stortree-user-mount@.service.j2), this entry now nests
-*inside* that wrapper mount's own presented tree instead of directly
-inside whatever plan_mounts() itself computed as entry.requires_slug --
-the wrapper mount must come first. A container with no wrapper mount
-(plain local, chowned directly) leaves entry.requires_slug exactly as
-plan_mounts() computed it.
-#}
-{% set container_path = entry.local_path.rsplit('/', 1)[0] %}
-{% set wrapper = stortree_user_containers | selectattr('local_path', 'equalto', container_path) | selectattr('requires_slug') | list %}
-{#
-PartOf= on every mount this bind depends on, for the same reason as
-stortree-mount@.service.j2 (see its own comment) -- and a bind mount is
-the worst-affected of the three: `Type=oneshot` + `RemainAfterExit=yes`
-means the unit reports active forever once its ExecStart succeeded, with
-nothing left running to notice its mount went away. Both edges below can
-take it out. The *source* is a mount whose tree this binds from, so
-remounting it leaves this bind pointing at a detached one; the
-*container* is a mount whose tree this bind's own mountpoint lives in,
-so remounting that detaches the bind outright. Either way the path
-reverts to the empty directory underneath, silently, until something
-restarts this unit -- which nothing ever did, because as far as systemd
-was concerned it never stopped.
+A per-user fan-out of one layer-2 presentation: `mount --bind` from the
+node the group grant actually resolved to (entry.symlink_target, still
+named for the symlink this used to be -- see plan_mounts() for why a
+real symlink can't work here) onto each member's own path inside their
+container.
+
+Binding the *presented* path, not the transport underneath it, is
+deliberate: the presentation is where the group ownership lives, and a
+bind of it is the same filesystem at a second location, so each member
+sees the grant exactly as the shared mount presents it.
 #}
 [Unit]
 Description=stortree per-user bind mount %i (managed by stortree, do not edit by hand)
+{#
+PartOf= on every mount this bind depends on, for the same reason as
+stortree-mount@.service.j2 -- and a bind mount is the worst-affected of
+the three: `Type=oneshot` + `RemainAfterExit=yes` means the unit reports
+active forever once its ExecStart succeeded, with nothing left running
+to notice its mount went away. Both edges below can take it out. The
+*source* is the presentation this binds from, so remounting it leaves
+this bind pointing at a detached tree; the *container* is the
+presentation this bind's own mountpoint lives inside, so remounting that
+detaches the bind outright. Either way the path reverts to the empty
+directory underneath, silently, until something restarts this unit --
+which nothing ever did, because as far as systemd was concerned it never
+stopped.
+#}
 After=stortree-mount@{{ entry.symlink_target | stortree_slug }}.service
 Requires=stortree-mount@{{ entry.symlink_target | stortree_slug }}.service
 PartOf=stortree-mount@{{ entry.symlink_target | stortree_slug }}.service
 RequiresMountsFor={{ stortree_root }}/{{ entry.symlink_target }}
-{% if wrapper %}
-After=stortree-user-mount@{{ wrapper[0].slug }}.service
-Requires=stortree-user-mount@{{ wrapper[0].slug }}.service
-PartOf=stortree-user-mount@{{ wrapper[0].slug }}.service
-RequiresMountsFor={{ stortree_root }}/{{ container_path }}
-{% elif entry.requires_slug %}
+{% if entry.requires_slug %}
 After=stortree-mount@{{ entry.requires_slug }}.service
+Requires=stortree-mount@{{ entry.requires_slug }}.service
 PartOf=stortree-mount@{{ entry.requires_slug }}.service
-RequiresMountsFor={{ stortree_root }}/{{ entry.local_path }}
+RequiresMountsFor={{ stortree_root }}/{{ entry.requires_slug_path }}
 {% endif %}
 
 [Service]

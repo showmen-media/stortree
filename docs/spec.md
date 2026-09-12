@@ -1,4 +1,10 @@
-# stortree — development plan
+# stortree — specification
+
+What stortree is and how it behaves: the design the roles and
+`filter_plugins/stortree.py` implement, section by section. It says what
+the system does, not how it got built — [plan.md](plan.md) is the build
+plan, and the `§N` references throughout this repo point at the
+Architecture sections below.
 
 ## Goal
 
@@ -24,6 +30,8 @@ project is a set of roles, a filter plugin, and a playbook.
 inventory/
   hosts.yml          # storage hosts + connection vars, ordinary Ansible inventory
                      # — every host here participates (§1), named in config.yml or not
+  group_vars/        # optional: fleet-wide operator settings (Samba globals, metrics)
+  host_vars/         # optional: the same, narrowed to one host
 stortree/
   config.yml         # the directory tree: hosts, clients, subdirs, access grants (non-secret)
   ldap.yml           # LDAP server connection + group/POSIX mapping (vaulted)
@@ -44,6 +52,9 @@ roles/
 playbooks/
   site.yml           # the only entrypoint: apply the whole tree to every host
   status.yml         # read-only facts/report play
+  metrics-targets.yml  # read-only: collect each host's metrics endpoints (§8)
+prometheus/
+  prometheus.yml.example  # scrape config for the list that playbook generates
 docs/config-schema.md
 ```
 
@@ -102,11 +113,14 @@ filter directly:
   `access` rules. A node with no `rclone.remote` of its own resolves with
   no remote at all — it's a plain directory that has to exist, not a
   separate rclone mount; §2 covers what that means for mount planning.
-- **Client mounts** — one per top-level subtree in `config.yml` (every
-  key at the file's own top level, config-schema.md "Top-level
+- **Client mounts** — normally one per top-level subtree in `config.yml`
+  (every key at the file's own top level, config-schema.md "Top-level
   subtrees") that this host doesn't own: a peer-sftp mount sourced from
   the host that actually owns it (that subtree's own `host:`) rather
-  than the subtree's own third-party `rclone.remote`. This is the same
+  than the subtree's own third-party `rclone.remote`. Where a subtree is
+  opted out for this host but something inside it isn't, the mount lands
+  on the nodes inside it instead — see the nested `client-defaults`/
+  `clients` rule below. This is the same
   peer-sourcing rule §1 already applies to any samba descendant a host
   doesn't own, just generalized to every top-level subtree instead of
   being funneled through one shared tree root — there's no single
@@ -126,15 +140,43 @@ filter directly:
   host by default — out of mounting it at all (config-schema.md
   "Per-client mount opt-out"); this is the mechanism a subtree with no
   business being visible past its own owning host (e.g. a per-host
-  VFS-cache backing store) uses to stay local-only. A subtree with no
-  `rclone.remote` of its own has nothing to peer for — the client still
-  gets its local directory created, just no mount and no peer dependency
-  for it. Unlike a samba peer dependency, this one implies no Samba
+  VFS-cache backing store) uses to stay local-only. Both keys are
+  ordinary node keys rather than a top-level-subtree privilege: a node
+  at any depth can carry its own, refining (or reversing) what its
+  ancestors set for that host, for itself and everything under it
+  (config-schema.md "At any depth"). Where every ancestor of a node is
+  opted out and the node itself isn't, there's no ancestor mount left to
+  reach it through, so the client mount lands at that node's own path,
+  peer-sourced from its own resolved owner — the shallowest enabled node
+  of each branch, which for a tree that writes these keys only at the
+  top level is always the top-level subtree itself, exactly as before.
+  Either kind of block may also carry an `access` object, replacing the
+  node's own grant on every host that only holds a copy of it
+  (config-schema.md "Client-side access", §6). Whether the owning
+  host's own copy is remote-backed makes no difference: a peer mount is
+  sftp to that host's *filesystem path*, which exists just as much when
+  the content simply lives on its disk, or arrives there over a mount
+  stortree knows nothing about, as when rclone puts it there. The only
+  way to keep a subtree off its non-owning hosts is the explicit
+  `client-defaults`/`clients.<host>` opt-out. Unlike a samba peer
+  dependency, this one implies no Samba
   behavior of its own — it exists purely so a client's local tree has
   real content — but it does mean a non-owning host now needs
   `stortree_peer_trust` (§7) to reach whichever host owns each top-level
   subtree it client-mounts, which the role already handles the same way
   as any other peer dependency.
+- **Client grants** — every node *inside* something this host mounts
+  without owning it, whose own `access` (or an ancestor's
+  `client-defaults`/`clients` block, config-schema.md "Client-side
+  access") this host therefore has to apply to its own copy. A grant
+  describes the node, not one host's copy of it, so it holds everywhere
+  the node does; the entry exists because nothing else in the resolved
+  set names such a node, and without one its grant would reach only the
+  host that owns it. §6 covers the mechanism, which for a path inside a
+  mount can only be a presentation. Never a node this host owns (already
+  a server subtree), never a `user-subdirs` node (still `%U`-templated,
+  and it fans out instead), and never anything under a subtree a client
+  policy opted this host out of — nothing is presented there to grant.
 - **Samba shares** — every node anywhere in the tree that carries a
   `samba:` block, resolved for *every* host in `all_hosts`, not just the
   node's own resolved `host` or hosts named anywhere in `config.yml`. A
@@ -157,7 +199,7 @@ subtree's local path — see the `cache-dir` fields in the example config in
 whatever its own value resolves to is passed to `rclone mount` exactly as
 written, never combined with the node's position in the tree, and never
 inherited from an ancestor (`rclone` — both `remote` and `args` — is
-never inherited; only `host` is). See "Node inheritance" and
+never inherited; `host` and `access` are). See "Node inheritance" and
 "`rclone.remote` is verbatim" in
 [docs/config-schema.md](config-schema.md) for the full rule and what a
 node with no `rclone.remote` of its own resolves to instead.
@@ -225,22 +267,28 @@ rather than tree inheritance:
 - **Client-mount role**: `client-defaults.rclone.args` sets the defaults
   applied to every peer that mounts this host's remote, then
   `clients.<host>.rclone.args` merges its own overrides on top for that
-  specific peer. This is the one intentional merge chain, exactly two
-  levels deep (defaults, then a single per-client override) — later
-  entries win on key conflicts.
+  specific peer. This is the one intentional merge chain — later entries
+  win on key conflicts — and the one place args accumulate down the tree
+  rather than being read off a single node: a `client-defaults`/`clients`
+  block on a nested node contributes on top of whatever its ancestors'
+  blocks already set for that host, nearest and most specific winning
+  (config-schema.md "At any depth"). It stays a client-side merge chain
+  and nothing more; a node's own `rclone.args`, below, are untouched by
+  it.
 - **Server role**: a subdir node's `rclone.remote`/`rclone.args` are used
   exactly as set on that node, full stop — never merged with, substituted
   from, or inherited from any ancestor or descendant subdir's `rclone`. A
   node without its own `rclone` resolves to no remote and no args at all,
   even if an ancestor sets some; a node's own `rclone`, once set, isn't
-  affected by what its children set either. `host` still inherits down
-  the tree as usual (Node inheritance, config-schema.md) — `rclone` is the
-  one field, at every level, that's exempt.
+  affected by what its children set either. `host` and `access` still
+  inherit down the tree as usual (Node inheritance and Access
+  inheritance, config-schema.md) — `rclone` is the one field, at every
+  level, that's exempt.
 
 ### 2. Mount management (rclone)
 
 The `stortree_mounts` role flattens `stortree_facts`' resolved server
-subtrees, client mount, and peer dependencies into one plan
+subtrees, client mount, peer dependencies and client grants into one plan
 (`stortree_plan_mounts`) and, for every entry that actually has a
 `remote` (§1 — a server-subtree node with no `rclone.remote` of its own
 resolves with none, since `rclone` never inherits), templates one
@@ -263,7 +311,7 @@ unit, since it isn't a second rclone mount of the same remote.
 
 Every one of those containment dependencies also carries `PartOf=`, and
 that part is not optional bookkeeping. A mount nested inside another
-mount — a nested rclone mount, a per-user wrapper mount (§6), or a bind
+mount — a nested rclone mount, a presentation mount (§6), or a bind
 mount, all three — has its mountpoint inside the parent's presented tree,
 so remounting the parent detaches it. `After=`/`Requires=` propagate
 start ordering and stop, never *restart*, so nothing brings the nested
@@ -274,7 +322,7 @@ there's no process left to notice at all; an rclone mount usually dies
 with its parent and gets restarted, but not reliably. This was observed
 in production the first apply after `requires` landed: adding the key
 changed one outer mount's unit file, restarting it took every nested
-mount on that host with it, three of four wrapper mounts died and were
+mount on that host with it, three of four presentation mounts died and were
 restarted normally, and the fourth survived as a live process with no
 mount behind it — so the next `state: started` was a no-op and that one
 user's folder sat at the bare `stortree:stortree` directory underneath
@@ -371,9 +419,12 @@ every remote (`storagebox`, `some-remote`, `some-gcs-bucket`, …). The
 `stortree_secrets` role reads the decrypted INI in memory (via the same
 filter plugin, using Python's `configparser`) and templates a **filtered,
 host-specific `rclone.conf`** containing only the remote sections that
-host's resolved server+client+Samba role actually needs (Samba sharing
-being universal per §1 means even a client-only host can pull in peer
-sections here), writing it to
+host's own **mount plan** (§2) references — every mount it makes gets
+its credentials, and nothing else does. Deriving it from the plan rather
+than from the resolved tree is deliberate: a host exports every Samba
+share in the tree (§1), so reading remotes out of *those* hands each
+host the credentials behind shares it exports but doesn't own, which is
+precisely what this scoping exists to prevent. Written to
 `/etc/stortree/rclone.conf` on that host (mode `0600`, owned by the local
 `stortree` service account). This keeps e.g. a storage-gadget's remote
 scoped to only the credentials it has a resolved use for — other remotes
@@ -392,13 +443,14 @@ with that subtree's own top-level path as the local path — the section's
 `path` is the owning host's own copy of that one subtree, and the
 client's mount unit references the synthesized section's name the same
 way any other peer-sourced mount does, instead of the subtree's own
-third-party `rclone.remote` value. A per-user peer dependency's %U gets resolved to a
-single real path here too, exactly the way `stortree_mounts` (§2, §6)
-independently resolves the same entry to its own one real mount — an
-owner grant's own path, or a group-only grant's one shared `.mounts`
-path, never one section per member — both have to agree on that resolved
-(not templated) path to name the section the same way, so
-`stortree_secrets` is the one role that resolves
+third-party `rclone.remote` value. A per-user peer dependency's %U is
+resolved to a single real path — an owner grant's own path, or a
+group-only grant's one shared `.mounts` path, never one section per
+member. The section is named for whatever path the *mount plan* landed
+on, so a mount and the section holding its credentials cannot disagree
+about it; that agreement used to be two separate resolutions of the same
+%U that happened to match. Resolving it needs real group membership,
+which is why `stortree_secrets` is the one role that resolves
 `stortree_group_members`/`stortree_group_gids`/`stortree_user_uids` (§6)
 fresh via `getent`, first in `site.yml`'s order among the roles that need
 them; `stortree_mounts` reuses those same facts rather than re-deriving
@@ -410,9 +462,13 @@ The `stortree_samba` role generates `smb.conf` share stanzas from every
 `samba:`-configured node resolved for the current host (§1) — which,
 since Samba sharing is universal, means every host gets a stanza for
 every such node in the tree, not only the ones whose subtrees it happens
-to own: path, subpath templates (`%U` for the `home` per-user pattern),
+to own: path (with Samba's `%U` where the node has `user-subdirs`),
 and `valid users`/`write list` derived from the resolved `access` rules
-once those are mapped to real POSIX groups/users (§5, §6). A host
+once those are mapped to real POSIX groups/users (§5, §6). The stanza's
+name is the node's own `samba.name` where it sets one, and otherwise the
+node path folded into a legal share name (`tree/home` → `tree_home`);
+either way `resolve()` settles it, and rejects two nodes claiming the
+same one (config-schema.md "Share names"). A host
 assembles the node's local path the same way whether it's the resolved
 owner or sourcing peer data (§1/§3) — Samba itself never needs to know
 which. Sets `nt acl support = yes` (still lets a Windows client view the
@@ -428,6 +484,40 @@ The role validates every rendered `smb.conf` with `testparm` (as a
 `command`/`validate` argument on the `template` task, so a bad render
 fails the play instead of getting written) before triggering a `smbd`
 reload handler.
+
+The `[global]` block is stortree's own defaults merged with
+`stortree_samba_globals` (`roles/stortree_samba/defaults/main.yml`), a
+per-site escape hatch shaped exactly like `ldap.yml`'s `extra:` for
+`sssd.conf` (§5) and there for the same reason: no fleet's Samba
+settings are fully derivable from this tree — `workgroup` above all —
+and without an override the only way to change one is to fork the
+template. A key of the same name replaces the built-in value rather than
+appending a second line, and `testparm` above validates the result, so a
+misspelled directive fails the apply. What `testparm` can't catch is an
+override that is valid but defeats the model: `security = user` and
+`passdb backend = tdbsam` are what make authentication local against the
+NT hashes `stortree_pam_smbpass` syncs (§5) while authorization stays
+the underlying Unix ownership/mode (§6), so changing either is a change
+to the design, not a tweak. `server min protocol` is pinned explicitly
+to what Samba ≥ 4.11 already defaults to — it changes nothing on any
+supported platform, but it puts the posture in the rendered file and
+keeps a future distro default from quietly lowering it.
+
+**Which hosts export at all.** Universality is the default, and the
+`stortree_samba_hosts` list (`roles/stortree_facts/defaults/main.yml`,
+defaulting to the whole fleet) is how a host opts out of it. The list
+reaches `resolve()` rather than only gating the role, because the share
+stanza is the cheap half: the expensive half is the peer sftp mount a
+host makes purely to hold content for a share it exports but doesn't own
+(§1), which is an rclone process and a VFS cache of another host's
+bytes. An excluded host therefore resolves neither, while keeping its
+own client mounts — wanting the tree locally is independent of
+re-exporting it. The same list filters `peer_served_by` on the owning
+side, so §7's trust provisioning never grants SSH access for a mount the
+other end has opted out of making. It is a fleet-level list rather than
+a per-host flag precisely so both ends reach that conclusion from the
+same input, without the `hostvars` cross-referencing §1 rules out. See
+config-schema.md "What universality costs" for the operator-facing view.
 
 ### 5. Identity & authentication (LDAP + SSSD)
 
@@ -459,8 +549,10 @@ along with it well before any platform this project targets existed, so
 it's not installable anywhere `stortree_pam_smbpass` would run. The
 `stortree_pam_smbpass` role instead stacks `pam_exec.so
 expose_authtok seteuid` into the host's PAM `auth`/`password` chain
-*after* SSSD's module (via `ansible.builtin.pamd` for a declarative,
-idempotent edit rather than hand-patching `/etc/pam.d/common-auth`),
+*after* SSSD's module (via `community.general.pamd` for a declarative,
+idempotent edit rather than hand-patching `/etc/pam.d/common-auth` --
+`pamd` has only ever shipped in `community.general`, never in
+ansible-core),
 pointed at a small script the role deploys
 (`roles/stortree_pam_smbpass/files/pam-smbpass-sync.sh`). `pam_exec`
 hands that script the plaintext credential on stdin on any successful PAM
@@ -498,14 +590,32 @@ just a syntax restriction: a remote-backed node (directly, or
 peer-sourced from whichever host owns it, §1/§2) is always an rclone FUSE
 mount, and rclone's FUSE mount never implements `setxattr` — it can't
 carry a POSIX ACL at all, on any host, ever. What it *can* carry is plain
-Unix ownership and mode: one owner, one group, one shared permissions
-level applied to both. That's exactly what one `access` object expresses
-and no more, so the schema doesn't let you write anything a remote-backed
-node couldn't actually enforce (`_normalize_access()` raises if it's
-ever given a list). A plain local node (no `rclone.remote` of its own)
-gets the same treatment for a simpler reason: consistency, not
+Unix ownership and mode: one owner, one group, and a permissions level
+for each of them (and for everyone else). That's exactly what one
+`access` object expresses and no more, so the schema doesn't let you
+write anything a remote-backed node couldn't actually enforce
+(`_normalize_access()` raises if it's ever given a list). A plain local
+node (no `rclone.remote` of its own) gets the same treatment for a
+simpler reason: consistency, not
 necessity — it could carry a real POSIX ACL, but there's no reason for
 its enforcement to work differently from a remote-backed sibling's.
+
+A node's own `access` is what it wrote merged over what it inherited,
+key by key, down the tree the way `host` is inherited (config-schema.md
+"Access inheritance"): a grant describes the subtree under the node it
+is written on — one that stopped at that node would leave the principal
+able to traverse into the subtree and read nothing in it — and a
+descendant refines it a key at a time, `null` taking a key back and an
+empty `access:` the whole grant. That grant is what the owning host
+enforces, and it's what every other host enforces on its own copy too,
+unless a `client-defaults`/`clients` block on that node (or an ancestor)
+adjusts it for that host, which merges over the resolved grant the same
+key-by-key way the tree inheritance does. One `access` object in, one
+out, nothing below this point can tell which of the two it came from
+(config-schema.md "Client-side access"; `resolve()` settles it, per
+host, and the Samba share's own `valid users`/`write list` follow the
+same resolution — a principal only one host can resolve belongs in that
+host's share and nowhere else, §4).
 
 `stortree_mounts` applies `access` directly, for every resolved path —
 mount point or plain directory alike — via three pure filters
@@ -524,6 +634,13 @@ mount point or plain directory alike — via three pure filters
 - **Both**: the path is pinned to that one `owner` (no group-driven
   expansion — see below), who and whose group both get `permissions`.
 
+Written as a mapping instead of a string, `permissions` gives each Unix
+class its own level (`{owner: rwx, group: r-x, other: "---"}`,
+config-schema.md "Access"), overriding the defaults above for exactly
+the classes it names. This needs no POSIX ACL and never did: one owner
+and one group at two different levels is plain mode bits. What still
+needs one — and so is still unwritable — is a *second* group.
+
 Every one of these except an *explicit* `permissions` (one the config
 actually wrote out, tracked as `permissions_explicit` by
 `_normalize_access()`) also carries a bare execute bit on `other`, even
@@ -541,29 +658,45 @@ differently-scoped descendant grant.
 For a plain local directory, that's `ansible.builtin.file`'s
 `owner`/`group`/`mode` — real, standard Unix ownership, no `acl` package
 needed at all. For a remote-backed node, `stortree_mounts` renders the
-same three values into the rclone unit instead: with neither `owner` nor
-`group` granted, the unit omits `--allow-other`, so FUSE restricts the
-mount to the mounting user (`stortree`) alone — no SSH session or local
-process reaches it, root included, and nothing overrides that for Samba
-either (`smbd` still runs as the real authenticated user, unchanged from
-stock behavior). Root's exclusion here isn't a gap to close: rclone's
-own `--allow-root` (libfuse's documented way to widen a private mount to
-"the mounting user and root") is silently ignored by the rclone build
-this fleet runs ("Ignoring --allow-root. Support has been removed
-upstream", logged on every mount attempt) — there is no flag that gets
-root into an ungranted mount, full stop, so `stortree_common` and
-`stortree_mounts` both treat that as permanent: neither ever tries to
-manage a path once a direct probe shows root can't reach it (a `stat`,
-not `ansible_facts.mounts` — Ansible's own mount-fact gathering silently
-drops any mount whose device string doesn't happen to contain "/",
-which some of this fleet's own rclone mounts hit in practice), rather
-than assume root access it structurally cannot have.
-`--allow-other` (the granted-mount case just below) additionally
+same three values into the rclone unit instead, and renders
+`--allow-other`/`--dir-perms`/`--file-perms` for *every* mount rather
+than only granted ones: with neither `owner` nor `group` granted, the
+mount presents exactly what an ungranted local directory already does —
+`stortree:stortree` `0751`, since `--uid`/`--gid` have nothing to pin
+them to and fall through to the mounting process's own, which is
+unconditionally `stortree`. `other` gets the same traversal-only bit
+there that it gets everywhere else, never read, so nothing is world-
+readable that wasn't before; what the flag buys is root.
+
+Omitting `--allow-other` is what used to cost it. FUSE then restricts
+the mount to the mounting user alone — no SSH session or local process
+reaches it, root included — and rclone's own `--allow-root` (libfuse's
+documented way to widen a private mount to "the mounting user and
+root") is silently ignored by the rclone build this fleet runs
+("Ignoring --allow-root. Support has been removed upstream", logged on
+every mount attempt), so there is no *narrower* flag that gets root in.
+An ungranted mount was therefore unreachable to root permanently, by
+construction — and a VFS-cache subtree (docs/config-schema.md's
+`.bravo-cache`) is exactly that shape, since no `access` grant is
+meaningful on a cache: it reported itself as a masked mount on every
+single apply, forever, with no later apply able to widen a grant that
+was never meant to exist.
+
+Masking is now only ever transient — a host keeps whatever unit it was
+last started with, so a mount rendered before this stays private until
+something restarts it, one apply later. `stortree_common` and
+`stortree_mounts` both still handle it the same way meanwhile: neither
+tries to manage a path once a direct probe shows root can't reach it (a
+`stat`, not `ansible_facts.mounts` — Ansible's own mount-fact gathering
+silently drops any mount whose device string doesn't happen to contain
+"/", which some of this fleet's own rclone mounts hit in practice),
+rather than assume root access it doesn't currently have.
+`--allow-other` additionally
 requires `user_allow_other` in `/etc/fuse.conf` (`stortree_mounts`
 ensures it's set before rendering or restarting any unit) — libfuse
 refuses the option outright from a non-root mounting process without it.
 With `owner` and/or `group` granted, the
-unit instead adds `--allow-other` back and uid/gid-owns the mount
+unit additionally uid/gid-owns the mount
 directly (`--uid`/`--gid`, resolved from the same `getent passwd`/`getent
 group` lookups `stortree_secrets` already runs for %U-expansion below —
 `stortree_user_uids`/`stortree_group_gids` read the numeric id out of the
@@ -571,9 +704,10 @@ same merged lookup data instead of the name/member list — merged from
 each looped `getent` call's own result via `stortree_merge_getent()`,
 not from `ansible_facts.getent_passwd`/`getent_group` directly, since
 Ansible's own fact-merge behavior replaces rather than accumulates a
-module's returned facts across loop iterations) and `--dir-perms`/
-`--file-perms` (both set to the same
-mode `access_mode()` computed). Real, kernel-enforced access, checked
+module's returned facts across loop iterations), on top of the
+`--dir-perms`/`--file-perms` every mount already carries — both set to
+the same mode `access_mode()` computed, which is the grant's own here
+rather than the plain default. Real, kernel-enforced access, checked
 against whoever is actually connecting — Samba included, since Samba
 still operates as that real user throughout. `mw-fam` in the running
 example (`access.group`) is exactly this case.
@@ -613,12 +747,15 @@ folder per member, against real group membership (interpretation call
 anywhere in an access grant first — same lookup `stortree_group_gids`
 needs for the gid-owned-mount case above, just reading the member list
 instead of the numeric id. `stortree_needed_groups()`/`needed_users()`
-compute that set once each (covering both `server_subtrees`' own nodes
-and `peer_dependencies`' — a peer-sourced descendant's grant expands the
-exact same way, §2/§3, and unlike the old per-user-only scoping, both now
+compute that set once each, over every scope a resolved grant can turn
+up in — `server_subtrees`' own nodes, `peer_dependencies`' (a
+peer-sourced descendant's grant expands the exact same way, §2/§3),
+`client_mounts`' and `client_grants`' (a node inside something this host
+mounts, presented by this host under a grant that may be named nowhere
+else in its facts) — and, unlike the old per-user-only scoping, they
 cover every node with a grant, not just per-user ones, since a plain
-shared node's own `access.group`/`access.owner` still needs its
-id resolved to own its mount); the `stortree_secrets` role — first among
+shared node's own `access.group`/`access.owner` still needs its id
+resolved to own its mount; the `stortree_secrets` role — first among
 the roles that need it in `site.yml`'s order (§8) — runs the `getent`
 lookups and sets the `stortree_group_members`/`stortree_group_gids`/
 `stortree_user_uids` facts from them, which `stortree_mounts` then
@@ -632,7 +769,7 @@ actually needed).
 
 The per-user folder `access_grant_usernames()` says a `user-subdirs`
 node needs — `home/jd`, say — is itself owned by that one real user, not
-`stortree`: `user_container_paths()` derives, from the same
+`stortree`: `_plan_user_containers()` derives, from the same
 `server_subtrees`/`peer_dependencies` facts, every `<prefix>/<username>`
 container any resolved grant anywhere under that prefix implies (deduped
 by path — several sibling descendants resolving to the same user all
@@ -645,10 +782,9 @@ bare traversal `access_mode()`'s public-execute bit alone would give an
 here, the container and the grant agree on exactly who it's for.
 
 Getting there takes one of two different mechanisms, depending on what
-the container's own ancestors look like, and `user_container_paths()`
-tells `stortree_mounts` which one applies via `requires_slug` (`_nearest_
-mount_slug()` against the resolved mount plan, checking not the
-container's own path but its *staging path*, below): a genuinely local
+the container's own ancestors look like, and `plan_mounts()` tells
+`stortree_mounts` which one applies via each entry's `kind` and
+`transport_slug`: a genuinely local
 container — no remote-backed ancestor anywhere above it (a top-level
 subtree with `host` set and no `rclone.remote`, config-schema.md
 "storing locally") — just gets `ansible.builtin.file`'s real `chown`/
@@ -661,24 +797,104 @@ mount's own single, uniform `--uid`/`--gid` says, for the simple reason
 that a plain `chown()`/`chmod()` through that mount's FUSE layer has
 nowhere real to persist a *different* value for just this one path.
 
-For that second case, `stortree_mounts` renders a per-user "wrapper
-mount" instead: an `rclone mount` using the `local` backend (source =
-`STORTREE_USER_PREFIX + username`, a sibling of the container itself,
-inside the very same remote-backed ancestor — ordinary content nothing
-but the `stortree` account driving both mounts ever touches directly;
-target = the container's own path), with that one user's real
-`--uid`/`--gid`/`--dir-perms`. This works where a plain `chown` can't
-because rclone's VFS-layer `--uid`/`--gid`/`--dir-perms`/`--file-perms`
-override applies uniformly to whatever a mount presents, *regardless* of
-backend or of what the underlying path natively supports — the same
-mechanism that already lets any remote-backed node's mount present
-`access`-derived ownership at all, on a backend with no native
-permission concept of its own (S3, say). No second network connection
-either: the wrapper's source is
-already local (it's read through the outer mount, which already has
-whatever network connection it needs), so `vfs-cache-mode: off` on the
-wrapper — there's no network latency at this layer to hide, only
-staleness risk against the real mount underneath it.
+For that second case, the tree runs **two layers** instead of one.
+
+**Layer 1, transport** (`stortree-remote@.service.j2`). One `rclone
+mount` per node that declares an `rclone.remote`, mounted under
+`stortree_remotes_root` — a local directory on the host, outside
+`stortree_root` and never part of the visible tree — at the node's own
+path. The remotes root therefore mirrors the tree, and
+`<remotes_root>/<path>` and `<stortree_root>/<path>` are the same
+directory on the backend reached by two different local paths. This is
+the only layer that talks to a backend and the only layer that caches,
+so every operator-supplied `rclone.args` value belongs to it, and there
+is nothing to split between layers.
+
+It is also the only layer that can be *monitored* as rclone, and so the
+only one that renders a metrics listener (off by default; see §8). That
+endpoint is per mount rather than per host because an rclone metrics or
+rc server only ever reports the process it runs in — a separate rclone
+started anywhere else, by an operator or by a GUI, cannot see or adopt
+these mounts. Layer 2 below is `bindfs`, and the per-user fan-out under
+it is `mount --bind`; neither is rclone, and neither has anything to
+serve.
+
+Because layer 1 is local, a backend's own directory structure holds only
+the paths `config.yml` describes. An earlier revision staged inside the
+tree, in a sibling directory next to each node it served, and every
+staging name it invented appeared on the remote.
+
+Mirroring the tree rather than flattening to one directory per remote is
+not only tidiness. A flat layout must name each directory somehow, and
+the obvious name — the systemd slug — is exactly the wrong one:
+`_slug()` escapes `-` as `\x2d` so unit names stay injective, and
+systemd then *unescapes* that same sequence when it parses an
+`ExecStart` path, silently pointing the mount at a different directory.
+Slugs name units; paths name paths.
+
+One transport per declaring node, with one exception: a peer mount whose
+content a transport already above it presents gets none of its own
+(`_transport_covers()`). A host that peer-mounts a whole subtree *and*
+exports a Samba share for one path inside it — the ordinary shape for a
+hidden share over content the host doesn't own (§4) — would otherwise
+open two sftp sessions to one account and run two rclone processes over
+the same bytes, each with its own VFS cache and, since
+`--vfs-cache-max-size` is per mount, its own copy of that budget. Only
+the peer references stortree synthesizes itself collapse, and only where
+the owning host, the path and the `rclone.args` all agree: operator-written
+remotes may nest too, but proving it means reading `remote:path` strings
+whose meaning belongs to the backend, and a node asking for a different
+cache than the mount above it is asking for a second mount. The
+presentation is untouched either way — it is what carries the grant, and
+it reads the covering mount from the inside.
+
+**Layer 2, presentation** (`stortree-mount@.service.j2`). One `bindfs`
+mount per visible node that needs its own ownership, reading
+`<remotes_root>/<path>` and mounted at `<stortree_root>/<path>`,
+carrying the resolved `access` grant as `-u`/`-g`/`-p`. Source and
+target are the same directory on the backend, so there is no data to
+move and nothing to self-mount. It caches nothing, so every byte and
+every listing still comes from layer 1.
+
+A node gets a presentation when it has a remote of its own, or when it
+carries an `access` grant and sits inside some transport. The same
+mechanism covers per-user containers and granted plain-directory nodes
+alike — before it was general, the latter's grant went unapplied
+entirely, with Ansible reporting the chown as `changed` on every apply
+while `stat` kept returning the ancestor mount's own uniform owner.
+
+Four flags are not obvious and are load-bearing:
+
+- **`-p`** takes one chmod-style spec for files and directories both,
+  where rclone took `--dir-perms` and `--file-perms` separately. The
+  octal is therefore the *file* mode and capital `X` puts the execute
+  bits back on directories alone — see `bindfs_perms()`. Passing
+  `access_mode()` straight through would mark every regular file in the
+  subtree executable.
+- **`--mirror=<service account>`** is what lets a granted node contain
+  anything else. Without it the mount presents its path as the granted
+  owner to everyone, `stortree` included, and `fusermount` then refuses
+  every nested mount underneath it — a descendant's own presentation, or
+  a transport mountpoint — with "user has no write access to
+  mountpoint". The tree's previous answer was to force any mount with
+  nested children to `stortree:stortree` and discard its grant, which is
+  precisely the bug this exists to fix. `--mirror` keeps the grant real
+  for every actual user and lets only the account that already owns the
+  raw content see itself as owner.
+- **`-o nonempty`** is required, not defensive: Debian's `bindfs` links
+  libfuse2, which refuses a non-empty mountpoint outright, and a
+  presented node's mountpoint routinely is one. libfuse3 dropped the
+  check and ignores the option.
+- **`--default-permissions`** on the transport. Without it FUSE skips
+  kernel permission checking and rclone permits everything, so the mode
+  a mount presents is decorative — which is how any local account could
+  read any path in the tree regardless of its grant.
+
+No second network connection either: layer 2's source is already local,
+and `bindfs` keeps no cache of its own to go stale — a write through the
+transport shows at the presented path immediately, where the rclone
+wrapper this replaced could hide it for minutes behind its VFS directory
+cache.
 
 `access_grant_usernames()` says *who* gets a folder; `per_user_mount_path()`
 says *where the real content actually lives*, and the two only disagree
@@ -721,52 +937,61 @@ so no `smb.conf` change is needed for this to work either. A peer-sourced
 real, shared path — there's nothing at a per-member path on the owning
 host's own disk for a `group`-only grant, bind mount included.
 
-A per-user container's own wrapper mount (above) changes what a
-descendant's bind-mount unit has to wait for, when that descendant lives
-directly under a wrapped container: `mw-fam`'s `home/jd/mw-fam` used to
-just nest inside the outer remote-backed mount directly; once `home/jd`
-itself is a separate wrapper mount, `home/jd/mw-fam` nests *inside that
-wrapper's own presented tree* instead, so `mw-fam`'s bind-mount unit has
-to come after the wrapper mount, not just the outer one. `mw-fam` itself
-is completely unchanged by this — same bind mount, same gid ownership,
-same everything — only *when* its unit is allowed to start moves; the
-`stortree-bind@`/`stortree-mount@` unit templates both check, ahead of
-whatever `plan_mounts()` itself computed as `requires_slug`, whether the
-entry's own immediate parent is a container with a wrapper mount of its
-own, and prefer that dependency when one exists. This preserves the
-"real ownership stacks on top" pattern (§6) one level deeper: `mw-fam`'s
-own distinct group ownership shadows whatever the wrapper mount
-would've shown at that exact path, exactly as it already shadowed the
-outer mount before the wrapper existed — rclone's uid/gid override is
-uniform across a whole mount (no way to carve out one nested path with a
-different owner from inside the same mount), so this is the only way
-`mw-fam`'s ownership and the container's can coexist at all.
+A node's own presentation mount (above) changes what a
+descendant's bind-mount unit has to wait for: `mw-fam`'s `home/jd/mw-fam`
+used to just nest inside the outer remote-backed mount directly; once
+`home/jd` itself is a presentation mount, `home/jd/mw-fam` nests
+*inside that presentation's tree* instead, so `mw-fam`'s bind-mount unit
+has to come after it, not just after the outer one. `mw-fam` itself is
+completely unchanged by this — same bind mount, same gid ownership, same
+everything — only *when* its unit is allowed to start moves; the
+`stortree-bind@`/`stortree-mount@` unit templates both consult
+`presented_ancestor()`, ahead of whatever `plan_mounts()` itself computed
+as `requires_slug`, and prefer that dependency when one exists.
 
-Ordering alone isn't enough, though: a wrapped container's path stops
-being a real directory the moment its wrapper mounts, and becomes a
-mountpoint whose visible contents are the *staging* directory's. So a
-directory created at `home/jd/mw-fam` — the empty mountpoint every
-bind mount needs — is simply hidden the instant the wrapper comes up,
-and the bind's own `mount --bind` then fails outright against a path
-that, as far as anything above the wrapper can see, doesn't exist. This
-is how the first apply after wrapper mounts existed actually failed in
-production: all eight per-user binds, both hosts, each one's new
-`Requires=` on the wrapper dutifully bringing the wrapper up first and
-thereby hiding the very mountpoint the unit was about to mount onto.
-`physical_path()` (`filter_plugins/stortree.py`) is the fix and the
-general rule: every directory `stortree_mounts` creates is created at
-its *physical* path, rewriting anything strictly inside a wrapped
-container to the staging directory the wrapper re-presents it from, so
-it shows up at the visible container path for real and stays mountable.
-Strictly inside — the container path itself is the wrapper's own
-mountpoint and has to keep existing exactly where it is; and an
-unwrapped (plain local, directly chowned) container has no wrapper
-shadowing anything, so nothing under it moves at all. The mount units
-themselves are untouched by this: they still mount onto the visible
-path, which is the whole point — only directory *creation* follows the
-content to where it physically lives. Sequencing follows: the staging
-directory is created ahead of both bind-mountpoint tasks, since it's now
-the parent everything nested gets redirected into.
+That is a *search* for the deepest presented ancestor, not a look at the
+immediate parent. A container is always the immediate parent of what
+nests inside it, so the immediate-parent lookup this replaced was
+sufficient while containers were the only presented paths there were. A
+granted plain-directory node can sit several levels above the mount
+nested in it — a grant at `system/data` presenting a descendant mount at
+`system/data/store/thing` is two — and the old lookup silently found
+nothing there, leaving that descendant with no ordering at all against
+the mount that owns its mountpoint.
+
+This preserves the "real ownership stacks on top" pattern (§6) one level
+deeper: `mw-fam`'s own distinct group ownership shadows whatever the
+presentation would've shown at that exact path, exactly as it already
+shadowed the outer mount before — a mount's uid/gid override is uniform
+across the whole mount (no way to carve out one nested path with a
+different owner from inside it), so this is the only way `mw-fam`'s
+ownership and the container's can coexist at all.
+
+Ordering alone isn't enough, though: a presented node's path stops
+being a real directory the moment its presentation mounts, and becomes
+a mountpoint whose visible contents are layer 1's. So a directory
+created at `home/jd/mw-fam` in the visible tree — the empty mountpoint
+every bind mount needs — is hidden the instant the presentation comes
+up, and the bind's own `mount --bind` then fails outright against a path
+that, as far as anything above the presentation can see, doesn't exist.
+This is how the first apply after these mounts existed actually failed
+in production: all eight per-user binds, both hosts, each one's new
+`Requires=` dutifully bringing the presentation up first and thereby
+hiding the very mountpoint the unit was about to mount onto.
+
+Creating directories in layer 1 is the fix and the general rule: every
+directory `stortree_mounts` creates for a path inside a transport is
+created at `<remotes_root>/<path>`, which is where the presentation
+serves it from — so it shows up at the visible path for real and stays
+mountable. The mount units themselves are untouched by this: they still
+mount onto the visible path, which is the whole point — only directory
+*creation* follows the content to where it physically lives.
+
+What is left in the visible tree is exactly what nothing composes into
+view: the mountpoint of each top-level presentation, and every path of a
+genuinely local subtree, which has no transport and so keeps living
+there for real. `requires_slug` is the test, since it names the nearest
+presentation above a path.
 
 The optional `sshd_config` fragment (`stortree_sshd`, only runs when
 `stortree/sshd_config` is present in the repo) is templated to
@@ -808,9 +1033,10 @@ tree:
 
 Every host that doesn't own every top-level subtree in `config.yml` is
 the *serving* side of at least one peer dependency unconditionally now —
-its own top-level-subtree client mounts (§1), one per top-level subtree
-it doesn't own and isn't opted out of (config-schema.md "Per-client mount
-opt-out") — so this provisions on every `ansible-playbook` run for the
+its own client mounts (§1), one per top-level subtree it doesn't own and
+isn't opted out of — or, where a nested `client-defaults`/`clients` block
+opts something back in below an opted-out subtree, one per such node
+(config-schema.md "Per-client mount opt-out") — so this provisions on every `ansible-playbook` run for the
 whole fleet, not only where a `samba:` block is in play. Because Samba
 sharing is universal
 (§1) on top of that, the set of hosts needing this provisioned can extend
@@ -867,6 +1093,21 @@ invocations — there is no separate CLI to install or learn:
   status (`smbstatus`), and SSSD/PAM sanity checks, and prints a per-host
   summary. No state-changing modules.
 
+- **Metrics targets**: `ansible-playbook playbooks/metrics-targets.yml` —
+  read-only, and only meaningful once `stortree_metrics_enabled` is on
+  somewhere. `site.yml` gives each rclone mount on an enabled host its
+  own metrics endpoint and leaves a Prometheus `file_sd` fragment there
+  describing them; this collects those fragments into one target list on
+  the control node. It collects rather than recomputes, so the control
+  node never needs the LDAP group memberships a mount plan is resolved
+  against. Re-run it after any apply that changes which mounts exist or
+  where they bind. Enablement is ordinary inventory precedence —
+  fleet-wide in `group_vars/all.yml`, narrowed in `host_vars/<host>.yml`
+  — with no fleet-level list to keep in agreement, because unlike
+  `stortree_samba_hosts` nothing on any other host depends on what this
+  one publishes. See [runbook.md](runbook.md) "Publishing rclone
+  metrics".
+
 If a host is unreachable, that one host's tasks fail and Ansible reports
 it while continuing (or halting, depending on `--limit`/strategy) — same
 retry-by-rerunning story as the old `apply`, just Ansible's native
@@ -877,8 +1118,10 @@ failure handling instead of bespoke retry logic.
 **Dependencies**, gathered here from the roles above for reference:
 
 - **Control node**: `ansible`, plus the `ansible.posix` collection
-  (`ansible.posix.authorized_key` in §7) and the `community.crypto`
-  collection (`community.crypto.openssh_keypair` in §7).
+  (`ansible.posix.authorized_key` in §7), the `community.crypto`
+  collection (`community.crypto.openssh_keypair` in §7) and the
+  `community.general` collection (`community.general.pamd` in §5).
+  All three are in `requirements.yml`.
 - **Every managed host**: `rclone` (§2), `samba` (§4), `sssd` (§5), and
   `samba-common-bin`/`libpam-modules` (`smbpasswd` and `pam_exec.so`,
   §5) — existing, well-known Linux storage/identity tooling the roles

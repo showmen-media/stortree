@@ -10,9 +10,11 @@ resolves a different tree than the playbook it claims to mirror.
 
 Also here: the repo-hygiene rule from docs/plan.md that no real config
 ever gets committed, which is worth a test precisely because it's the
-kind of mistake you only make once.
+kind of mistake you only make once, and the handful of paths the filter
+plugin has to spell the same way the roles do.
 """
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -20,7 +22,15 @@ import pytest
 import yaml
 
 from conftest import EXAMPLE_HOSTS, REPO_ROOT
-from filter_plugins.stortree import plan_mounts, resolve
+from filter_plugins.stortree import (
+    DEFAULT_STORTREE_ETC,
+    DEFAULT_STORTREE_ROOT,
+    DEFAULT_STORTREE_REMOTES_ROOT,
+    PEER_SSH_KEY_NAME,
+    mount_unit_names,
+    plan_mounts,
+    resolve,
+)
 
 # The three copies of docs/config-schema.md's worked example: what the
 # unit tests resolve, what an operator copies to start from, and what
@@ -62,6 +72,7 @@ def test_the_shipped_example_resolves_for_every_host_in_its_fleet():
             "client_mounts",
             "samba_shares",
             "peer_dependencies",
+            "client_grants",
             "peer_served_by",
         }
         # Samba sharing is universal, so every host exports the one
@@ -163,6 +174,9 @@ def test_no_real_site_config_is_tracked_in_git():
         "stortree/rclone.conf",
         "stortree/sshd_config",
         "inventory/hosts.yml",
+        "inventory/group_vars/all.yml",
+        "inventory/host_vars/storage-node-alpha.yml",
+        "prometheus/stortree-targets.json",
     }
     assert forbidden.isdisjoint(tracked)
 
@@ -181,3 +195,204 @@ def test_the_example_ldap_config_has_the_keys_sssd_conf_j2_reads():
     ldap = load_yaml("stortree/ldap.yml.example")
     assert set(ldap["server"]) >= {"url", "base_dn", "bind_dn", "bind_password"}
     assert set(ldap["posix"]) >= {"uid_attr", "gid_attr"}
+
+
+# -- filter-plugin fallbacks vs. the role defaults they mirror -------------
+
+
+def role_defaults(role):
+    return load_yaml(Path("roles") / role / "defaults" / "main.yml")
+
+
+def test_the_plugins_path_fallbacks_match_the_role_defaults():
+    # The roles pass `stortree_root`/`stortree_etc` into stortree_resolve,
+    # stortree_plan_mounts and stortree_filter_rclone_conf, so an override
+    # reaches every generated path. These module-level constants are only
+    # the fallback for a call that passes neither -- every unit test here,
+    # and any use of the module outside a play. If they drift from the
+    # role defaults, the tests assert one set of paths while a real run
+    # produces another, which is exactly the gap that makes a fallback
+    # worth having a guard on at all.
+    assert role_defaults("stortree_facts")["stortree_root"] == DEFAULT_STORTREE_ROOT
+    # Same guard for layer 1's root: the plugin falls back to its own
+    # constant when called outside a play, and the two drifting apart
+    # would put the transport mounts somewhere the role never creates.
+    assert (
+        role_defaults("stortree_facts")["stortree_remotes_root"]
+        == DEFAULT_STORTREE_REMOTES_ROOT
+    )
+    assert role_defaults("stortree_common")["stortree_etc"] == DEFAULT_STORTREE_ETC
+
+
+def test_stortree_root_has_exactly_one_definition():
+    # It lives in stortree_facts, not stortree_common, because
+    # playbooks/status.yml applies stortree_facts with no other role in
+    # the play -- see that defaults file's own comment. Defining it in
+    # both would work by accident (the values agree) right up until one
+    # of them was edited.
+    defining = [
+        role.name
+        for role in sorted((REPO_ROOT / "roles").iterdir())
+        if role.is_dir()
+        and (role / "defaults" / "main.yml").is_file()
+        and "stortree_root" in (role_defaults(role.name) or {})
+    ]
+    assert defining == ["stortree_facts"]
+
+
+def test_every_play_that_resolves_the_tree_applies_stortree_facts():
+    # The single definition above only reaches everything because
+    # stortree_facts is in every play. A play that resolved the tree
+    # without it would hit an undefined `stortree_root` at the first
+    # stortree_resolve call.
+    playbooks = [SITE_PLAYBOOK, REPO_ROOT / "playbooks/status.yml"]
+    playbooks += sorted((REPO_ROOT / "roles").glob("*/molecule/*/converge.yml"))
+    playbooks += sorted((REPO_ROOT / "molecule").glob("*/converge.yml"))
+    for playbook in playbooks:
+        roles = play_roles(playbook)
+        assert roles[0] == "stortree_facts", playbook
+
+
+def test_the_peer_ssh_key_name_matches_what_stortree_peer_trust_writes():
+    # filter_rclone_conf() writes `key_file = {stortree_etc}/{name}` into
+    # every synthesized sftp section; stortree_peer_trust is what actually
+    # creates the keypair at that path. A rename on either side alone
+    # leaves every peer mount authenticating with a key file that isn't
+    # there.
+    tasks = (
+        REPO_ROOT / "roles" / "stortree_peer_trust" / "tasks" / "main.yml"
+    ).read_text()
+    referenced = {
+        name.removesuffix(".pub")
+        for name in re.findall(r"\{\{ stortree_etc \}\}/([\w.]+)", tasks)
+    }
+    assert referenced == {PEER_SSH_KEY_NAME}
+
+
+def test_every_unit_family_the_plugin_names_is_swept_by_the_role():
+    # Three places sweep stortree's units by wildcard -- the `find` that
+    # detects stale unit files, the `systemctl reset-failed` that clears
+    # ghost state, and playbooks/status.yml's own `list-units` -- and
+    # each names the unit families literally. A fourth place invents the
+    # names: mount_unit_names(), off UNIT_FAMILIES. A family added there
+    # but missed in any of the three sweeps is a unit that is rendered
+    # and started but never listed, never reset, and never cleaned up
+    # when it goes stale, on every apply, silently.
+    plan = [
+        {"local_path": "a", "kind": "transport", "slug": "a"},
+        {"local_path": "a", "kind": "mount", "slug": "a"},
+        {"local_path": "b", "kind": "bind", "slug": "b"},
+        {"local_path": "c", "kind": "dir", "slug": "c"},
+    ]
+    families = {name.split("@", 1)[0] + "@" for name in mount_unit_names(plan)}
+    assert len(families) == 3, f"unexpected unit families: {families}"
+
+    sweeps = {
+        "stortree_mounts find + reset-failed": (
+            REPO_ROOT / "roles/stortree_mounts/tasks/main.yml"
+        ),
+        "status.yml list-units": REPO_ROOT / "playbooks/status.yml",
+    }
+    for where, path in sweeps.items():
+        globbed = set(re.findall(r"(stortree-[a-z-]+@)\*\.service", path.read_text()))
+        assert families <= globbed, f"{where} misses {families - globbed}"
+
+
+def test_the_role_derives_no_unit_name_the_plugin_does_not_render():
+    # The other half of the same seam: stortree_mounts restarts and
+    # enables units by reading each render task's own `dest` back, so a
+    # unit's name is written once (in the task that creates the file)
+    # rather than re-spelled in the tasks that act on it. A second
+    # spelling is what this guards against coming back -- three families
+    # x three steps was nine places one rename had to reach.
+    tasks = (REPO_ROOT / "roles/stortree_mounts/tasks/main.yml").read_text()
+    interpolated = set(re.findall(r"\"(stortree-[a-z-]+@\{\{[^\"]*)\"", tasks))
+    assert interpolated == set(), (
+        "unit names are being rebuilt in the role instead of read from the "
+        f"render task's own dest: {interpolated}"
+    )
+
+
+def test_stortree_samba_hosts_is_defined_once_and_gates_both_ends():
+    # The opt-out is only correct if the *same* list reaches resolve()
+    # and the stortree_samba role: resolve() decides which shares and
+    # peer mounts exist, the role decides whether smbd serves them. Gate
+    # one on a different variable than the other and a host either
+    # exports shares whose content it never mounted, or mounts content
+    # for shares it never exports.
+    defining = [
+        role.name
+        for role in sorted((REPO_ROOT / "roles").iterdir())
+        if role.is_dir()
+        and (role / "defaults" / "main.yml").is_file()
+        and "stortree_samba_hosts" in (role_defaults(role.name) or {})
+    ]
+    assert defining == ["stortree_facts"]
+
+    # Passed positionally into stortree_resolve by the facts role...
+    facts = (REPO_ROOT / "roles/stortree_facts/tasks/main.yml").read_text()
+    assert "stortree_samba_hosts" in facts
+    assert "stortree_resolve(" in facts
+
+    # ...and read by every task of the samba role, so none of them can
+    # act on a host the resolver already excluded.
+    samba = yaml.safe_load(
+        (REPO_ROOT / "roles/stortree_samba/tasks/main.yml").read_text()
+    )
+    for task in samba:
+        assert "when" in task, task["name"]
+        assert "stortree_samba_hosts" in str(task["when"]), task["name"]
+
+
+def test_the_mounts_verification_covers_the_paths_the_role_creates():
+    # The re-stat at the end of stortree_mounts only closes the
+    # ignore_errors gap for paths it actually looks at. Both sources the
+    # creation tasks loop over -- the mount plan and the per-user
+    # containers' staging paths -- have to appear in its loop, or a whole
+    # family of directories goes back to failing silently.
+    tasks = yaml.safe_load(
+        (REPO_ROOT / "roles/stortree_mounts/tasks/main.yml").read_text()
+    )
+    verify = [t for t in tasks if t["name"].startswith("Re-stat")]
+    assert len(verify) == 1
+    loop = verify[0]["loop"]
+    assert "stortree_mounts_plan" in loop
+    # The verification loop walks the whole plan, both layers: a
+    # transport mountpoint under the remotes root and a presented path
+    # in the tree are both things this apply was supposed to create.
+    assert "stortree_remotes_root" in str(verify[0]["ansible.builtin.stat"]["path"])
+    # ...and it must not re-report a masked path, which has its own
+    # runbook entry rather than being a failure.
+    assert "stortree_path_masked" in str(verify[0]["when"])
+
+
+def test_the_metrics_fragment_lives_in_the_directory_stortree_common_creates():
+    # stortree_metrics_fragment is spelled as a literal path rather than
+    # "{{ stortree_etc }}/..." because stortree_etc is a stortree_common
+    # default and playbooks/metrics-targets.yml applies stortree_facts
+    # alone -- the same constraint that put stortree_root in
+    # stortree_facts. The cost of that literal is this guard: change
+    # stortree_etc and the fragment would otherwise be written into a
+    # directory nothing creates, and read back from one nothing wrote.
+    etc = role_defaults("stortree_common")["stortree_etc"]
+    assert (
+        role_defaults("stortree_facts")["stortree_metrics_fragment"]
+        == f"{etc}/metrics-targets.json"
+    )
+
+    # ...and the guard only holds while the writer and the reader both
+    # go through the variable instead of re-spelling the path. (The
+    # role names `metrics-targets.json.j2` as a template *source*, which
+    # is a file in the role, not the destination on the host.)
+    for path in (
+        REPO_ROOT / "roles/stortree_mounts/tasks/main.yml",
+        REPO_ROOT / "playbooks/metrics-targets.yml",
+    ):
+        text = path.read_text()
+        assert "stortree_metrics_fragment" in text, path
+        # Comments stripped: both files explain /etc/stortree's 0750 in
+        # prose, and prose about a path is not a second spelling of it.
+        directives = "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert etc not in directives, path

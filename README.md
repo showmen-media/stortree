@@ -10,10 +10,19 @@ CLI: a control node (an operator's machine or CI) runs `ansible-playbook`
 against the fleet over plain SSH, the same way you'd run any other
 Ansible project.
 
-> 🚧 **Implemented, not yet run against real hosts.** All roles and both
-> playbooks exist; the Docker-based test harness is scaffolded but hasn't
-> been executed here. See [docs/plan.md](docs/plan.md) for current status
-> and [docs/spec.md](docs/spec.md) for the full design.
+> **Status: running in production against a real fleet; the Molecule
+> harness has never been run.** A good deal of the design below is scar
+> tissue from live applies — the `PartOf=` on nested mounts, the
+> presentation mounts for granted nodes, the non-fatal directory
+> creation, and
+> the unknown-key rejection each exist because the obvious version broke
+> on real hosts; those incidents are recorded at their point of
+> implementation. What that leaves untested is the *clean-slate* path:
+> nothing has ever applied these roles to a host that didn't already have
+> them, which is exactly what the Docker-based scenario in
+> `molecule/full-tree/` would cover. See
+> [docs/plan.md](docs/plan.md) "What's verified" for the precise line
+> between the two, and [docs/spec.md](docs/spec.md) for the full design.
 
 ## Why
 
@@ -48,6 +57,14 @@ needs.
   tree that carries a `samba:` config. There's no "designated Samba
   host," and a host doesn't need to be named in `config.yml` to join in
   — see [docs/config-schema.md](docs/config-schema.md).
+- **Optional Prometheus metrics**, off by default: each rclone mount
+  publishes its own endpoint (one process, one mount — no separate
+  rclone or manager can adopt mounts it didn't start), with ports
+  derived per node so an unrelated config edit never renumbers and
+  remounts the rest. Enable it fleet-wide or per host from inventory,
+  and `playbooks/metrics-targets.yml` collects every host's endpoints
+  into one `file_sd` list — see
+  [docs/runbook.md](docs/runbook.md) "Publishing rclone metrics".
 - **Automatic peer routing** — a host that needs data owned by another
   host in the tree — most often to assemble a complete Samba share it
   doesn't itself own, per the point above — gets SSH trust to that owning
@@ -113,8 +130,21 @@ role/playbook layout, and the Molecule test harness — are in
 
 ## Requirements
 
-On the control node: `ansible` plus the `ansible.posix` and
-`community.crypto` collections (see `requirements.txt`/`requirements.yml`).
+**Managed hosts must be Debian-based.** The roles install packages with
+`ansible.builtin.apt`, use Debian's package names directly
+(`samba-common-bin`, `libpam-modules`), and call `pam-auth-update` — so
+any apt/dpkg distro works, and a non-apt host fails on the first task of
+`stortree_mounts`. Debian and Ubuntu are what the roles declare in
+`meta/main.yml` and the only ones actually applied to; other derivatives
+should work but haven't been tried. Nothing else in the design is
+distro-specific — rclone, Samba and SSSD are configured through their own
+files, not through anything Debian-shaped — so porting elsewhere means
+replacing the five `apt` tasks, the package names, and the
+`pam-auth-update` call, not reworking the roles.
+
+On the control node: `ansible` plus the `ansible.posix`,
+`community.crypto` and `community.general` collections (see
+`requirements.txt`/`requirements.yml`).
 On every managed host: existing, well-known Linux storage/identity
 tooling that the roles configure rather than reinvent — `rclone`, `samba`,
 `sssd`, and `samba-common-bin`/`libpam-modules`. See
@@ -136,6 +166,12 @@ cp stortree/rclone.conf.example stortree/rclone.conf
 ansible-vault encrypt stortree/ldap.yml stortree/rclone.conf
 ```
 
+Operator settings that aren't part of the tree — Samba globals, whether
+hosts publish metrics — go in ordinary Ansible inventory files, also
+uncommitted:
+`inventory/group_vars/all.yml.example` for the fleet and
+`inventory/host_vars/<host>.yml.example` for one host.
+
 Then `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 && .venv/bin/ansible-galaxy collection install -r requirements.yml`. See
 [docs/runbook.md](docs/runbook.md) for day-to-day operator commands.
@@ -143,8 +179,7 @@ Then `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ## Tests
 
 Everything except the Molecule scenario runs in seconds on a checkout,
-with no Docker and no hosts to talk to, and runs on every push via
-[GitHub Actions](.github/workflows/ci.yml):
+with no Docker and no hosts to talk to:
 
 ```
 pytest                       # resolution, filters, and rendered templates
@@ -160,29 +195,36 @@ them to plays, and the roles' Jinja templates, rendered through
 ansible-core's own filters against real `resolve()` output so a systemd
 unit or `smb.conf` can be asserted on without a host to apply it to.
 
-The multi-host Molecule scenario is the one thing that isn't automatic
-— it needs privileged systemd-in-Docker containers and has never been
-run. It has its own manually dispatched workflow
-([.github/workflows/molecule.yml](.github/workflows/molecule.yml)), or
-run it locally with `cd molecule/full-tree && molecule test`. See
+The multi-host Molecule scenario is the exception — it needs privileged
+systemd-in-Docker containers and has never been run. Run it locally with
+`cd molecule/full-tree && molecule test`. See
 [docs/plan.md](docs/plan.md) "What's verified".
+
+GitHub Actions workflows for all of the above (`ci.yml` on every push,
+`molecule.yml` on manual dispatch) are written but not yet on `master` —
+they live on the `github-workflows` branch. Until that's merged, the
+commands above are run by hand.
 
 ## Docs
 
-- [docs/spec.md](docs/spec.md) — architecture, role/playbook layout, and
-  the Molecule-based test harness design.
+- [docs/spec.md](docs/spec.md) — the specification: architecture,
+  role/playbook layout, and the Molecule-based test harness design.
 - [docs/config-schema.md](docs/config-schema.md) — full schema reference
-  for `config.yml`, `ldap.yml`, and `rclone.conf`.
-- [docs/plan.md](docs/plan.md) — build status and the phased build plan.
+  for `config.yml`, `ldap.yml`, and `rclone.conf`, including how the
+  three derived name schemes work ("Names and identity").
+- [docs/plan.md](docs/plan.md) — how it was built, the interpretation
+  calls made along the way, and what is and isn't verified.
 - [docs/runbook.md](docs/runbook.md) — operator commands.
 
 ## Status
 
-All roles and both playbooks are implemented — see
-[docs/plan.md](docs/plan.md) for exactly what's been verified so far
-(unit tests, syntax checks, lint) versus what still needs a live Molecule
-run before trusting this against real hosts. Contributions and design
-feedback are welcome via issues.
+All roles and both playbooks are implemented and applied to a real
+fleet. The gap is the clean-slate path: `molecule test` has never been
+run in any scenario, so nothing has verified a first apply against a
+host that didn't already have these roles on it — see
+[docs/plan.md](docs/plan.md) "What's verified" for exactly which checks
+back which claim. Contributions and design feedback are welcome via
+issues.
 
 ## License
 

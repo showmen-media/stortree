@@ -1,16 +1,18 @@
 # stortree — build plan
 
-Tracks how [spec.md](spec.md) gets implemented, and current status. Section
-references below (`§1`, `§2`, ...) are spec.md's Architecture sections.
+How [spec.md](spec.md) got built: the judgment calls made where the spec
+left something implicit, the phases the work was done in, and what is
+and isn't verified. Section references below (`§1`, `§2`, ...) are
+spec.md's Architecture sections.
 
 ## Status
 
-Everything through phase 9 below is implemented: `resolve()`, all ten
-roles, both playbooks, and Molecule scaffolding for a per-role `default`
-scenario plus one multi-host `full-tree` scenario. What's **not** done is
-running `molecule test`/`molecule converge` against real Docker containers
-— see "What's verified" below for exactly what has and hasn't been
-exercised.
+Every phase below is done, and each says so. The list is kept as the
+record of how the project was built, not as a tracker to update — what
+is true of the code *today* is whatever `pytest`, `ansible-lint` and
+`yamllint --strict` say when you run them, and `git log` is the account
+of how it changed. The one thing no check here covers is in "What's
+verified" below, and that gap is real rather than pending.
 
 ## Repo hygiene
 
@@ -77,26 +79,126 @@ implementation:
    spec.md at all — every existing mechanism enforces a *descendant's*
    `access` grant, never the per-user container path itself
    (`home/jd`), which every task in `stortree_mounts` left at the plain
-   `stortree:stortree` default. Resolved to: `user_container_paths()`
+   `stortree:stortree` default. Resolved to: `_plan_user_containers()`
    (`filter_plugins/stortree.py`) derives the one real user each
    container belongs to, and `stortree_mounts` gives it real ownership —
    but *how* depends on what's above it, since that's the one thing this
    call couldn't just apply uniformly: a plain `chown`/`chmod` for a
    container nested under a genuinely local top-level subtree (`host`
    set, no `rclone`), since real, native Unix ownership already works
-   there; a dedicated per-user "wrapper mount" (`rclone mount`'s `local`
-   backend, source = a `stortree-user-<name>` sibling of the container,
-   target = the container itself, that user's real `--uid`/`--gid`/
-   `--dir-perms`) for one nested inside a remote-backed ancestor's own
-   rclone mount instead, discovered the hard way against a live
-   deployment: a plain `chown` there is accepted by the FUSE layer
-   (Ansible reports `changed`) but never actually persists, since a
-   single rclone mount can only ever present one uniform owner for
-   everything under it. That same constraint is also why a sibling
+   there; a **presentation mount** (`bindfs`, source = the same path
+   under `stortree_remotes_root`, target = the node itself, the
+   resolved grant as `-u`/`-g`/`-p`) for one nested inside a
+   remote-backed ancestor's own rclone mount instead, discovered the
+   hard way against a live deployment: a plain `chown` there is accepted
+   by the FUSE layer (Ansible reports `changed`) but never actually
+   persists, since a single mount can only ever present one uniform
+   owner for everything under it.
+
+   Generalised since: the identical problem applies to *any* node with
+   an `access` grant and no `rclone.remote` of its own, not just a
+   per-user container, and the same two-layer mechanism now covers
+   both -- the raw rclone mount moved out of the visible tree into
+   `stortree_remotes_root`, and a bindfs mount composes it back in under
+   the resolved grant. That same constraint is also why a sibling
    descendant with its own distinct ownership (a `group`-only grant's
-   bind mount, e.g. `mw-fam`) now has to wait for the wrapper mount too,
+   bind mount, e.g. `mw-fam`) has to wait for the presentation too,
    stacking its own real ownership on top exactly as it already stacked
-   on the outer mount before the wrapper existed (spec.md §6).
+   on the outer mount before (spec.md §6).
+
+5. **What a key the schema doesn't define should do**, and **what
+   counts as a `samba:` block.** Neither is stated anywhere. Both were
+   resolved the same way — silently ignoring input is the worst
+   available option for this particular program — after finding that
+   `resolve()` read the keys it recognized and discarded everything
+   else. Resolved to: `_validate_node()` in
+   `filter_plugins/stortree.py` rejects any key the schema doesn't
+   define, at the node level and inside `rclone:`/`access:`/`samba:`/
+   `client-defaults:`/`clients:`, naming the node and suggesting the
+   near match (docs/config-schema.md "Unknown keys are an error"). The
+   argument is the failure direction: every typo tested resolved to
+   something plausible and wrong, and several of them wrong in the
+   direction of *more* access or *more* peer trust than was written —
+   a misspelled `client-defaults` re-enables a subtree on every host
+   in the fleet and provisions the SSH trust for it, a misspelled
+   `access.group` drops the grant and leaves the path at its
+   permissive default. Failing at `resolve()` costs a run; the
+   alternative costs a silently wrong deployment nobody looks at
+   again. This subsumes the three-segment dotted key
+   (`rclone.args.vfs-cache-mode:`), which expands to a literal
+   `rclone.args` key under the documented last-dot rule and used to be
+   dropped without trace. `samba:` was then the same question one
+   level down: `_normalize_samba()` treats the key's *presence* as the
+   marker, so bare `samba:`, `samba: {}` and `samba: true` all mean
+   "share with the defaults" and only `samba: false` opts out. All
+   three used to mean the opposite — the first two resolved to no
+   share at all, and `samba: true` crashed `resolve()` outright with an
+   `AttributeError` from inside the share-building loop.
+
+6. **What a Samba share is called.** spec.md §4 describes the stanza's
+   contents and never names it, and config-schema.md had no key for it
+   — the name was an implementation detail of `smb.conf.j2`, which
+   folded the node path into a section header inline. Resolved to: the
+   fold stays the default (nothing an existing tree exports changes
+   name), an optional `samba.name` overrides it per node, and both now
+   resolve in `_share_name()`/`_normalize_samba()`
+   (`filter_plugins/stortree.py`) so the name is a resolved fact rather
+   than something the template invents — which is also what lets
+   `_validate_share_names()` reject two nodes claiming one name, a
+   collision `smb.conf` otherwise resolves by keeping the first stanza
+   and dropping the second. An operator-set name is validated against
+   the same alphabet the fold produces rather than being sanitized
+   silently (a name is typed into a mount command, so one that wouldn't
+   survive the fold is a mistake, not something to rewrite behind their
+   back), and `global`/`homes`/`printers` are rejected as reserved:
+   `[global]` in particular would merge into the generated global block
+   and rewrite fleet-wide settings instead of adding a share.
+
+7. **Whether "Samba sharing is universal" should be absolute.** The
+   spec states universality as a property, not as a default, and
+   nothing offered a way out of it. Resolved to: it stays the default
+   (no existing tree changes behaviour), but `stortree_samba_hosts`
+   (roles/stortree_facts/defaults/main.yml) narrows it. The argument
+   for making it adjustable at all is the cost, which is easy to miss
+   because the visible artifact — an `smb.conf` stanza — is the free
+   part: a host exporting a share it doesn't own peer-mounts that
+   content, so it pays an rclone process and a VFS cache per
+   peer-sourced path, and a cold read traverses SMB → sftp → the
+   owner's rclone → the third-party remote. N exporting hosts hold N
+   caches of identical bytes. That is the same duplication call #2
+   above went to some length to remove *within* a host, where one
+   shared mount plus bind mounts replaced one mount per group member;
+   across hosts a bind mount can't help, so the only available answer
+   is to let an operator say no. Hence the opt-out suppresses the peer
+   dependencies too, not just the stanza — suppressing only the stanza
+   would leave the entire cost in place and save nothing. A
+   fleet-level list rather than a per-host boolean because `resolve()`
+   has to reach the same conclusion about other hosts as they reach
+   about themselves (spec.md §1 rules out `hostvars`
+   cross-referencing), which is also what keeps `peer_served_by` — and
+   so the SSH trust `stortree_peer_trust` provisions — in step with
+   the mounts the other end actually makes.
+
+8. **What a run should report when a directory it was told to create
+   isn't there.** Every directory-creation task in `stortree_mounts`
+   is `ignore_errors: true`, for a reason established in production
+   (a stale mount aborting the play before the render/restart that
+   would fix it — call it out twice over, since it repeated
+   identically on every subsequent run). Nothing was stated about what
+   should happen afterwards, and what did happen was nothing: the run
+   reported success whether the directories appeared or not, so a full
+   disk and the transient it was meant to tolerate were
+   indistinguishable. Resolved to: a re-stat of every expected path at
+   the end of the role, *after* render/restart — by which point a
+   path that failed only because its mount was stale has usually
+   appeared — which always reports what is still missing and fails
+   only under `stortree_mounts_strict`. Advisory by default because
+   "missing on this apply" genuinely isn't an error: a brand-new
+   nested entry needs two runs by design, and failing the first would
+   break the documented pattern rather than catch a bug. Strict is for
+   a converged fleet, where a second apply should be clean — CI, or an
+   operator's own re-run. Masked paths are excluded: that is a known
+   state with its own runbook entry, not a missing directory.
 
 ## Phased build plan
 
@@ -135,53 +237,104 @@ implementation:
 
 ## What's verified
 
-Docker on the machine this was built on is in daily use for unrelated
-services, so `molecule test`/`molecule converge` (which needs privileged,
-systemd-in-Docker containers plus throwaway LDAP/sftp containers, §9) was
-deliberately **not** run here. Everything else now runs on every push
-via `.github/workflows/ci.yml`, rather than by hand:
+Three different things back the claims here, and it's worth keeping them
+apart: automated checks that run on a checkout, a real fleet this has
+been applied to, and one scenario that has never run at all.
 
-- `pytest` — three layers, all pure and hostless:
-  - `resolve()`/`filter_rclone_conf()` and the rest of
-    `filter_plugins/stortree.py`, including the mutual-peer-dependency,
-    client-only-host, and unnamed-inventory-host cases §1 calls out
-    explicitly. Statement *and* branch coverage of that module is at
-    100%, enforced by a `fail_under` floor in `pyproject.toml`.
-  - the `FilterModule` mapping itself (`tests/test_filters.py`) — that
-    every name a role pipes through is registered, and vice versa. A
-    typo there breaks every playbook while leaving the resolution tests
-    green, which is exactly what it used to do.
-  - the roles' Jinja templates (`tests/test_templates.py`) — the three
-    systemd unit templates, `smb.conf.j2` and `sssd.conf.j2`, rendered
-    through ansible-core's own filters/tests/`AnsibleUndefined` against
-    real `plan_mounts()`/`user_container_paths()` output. This is the
-    layer where a wrong `PartOf=` or a missing `--uid` becomes a mount
-    that silently serves the wrong thing, and it previously had no
-    coverage outside the unrun Molecule scenario.
-  - drift guards (`tests/test_repo_consistency.py`) — the worked example
-    exists in three copies (unit fixture, `stortree/config.yml.example`,
-    Molecule fixture) and `molecule/full-tree/converge.yml` claims to be
-    1:1 with `playbooks/site.yml`; both are now checked rather than
-    maintained by hand, along with the repo-hygiene rule above.
-- `ansible-playbook playbooks/site.yml --syntax-check` and the same for
-  `status.yml`, run against config copied from the `*.example` files by
-  the same commands README.md gives an operator — so a stale example
-  fails CI rather than someone's first run.
+**Applied in production.** These roles run against a real fleet, and a
+number of the design decisions above exist *because* the obvious version
+failed there — interpretation call #4's presentation mounts (a plain `chown`
+inside an rclone mount reports `changed` and silently doesn't persist),
+the non-fatal directory creation in `stortree_mounts` (a stale mount
+blocking the very render that would fix it, twice in a row), the
+`PartOf=` on nested mounts, and the multi-name `getent` loop in
+`stortree_secrets` (Ansible's `hash_behaviour: replace` clobbering all
+but the last lookup). Each is marked at its point of implementation with
+what it broke. That is real evidence, but it is evidence about *these*
+hosts in *their* current state — it says nothing about a first apply
+onto a clean one, which is the gap below.
+
+**Measured in production**, when the presentation layer moved from
+`rclone mount` to `bindfs`. Four presentation mounts over a 1000-file
+tree on the fleet's most distant host — the one that peer-mounts
+everything, so it has the longest path to the backend:
+
+| | rclone | bindfs |
+| --- | --- | --- |
+| recursive `ls -lR` | 0.178s median | 0.135s median |
+| resident memory, 4 mounts | 47.28 MB | 1.46 MB |
+| write via the transport, `stat` via the presented path | not visible after 10s | visible immediately |
+
+The staleness row is the correctness one: a presentation mount's whole
+job is to re-present a path something else is writing, and rclone's VFS
+directory cache hid a new file for longer than the test would wait.
+
+Under concurrency the single-threaded presentation holds up — per-listing
+latency *falls* from 0.133s at K=1 to 0.056s at K=16, and wall time grows
+sub-linearly (16× the work in 6.8× the time). Sequential reads pay
+nothing measurable for the extra layer: 98.6–99.3 MB/s through the
+presentation against 94.6–96.4 MB/s straight off the transport mount.
+Metadata-only listings are the one place the layer shows, at roughly 3.7×
+on a warm cache — a microbenchmark's worst case for a passthrough
+filesystem, and the reason the numbers above are recorded rather than
+assumed. A bind-mounted descendant bypasses the presentation entirely
+(it is its own mount at that path), so nothing fanned out that way pays
+even that.
+
+Run by hand on a checkout (and by `ci.yml` on the unmerged
+`github-workflows` branch, which is why this says "by hand"):
+
+- `pytest` — the pure resolution layer, the `FilterModule` mapping, the
+  roles' real Jinja templates rendered through ansible-core's own
+  filters, and a set of drift guards over the things this repo keeps in
+  more than one place. Each `tests/*.py` opens with what it covers and
+  why; that's the description, not this list. Statement *and* branch
+  coverage of `filter_plugins/stortree.py` is at 100%, enforced by a
+  `fail_under` floor in `pyproject.toml`, so a new branch has to arrive
+  with the test that exercises it.
+- `ansible-playbook playbooks/site.yml --syntax-check`, and the same for
+  `status.yml` and `metrics-targets.yml`, against config copied from the
+  `*.example` files by the same commands README.md gives an operator —
+  so a stale example fails before someone's first run does.
 - `ansible-lint` (clean at the `production` profile) and `yamllint
-  --strict` over the whole repo. Both were run by hand at the time this
-  section was first written and had since drifted red; the skips that
-  remain are listed with their rationale in `.ansible-lint`.
+  --strict` over the whole repo. The skips that remain are listed with
+  their rationale in `.ansible-lint`.
 - `shellcheck` over `pam-smbpass-sync.sh`, which runs as root inside the
   PAM stack with a plaintext password on stdin.
 
-Still not run: `molecule test` for any role, or the `full-tree`
-scenario. The scenario files exist, are checked for internal consistency
-by `tests/test_repo_consistency.py`, and are believed correct, but
-remain unexercised — before trusting this against real hosts, run at
-least the `full-tree` scenario (`cd molecule/full-tree && molecule
-test`, the manually dispatched `.github/workflows/molecule.yml`, or
-per-role via `cd roles/<role> && molecule test`) somewhere Docker
-capacity isn't shared with other workloads, then a staging pass
-(`ansible-playbook site.yml --check --diff` against real hosts, then a
-real apply) per spec.md §9's own caveat about what Molecule-in-Docker
-does and doesn't prove.
+**Not run: Molecule, in any scenario.** `molecule test`/`molecule
+converge` needs privileged systemd-in-Docker containers plus throwaway
+LDAP/sftp containers (§9), and Docker on the machine this was built on
+is in daily use for unrelated services. The scenario files exist and are
+checked for internal consistency by `tests/test_repo_consistency.py`,
+but nothing has ever applied a role to a container, mounted a real
+remote, or exercised a genuine two-host peer dependency.
+
+**Not applied to a host: the metrics endpoints.** The allocation, the
+listener resolution, both unit templates, the target fragment, the
+flavour decision and every branch of the role's safety assert are
+covered by `pytest`, and the collector playbook round-trips against a
+local inventory. What no check here touches is the claim the whole
+design rests on — that rclone exits when it cannot bind its listener,
+which on a `Type=notify` unit makes a misconfigured endpoint a failed
+*mount* rather than a missing counter, taking every presentation and
+bind above it with it through `PartOf=`. That is read from upstream
+behaviour, not watched on these hosts. It is also why the feature
+defaults to off, why the first enable belongs behind `--limit`
+([runbook.md](runbook.md) "Publishing rclone metrics"), and why the
+role fails the apply on a port collision or an unresolvable interface
+rather than letting either reach a unit file.
+
+That is the gap, and it is specifically the **clean-slate** gap: the
+production fleet above only ever exercises an apply onto hosts that
+already converged once, so the one path with no evidence behind it at
+all is the first apply onto a host that has never seen these roles —
+package installation, the initial SSSD join, peer trust bootstrapped
+from nothing, and a mount established where no directory yet exists.
+Closing it means running at least the `full-tree` scenario (`cd
+molecule/full-tree && molecule test`, or per-role via `cd roles/<role>
+&& molecule test`) somewhere Docker capacity isn't shared with other
+workloads — see spec.md §9's own caveat about what Molecule-in-Docker
+does and doesn't prove. Adding a *new* host to the existing fleet walks
+the same untested path, so `--check --diff` first is worth it there even
+though the fleet itself is long past its first apply.

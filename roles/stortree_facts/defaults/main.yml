@@ -1,4 +1,32 @@
 ---
+# The fixed mount root on every managed host -- every path in the
+# resolved tree hangs off this one. It lives here, rather than with the
+# service account in roles/stortree_common/defaults/main.yml, because
+# stortree_resolve() below needs it (a client mount of a subtree this
+# host doesn't own resolves to a peer reference with the owning host's
+# absolute path baked in) and stortree_facts is the one role every play
+# applies -- playbooks/status.yml applies it alone, where another role's
+# defaults would not be in scope. Overriding it in inventory/group_vars
+# beats this either way; kept in step with
+# filter_plugins/stortree.py's own DEFAULT_STORTREE_ROOT fallback by a
+# drift guard in tests/test_repo_consistency.py.
+stortree_root: /srv/stortree
+
+# Where layer-1 (transport) rclone mounts live -- a local directory on
+# every managed host, deliberately outside stortree_root and never part
+# of the visible tree (docs/spec.md §2 "The two layers"). It mirrors the
+# tree, so <stortree_remotes_root>/<path> and <stortree_root>/<path> are
+# the same directory on the backend reached by two different local
+# paths.
+#
+# It is local, which is the point: nothing here is ever written to a
+# backend, so a remote's own directory structure holds only the paths
+# config.yml describes. Kept in step with
+# filter_plugins/stortree.py's DEFAULT_STORTREE_REMOTES_ROOT by the same
+# drift guard in tests/test_repo_consistency.py that covers
+# stortree_root.
+stortree_remotes_root: /srv/.stortree-remotes
+
 # Paths on the control node, relative to the playbook. Override if your
 # stortree/ checkout lives somewhere else (spec.md "Config layout").
 stortree_repo_root: "{{ playbook_dir }}/.."
@@ -13,3 +41,161 @@ stortree_sshd_config_path: "{{ stortree_repo_root }}/stortree/sshd_config"
 # holds hosts that aren't part of the stortree fleet (e.g. the mocked
 # LDAP/sftp containers in the `full-tree` Molecule scenario).
 stortree_all_hosts: "{{ groups['all'] }}"
+
+# Which hosts actually export Samba shares. Defaults to the whole fleet
+# -- "Samba sharing is universal" (config-schema.md) is the design's
+# baseline and stays the default, so an existing tree's behaviour is
+# unchanged by this variable existing.
+#
+# It's worth being explicit about what universality costs, because it is
+# not free and it is paid per host: a host that exports a share whose
+# content it doesn't own peer-mounts that content over sftp from the
+# owning host, which means its own rclone process and its own VFS cache
+# of the same bytes. A cold read then traverses SMB -> sftp -> the
+# owner's rclone -> the third-party remote, and N exporting hosts hold N
+# independent caches of identical content. That is exactly the
+# duplication interpretation call #2 (docs/plan.md) went out of its way
+# to eliminate *within* a host, where one shared mount plus bind mounts
+# replaced one full mount per group member; across hosts the same
+# argument applies, but the answer can't be a bind mount, so it has to
+# be a choice instead.
+#
+# Narrow this list (in inventory or group_vars) for a host that has no
+# business serving SMB at all -- a host that is only a client of the
+# tree, or one kept in the fleet purely to own a subtree others consume.
+# It is a fleet-level list rather than a per-host boolean for the same
+# reason stortree_all_hosts is: resolve() is a pure per-host function
+# that must reach the same conclusion about *other* hosts as they reach
+# about themselves, and a per-host var would need hostvars
+# cross-referencing to do that (spec.md §1 rules that out). A list every
+# host sees identically keeps peer_served_by on the serving side in step
+# with the peer_dependencies the consuming side actually resolves, so a
+# host never provisions SSH trust for a mount the other end has opted
+# out of making.
+stortree_samba_hosts: "{{ stortree_all_hosts }}"
+
+# -- rclone metrics endpoints ---------------------------------------------
+#
+# Off by default, and an apply changes nothing on a host until it is
+# turned on. These live here, with stortree_samba_hosts and the two
+# roots, rather than in stortree_mounts where they are rendered: the
+# same settings have to be in scope for playbooks/metrics-targets.yml,
+# which applies stortree_facts and nothing else.
+#
+# None of this belongs in config.yml, deliberately. That file describes
+# the *tree* -- what exists, who owns it, who may read it -- and is
+# consumed by a pure per-host function whose answers about a host must
+# agree with the answers that host reaches about itself (spec.md §1).
+# Whether a host publishes counters is none of that: it is local
+# operational policy, it changes on its own cadence, and nothing on any
+# other host changes because of it. Which is also why this is a plain
+# boolean an operator can set per host -- unlike stortree_samba_hosts,
+# which has to be one fleet-wide list precisely because every host's
+# peer-trust provisioning depends on what the *others* decided.
+#
+# Set it in group_vars/all.yml for the fleet, group_vars/<group>.yml or
+# host_vars/<host>.yml for a subset -- ordinary Ansible precedence, no
+# list of opted-in hosts needed. See docs/runbook.md "Publishing rclone
+# metrics".
+stortree_metrics_enabled: false
+
+# Where each mount's metrics server listens: addresses, interface names
+# ("wg0", "br-lan" -- resolved against this host's own gathered facts at
+# render time), or a mix. rclone binds addresses, never interfaces, so a
+# name that resolves to nothing fails the apply rather than quietly
+# falling back to a wildcard bind.
+#
+# Loopback by default because there is no firewall role in this repo:
+# this list *is* the access control. A scraper elsewhere reaches a
+# loopback endpoint over an SSH tunnel or through an agent running on
+# the host itself; naming an interface here is what publishes it.
+#
+# One caveat worth knowing before you name a late-appearing interface
+# (WireGuard, a bridge brought up by something other than networkd):
+# rclone binds at startup and exits if the address isn't there yet, and
+# the transport unit is Type=notify, so that is a failed *mount*, not a
+# missing counter. The unit orders itself after the interface's .device
+# unit where it can, and its existing Restart=on-failure/RestartSec=5
+# covers the rest -- but only within systemd's default start-limit
+# burst. An interface that takes minutes to appear needs the mount
+# restarted by hand afterwards.
+stortree_metrics_bind:
+  - 127.0.0.1
+
+# Every mount is its own rclone process and so needs its own port (see
+# metrics_ports() in filter_plugins/stortree.py for why this is an
+# availability concern rather than a monitoring one). Ports are derived
+# from each node's path within [base, base + span), which keeps them
+# stable across unrelated config.yml edits.
+#
+# 20000-29999 stays clear of the well-known ports a storage host
+# actually runs -- losing a mount to node_exporter's 9100 would be a
+# baffling outage -- and below the 32768 floor of Linux's default
+# ip_local_port_range, so no listener races an outbound connection's
+# ephemeral port. Narrow the span if you would rather firewall a smaller
+# range; the derivation collides more often as it shrinks, and a
+# collision fails the apply with both paths named.
+stortree_metrics_base_port: 20000
+stortree_metrics_port_span: 10000
+
+# Escape hatch, keyed by tree path: `{tree/home: 20500}` pins one node's
+# port, whether to resolve a reported collision or to put a mount
+# somewhere a firewall rule already names.
+stortree_metrics_port_overrides: {}
+
+# Which flag the units render, because the two spellings are not
+# interchangeable and the wrong one is a failed mount:
+#
+#   metrics-addr  --metrics-addr, rclone >= 1.68. Serves /metrics and
+#                 nothing else.
+#   rc            --rc --rc-enable-metrics --rc-addr, every older
+#                 rclone. Serves /metrics *and the whole rc API*,
+#                 including config/dump -- which reads back this host's
+#                 scoped rclone.conf, credentials and all. Note that
+#                 --rc-addr only became repeatable in 1.63, so on a
+#                 host older than that a stortree_metrics_bind with
+#                 several entries quietly listens on the last one
+#                 alone.
+#   auto          read `rclone version` on the host and pick. The
+#                 default, because the roles install rclone from apt
+#                 (bookworm ships 1.60.1, eight releases before
+#                 --metrics-addr existed) and a fleet spanning two
+#                 Debian releases would otherwise need this set per
+#                 host. Falls back to `rc` if the version can't be
+#                 parsed: the conservative choice, since it works on
+#                 every rclone and the assert below keeps it off the
+#                 network unauthenticated.
+stortree_metrics_flavour: auto
+
+# Path on the managed host to an htpasswd file for the metrics endpoint,
+# or null for no authentication.
+#
+# Mandatory for the `rc` flavour -- the apply refuses without it --
+# including on loopback, which is not a trust boundary on these hosts.
+# Every LDAP user with a shell here is local, that being rather the
+# point of the tree, and an unauthenticated rc endpoint on 127.0.0.1
+# hands any of them the whole scoped rclone.conf that /etc/stortree's
+# own 0750 exists to keep away from them.
+#
+# Optional for the `metrics-addr` flavour, which serves counters and no
+# config endpoints at all -- worth setting anyway if you bind it to a
+# network where you would not publish your transfer volumes.
+#
+# stortree does not create this file; put it on the host however you
+# manage secrets, and keep it readable by the stortree service account.
+stortree_metrics_htpasswd: null
+
+# Where playbooks/metrics-targets.yml writes the combined file_sd list.
+# A control-node path, like the stortree_repo_root paths above it:
+# point it straight at the directory your Prometheus reads file_sd from
+# if the control node is also the scraper, or leave it in the checkout
+# and ship it from there. See prometheus/prometheus.yml.example.
+stortree_metrics_targets_file: "{{ stortree_repo_root }}/prometheus/stortree-targets.json"
+
+# Where each host writes the Prometheus file_sd fragment describing its
+# own endpoints, and where playbooks/metrics-targets.yml reads them back
+# from. Spelled literally rather than as "{{ stortree_etc }}/..." because
+# stortree_etc is a stortree_common default, and the plays that only
+# read state never apply that role. Kept in step with it by a drift
+# guard in tests/test_repo_consistency.py.
+stortree_metrics_fragment: /etc/stortree/metrics-targets.json

@@ -1,0 +1,101 @@
+---
+# Read-only: collect every host's metrics endpoints into one Prometheus
+# file_sd list on the control node. No state-changing modules touch a
+# managed host -- the only thing written is the target file, on the
+# control node, so this is safe to run on a schedule.
+#
+# Usage: ansible-playbook playbooks/metrics-targets.yml
+#        ansible-playbook playbooks/metrics-targets.yml \
+#          -e stortree_metrics_targets_file=/etc/prometheus/stortree.json
+#
+# Each host wrote its own fragment during the last site.yml apply
+# (roles/stortree_mounts, metrics-targets.json.j2), so this collects
+# rather than recomputes: the control node never needs the LDAP group
+# memberships a mount plan is resolved against, and what lands in
+# Prometheus is what the units on those hosts actually render.
+#
+# Re-run it after any apply that changes which mounts exist or which
+# addresses they bind. A host with metrics switched off contributes
+# nothing and drops out of the list, which is the intended way to
+# retire one.
+#
+# See docs/runbook.md "Publishing rclone metrics".
+
+- name: Collect each host's rclone metrics endpoints
+  hosts: all
+  become: true
+  gather_facts: false
+  # Stated rather than assumed: the assembly task reads every other
+  # host's collected rows out of hostvars, which is only complete once
+  # every host has finished the task that set them -- exactly the
+  # ordering `free` gives up.
+  strategy: linear
+  roles:
+    # For stortree_metrics_fragment -- the one setting this needs, and
+    # the reason it's a stortree_facts default rather than a
+    # stortree_mounts one.
+    - stortree_facts
+  tasks:
+    - name: Check whether this host publishes any endpoints
+      ansible.builtin.stat:
+        path: "{{ stortree_metrics_fragment }}"
+        get_checksum: false
+      register: stortree_metrics_fragment_stat
+      changed_when: false
+      tags: [metrics]
+
+    - name: Read this host's fragment
+      # /etc/stortree is 0750 stortree:stortree, hence become: true on
+      # the play -- an operator's own account cannot read this.
+      ansible.builtin.slurp:
+        src: "{{ stortree_metrics_fragment }}"
+      register: stortree_metrics_fragment_raw
+      when: stortree_metrics_fragment_stat.stat.exists
+      tags: [metrics]
+
+    - name: Keep this host's rows for the assembly step
+      ansible.builtin.set_fact:
+        stortree_metrics_rows: >-
+          {{ stortree_metrics_fragment_raw.content | b64decode | from_json }}
+      when: stortree_metrics_fragment_stat.stat.exists
+      tags: [metrics]
+
+    - name: Ensure the control node's target directory exists
+      # noqa: run-once[task] -- the rule's concern is run_once under
+      # the `free` strategy, which this play rules out above.
+      ansible.builtin.file:
+        path: "{{ stortree_metrics_targets_file | dirname }}"
+        state: directory
+        mode: "0755"
+      become: false
+      delegate_to: localhost
+      run_once: true
+      tags: [metrics]
+
+    - name: Write the combined file_sd target list on the control node
+      # run_once + delegate_to rather than a second `hosts: localhost`
+      # play, so stortree_facts' defaults are still in scope and the
+      # inventory's own view of the fleet is what gets walked.
+      #
+      # `groups["all"]`, not ansible_play_hosts: a host excluded by
+      # --limit contributes no rows fact, drops out through
+      # select("defined"), and its endpoints simply aren't refreshed --
+      # whereas walking the play's hosts would silently *delete* every
+      # unlimited host's targets from the file on a limited run.
+      # noqa: run-once[task] -- as above; one file, written once,
+      # from facts every host has already contributed.
+      ansible.builtin.copy:
+        content: "{{ stortree_metrics_targets | to_nice_json }}\n"
+        dest: "{{ stortree_metrics_targets_file }}"
+        mode: "0644"
+      vars:
+        stortree_metrics_targets: >-
+          {{ groups["all"]
+             | map("extract", hostvars, "stortree_metrics_rows")
+             | select("defined")
+             | flatten(levels=1)
+             | list }}
+      become: false
+      delegate_to: localhost
+      run_once: true
+      tags: [metrics]

@@ -1,0 +1,145 @@
+{#
+Layer 1, transport: the rclone mount for one node's `rclone.remote`,
+mounted under stortree_remotes_root at the node's own path rather than
+anywhere in the visible tree. The remotes root mirrors the tree, so
+<remotes_root>/<path> and <stortree_root>/<path> are the same directory
+on the backend reached by two different local paths. See
+docs/spec.md §2 "The two layers".
+
+This is the only layer that talks to a backend and the only layer that
+caches, so every operator-supplied rclone.args value is rendered here
+and nothing is split between layers.
+#}
+[Unit]
+Description=rclone transport mount %i (managed by stortree, do not edit by hand)
+After=network-online.target
+Wants=network-online.target
+{#
+PartOf= alongside the containment dependency: this mount's own
+mountpoint lives *inside* that other transport's tree, so when it
+restarts, this mount is silently detached -- the rclone process keeps
+running and systemd keeps reporting the unit active, while the path it
+was serving quietly reverts to whatever sits underneath. After=/Requires=
+don't help: they propagate start ordering and stop, never restart.
+PartOf= is the one that does.
+#}
+{% if entry.requires_transport %}
+After=stortree-remote@{{ entry.requires_transport }}.service
+PartOf=stortree-remote@{{ entry.requires_transport }}.service
+RequiresMountsFor={{ stortree_remotes_root }}/{{ entry.local_path }}
+{% endif %}
+{#
+Declared `requires` (docs/config-schema.md "Requires") attaches to layer
+1, not layer 2: what it expresses is a backend dependency -- most often
+a cache directory that has to be mounted before the mount writing into
+it -- and caching is entirely a transport concern now. Hard, not just
+ordered: without Requires= this mount would still start when its
+dependency is down, and rclone would then quietly fill the local disk at
+a path that gets shadowed the moment the real mount arrives.
+#}
+{% for req in entry.requires_mounts | default([]) %}
+After=stortree-remote@{{ req.slug }}.service
+Requires=stortree-remote@{{ req.slug }}.service
+RequiresMountsFor={{ stortree_remotes_root }}/{{ req.local_path }}
+{% endfor %}
+{#
+Ordering against the interface a metrics listener binds to, when
+stortree_metrics_bind names one (a literal address has no .device unit
+to wait for). rclone binds at startup and *exits* if the address isn't
+there yet, and this unit is Type=notify -- so a listener racing its own
+interface is a failed mount, not a missing counter.
+
+Wants=, never Requires=: a Requires= on a .device unit that doesn't
+exist yet fails the start job outright, and systemd does not retry that
+-- Restart=on-failure covers a process that died, not a dependency that
+was missing -- which would leave the mount down until someone restarted
+it by hand. Wants= orders behind the device when it's there and costs
+nothing when it isn't, leaving the existing Restart=on-failure to pick
+up an interface that arrives late.
+#}
+{% if stortree_metrics_enabled %}
+{% for listener in stortree_metrics_listeners if listener.device %}
+After={{ listener.device }}
+Wants={{ listener.device }}
+{% endfor %}
+{% endif %}
+
+[Service]
+Type=notify
+User={{ stortree_user }}
+Group={{ stortree_group }}
+{% set mount_path = stortree_remotes_root ~ '/' ~ entry.local_path %}
+ExecStart=/usr/bin/rclone mount {{ entry.remote }} {{ mount_path }} \
+{% for k, v in entry.args.items() %}
+  --{{ k }}{{ ' ' ~ (v | string) if (v is not sameas true) else '' }} \
+{% endfor %}
+{#
+This mount's own metrics endpoint. Per mount rather than per host
+because an rclone metrics server only ever reports the process it runs
+in: there is no host-wide endpoint to expose, and a separate manager or
+rcd cannot adopt these mounts (metrics_ports() in
+filter_plugins/stortree.py has the details, and the port allocation).
+
+Two spellings, decided per host by stortree_metrics_flavour, because
+--metrics-addr did not exist before rclone 1.68 and the roles install
+whatever apt has. The older one publishes the same counters on the rc
+port -- along with the entire rc API, which is why the role refuses to
+render it without --rc-htpasswd.
+
+One flag per resolved listener: both flags may be repeated, and the
+address is bracketed upstream when it's IPv6 so the listen string
+parses.
+#}
+{% if stortree_metrics_enabled %}
+{% set metrics_port = stortree_metrics_ports[entry.slug] %}
+{% if stortree_metrics_mode == 'rc' %}
+  --rc \
+  --rc-enable-metrics \
+  --rc-htpasswd {{ stortree_metrics_htpasswd }} \
+{% for listener in stortree_metrics_listeners %}
+  --rc-addr {{ listener.listen }}:{{ metrics_port }} \
+{% endfor %}
+{% else %}
+{% for listener in stortree_metrics_listeners %}
+  --metrics-addr {{ listener.listen }}:{{ metrics_port }} \
+{% endfor %}
+{% if stortree_metrics_htpasswd %}
+  --metrics-htpasswd {{ stortree_metrics_htpasswd }} \
+{% endif %}
+{% endif %}
+{% endif %}
+{#
+A transport presents one uniform stortree:stortree 0700 and carries no
+`access`-derived ownership at all. Ownership is layer 2's entire job,
+and doing it in both places is how the two mechanisms used to disagree.
+
+0700, not the tree's 0751: this is the raw, ungoverned view of the
+backend, where every node is visible regardless of who was granted what.
+Only the service account driving the presentation mounts above it, and
+root, have any business here -- see the remotes root's own mode in
+roles/stortree_mounts/tasks/main.yml.
+
+--allow-other is still required despite that. Without it FUSE restricts
+the mount to the mounting user alone, so root -- Ansible itself, which
+creates every directory in this tree -- cannot so much as stat() the
+mountpoint, and rclone's own --allow-root is silently ignored by the
+build this fleet runs ("Ignoring --allow-root. Support has been removed
+upstream"). The 0700 mode plus --default-permissions is what keeps
+everyone else out.
+
+--default-permissions makes the kernel actually check that mode. Without
+it FUSE skips permission checking and defers to the filesystem, rclone
+permits everything, and the mode above is decorative -- which is how any
+local account could read any path in the tree regardless of its grant.
+#}
+  --allow-other \
+  --default-permissions \
+  --dir-perms 0700 \
+  --file-perms 0600 \
+  --config {{ stortree_etc }}/rclone.conf
+ExecStop=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do mountpoint -q "{{ mount_path }}" || exit 0; /bin/fusermount -uz "{{ mount_path }}" || exit 0; done'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

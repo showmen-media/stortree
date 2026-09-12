@@ -15,10 +15,20 @@
     - name: Collect mount unit states
       # No ansible.builtin.systemd_service query mode covers "list every
       # unit matching a wildcard"; command is the actual right tool here.
+      #
+      # All three unit families stortree_mounts installs, not just
+      # stortree-mount@: a per-user bind mount (stortree-bind@) or a
+      # presentation mount (stortree-mount@) and its transport
+      # (stortree-remote@) can
+      # fail on its own while every rclone mount stays green, and a
+      # status report that can't show that is reporting a third of the
+      # picture. Matches the pattern list stortree_mounts itself uses to
+      # find and reset-failed these units.
       ansible.builtin.command:  # noqa: command-instead-of-module
         cmd: >-
           systemctl list-units --type=service --all --plain --no-legend
-          'stortree-mount@*.service'
+          'stortree-mount@*.service' 'stortree-bind@*.service'
+          'stortree-remote@*.service'
       register: stortree_status_mounts
       changed_when: false
       failed_when: false
@@ -46,7 +56,7 @@
           - "== {{ inventory_hostname }} =="
           - "server subtrees owned: {{ stortree.server_subtrees | map(attribute='path') | list }}"
           - "client mount: {{ 'yes' if stortree.client_mounts else 'no' }}"
-          - "samba shares exported: {{ stortree.samba_shares | map(attribute='node_path') | list }}"
+          - "samba shares exported: {{ stortree.samba_shares | map(attribute='name') | list }}"
           - "peer dependencies: {{ stortree.peer_dependencies | length }}"
           - "peer served by: {{ stortree.peer_served_by | map(attribute='serving_host') | unique | list }}"
           - "mount units: {{ stortree_status_mounts.stdout_lines }}"

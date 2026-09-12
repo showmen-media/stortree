@@ -1,4 +1,44 @@
 ---
+# Every task here is gated on this host being in `stortree_samba_hosts`
+# (roles/stortree_facts/defaults/main.yml), which defaults to the whole
+# fleet -- "Samba sharing is universal" (config-schema.md) stays the
+# baseline, and an operator narrows the list for a host that has no
+# business serving SMB. The gate is only half the opt-out: resolve()
+# reads the same list and returns no `samba_shares` *and* no samba peer
+# dependencies for an excluded host, so it also stops peer-mounting
+# content purely to back shares it no longer exports (see resolve()'s
+# docstring in filter_plugins/stortree.py -- that mount, not the
+# smb.conf stanza, is what universality actually costs).
+
+- name: Collect service facts on a host excluded from stortree_samba_hosts
+  # Only to answer "is there an smbd here to stop?" below -- a host that
+  # never served Samba has no such unit, and systemd_service would fail
+  # on it rather than cleanly doing nothing.
+  ansible.builtin.service_facts:
+  when: inventory_hostname not in stortree_samba_hosts
+  tags: [samba]
+
+- name: Stop and disable smbd on a host excluded from stortree_samba_hosts
+  # Converges a host that *used* to serve shares and has since been
+  # removed from the list. Without this it would keep exporting the last
+  # smb.conf this role rendered, whose share paths point at peer mounts
+  # resolve() no longer resolves -- shares backed by nothing, which is a
+  # worse state than either serving or not serving.
+  #
+  # The package and /etc/samba/smb.conf are deliberately left in place:
+  # removing a package and a config file the operator may also use for
+  # something else is not this role's call, and a stopped, disabled smbd
+  # already exports nothing. Delete both by hand if the host is done
+  # with Samba for good.
+  ansible.builtin.systemd_service:
+    name: smbd
+    state: stopped
+    enabled: false
+  when:
+    - inventory_hostname not in stortree_samba_hosts
+    - "'smbd.service' in (ansible_facts.services | default({}))"
+  tags: [samba]
+
 - name: Install samba
   ansible.builtin.apt:
     name: samba
@@ -6,6 +46,7 @@
     install_recommends: false
     update_cache: true
     cache_valid_time: 3600
+  when: inventory_hostname in stortree_samba_hosts
   tags: [samba]
 
 - name: Remove winbind
@@ -31,6 +72,7 @@
       - libnss-winbind
     state: absent
     autoremove: true
+  when: inventory_hostname in stortree_samba_hosts
   tags: [samba]
 
 - name: Regenerate PAM profiles now that winbind is gone
@@ -71,6 +113,7 @@
   environment:
     DEBIAN_FRONTEND: noninteractive
   changed_when: true
+  when: inventory_hostname in stortree_samba_hosts
   tags: [samba]
 
 - name: Render smb.conf (validated with testparm before it's written)
@@ -82,6 +125,7 @@
     mode: "0644"
     validate: "testparm -s %s"
   notify: stortree smb.conf changed
+  when: inventory_hostname in stortree_samba_hosts
   tags: [samba]
 
 - name: Ensure smbd is enabled and running
@@ -95,4 +139,5 @@
     name: smbd
     enabled: true
     state: started
+  when: inventory_hostname in stortree_samba_hosts
   tags: [samba]

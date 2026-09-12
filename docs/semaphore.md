@@ -126,6 +126,14 @@ Semaphore doesn't need.
 **"stortree — dry run"** (optional)
 - Same as apply, with CLI args `--check --diff`
 
+**"stortree — metrics targets"** (optional, read-only, see
+[metrics-targets.yml](../playbooks/metrics-targets.yml))
+- Playbook: `playbooks/metrics-targets.yml`
+- Same repository/inventory/vault key
+- Only worth adding once `stortree_metrics_enabled` is on somewhere, and
+  only with `stortree_metrics_targets_file` pointed somewhere that
+  outlives the run — see the gotcha below
+
 For occasional `--limit`/`--tags` runs (tags: `facts`, `common`,
 `identity`, `peer_trust`, `secrets`, `mounts`, `samba`,
 `pam_smbpass`, `sshd` — see [runbook.md](runbook.md#apply-just-one-concern)),
@@ -143,6 +151,14 @@ override" if your Semaphore version supports it.
 - **`become: true` with `ansible_user: root`** (per the inventory
   example) makes privilege escalation a no-op — no become-password
   prompt needed.
+- **The metrics target list is written on the control node**, which under
+  Semaphore is the runner — and its checkout is thrown away when the task
+  ends. `stortree_metrics_targets_file` defaults to
+  `{{ stortree_repo_root }}/prometheus/stortree-targets.json`, so left
+  alone the file is generated and then discarded. Override it in the
+  Variable Group to a path Prometheus actually reads, on a volume mounted
+  into the runner. Nothing fails if you don't; the list just never
+  reaches anything.
 - Run **"stortree — status"** first against a reachable host. It's
   non-destructive and confirms SSH, the `stortree_repo_root` override,
   and vault decryption all work before running the state-changing

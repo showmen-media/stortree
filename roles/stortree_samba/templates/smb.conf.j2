@@ -3,25 +3,77 @@
 # participating host (spec.md §4, config-schema.md "Samba sharing is
 # universal") -- not only the nodes this host happens to own.
 
+{# The [global] block stortree needs, plus whatever the operator adds.
+   `stortree_samba_globals` (roles/stortree_samba/defaults/main.yml)
+   merges over these, so a key of the same name overrides the built-in
+   value rather than duplicating it -- the same escape-hatch shape
+   ldap.yml's `extra:` already gives sssd.conf, and for the same reason:
+   no fleet's Samba settings are fully predictable from this tree, and
+   the alternative to an override is forking the template. `workgroup`
+   in particular is a per-site fact this project has no way to guess.
+
+   Not a free-for-all: `testparm -s` validates the rendered file before
+   it is written (the role's `validate:`), so a misspelled directive or
+   an illegal value fails the apply instead of landing on the host. What
+   it can't catch is an override that's valid but defeats the design --
+   `security` or `passdb backend` set to something the access model
+   doesn't assume, say -- which is why those carry their own comments
+   below rather than being silently overridable. #}
+{% set samba_globals = {
+  'workgroup': 'WORKGROUP',
+  'security': 'user',
+  'map to guest': 'never',
+  'nt acl support': 'yes',
+  'inherit permissions': 'yes',
+  'passdb backend': 'tdbsam',
+  'server min protocol': 'SMB2_02',
+} | combine(stortree_samba_globals | default({})) %}
+{# `security = user` + `passdb backend = tdbsam` are what make the whole
+   access model work: authentication is local, against the NT hashes
+   stortree_pam_smbpass syncs from LDAP (spec.md §5), and authorization
+   is the underlying Unix ownership/mode -- not a domain join, and not a
+   separate Samba-side ACL that could drift from the filesystem.
+   Overriding either is a real change to that model, not a tweak.
+
+   `server min protocol` is set explicitly rather than left implicit: it
+   matches what Samba >= 4.11 already defaults to (SMB2_02 -- SMB1 is
+   off on every platform meta/main.yml lists), so it changes nothing
+   today, but it makes the posture auditable in the rendered file and
+   keeps a future distro default from quietly lowering it. #}
 [global]
-workgroup = WORKGROUP
-security = user
-map to guest = never
-nt acl support = yes
-inherit permissions = yes
-passdb backend = tdbsam
+{% for key, value in samba_globals.items() %}
+{{ key }} = {{ value }}
+{% endfor %}
 
 {% for share in stortree.samba_shares %}
-[{{ share.node_path | regex_replace('[^A-Za-z0-9_-]', '_') }}]
+{# The section header is the name clients mount. resolve()
+   settles it -- the node's own `samba.name` where it sets one,
+   otherwise its path folded into a legal name -- and rejects two
+   nodes landing on the same one (config-schema.md "Share
+   names"). #}
+[{{ share.name }}]
    path = {{ stortree_root }}/{{ share.node_path }}{{ '/' ~ share.subpath if share.subpath else '' }}
    read only = no
+{# `samba.hidden` keeps the share out of the host's browse list. It is
+   not access control -- `valid users` below is that, and this does not
+   touch it -- and the share stays mountable by its exact name. It's for
+   the shares no person browses for: an appliance's backup target, a
+   camera recorder's spool. Emitted only when set, so an ordinary share's
+   stanza is byte-identical to what it was before the key existed. #}
+{% if share.hidden %}
+   browseable = no
+{% endif %}
    {# stortree_samba_access_tokens (filter_plugins/stortree.py) quotes
       each principal -- smb.conf(5) "lists" are otherwise
       whitespace-delimited, and a name can contain a space (e.g. "Michael
       Whitfield Family", config-schema.md's worked example) -- and, for a
       %U-templated share, adds %U itself as a standing entry (spec.md
-      §6): the share's own path already confines each connecting user to
-      their own subtree, so their baseline access there shouldn't depend
+      §6). `subpath` is derived rather than configured -- it is %U for a
+      node with a `user-subdirs` key and unset otherwise
+      (_normalize_samba())
+      -- so "has a subpath" and "is per-user" are the same question. For
+      those, the share's own path already confines each connecting user
+      to their own subtree, so their baseline access there shouldn't depend
       on any particular descendant's `access` grant existing at all. A
       descendant with its own remote (e.g. mw-fam) doesn't strictly need
       its grant repeated here either way -- stortree_mounts already
@@ -29,10 +81,14 @@ passdb backend = tdbsam
       level) -- but leaving it in this union is harmless (%U already
       subsumes it for reaching one's own tree) and still correct for a
       plain local descendant with no mount of its own to enforce it. #}
-   {% set include_self = share.subpath and '%U' in share.subpath %}
+   {% set include_self = share.subpath is not none %}
    valid users = {{ share.access | stortree_samba_access_tokens(include_self) | join(' ') }}
 
-   write list = {{ share.access | selectattr('permissions', 'search', 'w') | list | stortree_samba_access_tokens(include_self) | join(' ') }}
+   {# Narrowed per principal rather than per grant
+      (stortree_samba_write_tokens): a grant's owner and its group can
+      carry different levels, so "who may write here" is a question
+      about each token, not about the grant it came from. #}
+   write list = {{ share.access | stortree_samba_write_tokens(include_self) | join(' ') }}
 
 
 {% endfor %}

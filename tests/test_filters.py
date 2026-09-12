@@ -40,24 +40,22 @@ SOURCES = sorted(
 # the many `stortree_*` *variables* (stortree_root, stortree_mounts_plan,
 # ...) that share the prefix. `\s` spans newlines, which matters: the
 # roles routinely break a long expression across lines after the pipe.
-_FILTER_CALL = re.compile(r"\|\s*(stortree_[a-z_]+)")
-
-# Registered on purpose without a caller in this repo. `path_masked`'s
-# sibling filters all back a role task; this one is the pure function
-# plan_mounts()/user_container_paths() use internally, exposed so an
-# operator's own play can ask "who does this grant actually resolve to
-# on this host?" without reimplementing the group expansion. Keep the
-# list short -- anything added here is surface that must keep working
-# with nothing in the repo exercising it.
-_EXPOSED_WITHOUT_A_CALLER = {"stortree_access_users"}
-
+# Two spellings, because both are real uses: `| stortree_x(...)`, and
+# `map('stortree_x', ...)` / `select(...)` / `reject(...)`, where the
+# filter is named as a quoted string instead. Missing the second one
+# would report a filter the roles genuinely call as dead.
+_FILTER_CALL = re.compile(
+    r"\|\s*(stortree_[a-z_]+)"
+    r"|(?:map|select|reject|selectattr|rejectattr)\(\s*['\"](stortree_[a-z_]+)['\"]"
+)
 
 def referenced_filters():
     """Every `stortree_*` name used as a filter anywhere in the roles,
     playbooks or Molecule scenarios, as {name: [files]}."""
     found = {}
     for path in SOURCES:
-        for name in _FILTER_CALL.findall(path.read_text()):
+        for piped, quoted in _FILTER_CALL.findall(path.read_text()):
+            name = piped or quoted
             found.setdefault(name, []).append(str(path.relative_to(REPO_ROOT)))
     return found
 
@@ -100,10 +98,13 @@ def test_every_filter_the_roles_use_is_registered():
 
 def test_every_registered_filter_is_actually_used_somewhere():
     # The other direction: a filter kept in the mapping after its last
-    # caller went away is dead surface that still has to keep working.
-    # Not a hard rule for a library -- it is for this one, which exists
-    # only to serve these roles.
-    unused = sorted(set(FILTERS) - set(referenced_filters()) - _EXPOSED_WITHOUT_A_CALLER)
+    # caller went away -- or, as happened with stortree_access_users,
+    # registered speculatively and never called at all -- is dead
+    # surface that still has to keep working. Not a hard rule for a
+    # library; it is for this one, which exists only to serve these
+    # roles. A filter meant for an operator's own plays belongs in
+    # docs/runbook.md, and this assertion relaxed to match.
+    unused = sorted(set(FILTERS) - set(referenced_filters()))
     assert unused == []
 
 

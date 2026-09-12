@@ -1,8 +1,25 @@
 ---
+# Upper bounds are as load-bearing as the floors here: these collections
+# raise their own `requires_ansible` on major releases, and an unbounded
+# `>=` quietly installs one that no longer supports the ansible-core
+# requirements.txt pins (`>=2.16,<2.18`) or that the roles declare in
+# meta/main.yml (`min_ansible_version: "2.16"`). That combination isn't
+# a hard failure -- it installs, and every run then prints "Collection
+# community.general does not support Ansible version 2.16.19" before
+# doing something undefined -- which is exactly the kind of warning an
+# operator learns to scroll past. Caps chosen from each collection's own
+# declared `requires_ansible`:
+#
+#   community.general 11.x -> >=2.16.0   (12.0.0 raises it to 2.17)
+#   community.crypto   2.x -> >=2.9.10   (3.0.0  raises it to 2.17)
+#   ansible.posix      2.x -> >=2.16.0   (no 3.x published yet)
+#
+# Raise a cap only together with the ansible-core floor in
+# requirements.txt and `min_ansible_version` in every roles/*/meta/main.yml.
 collections:
   - name: ansible.posix
-    version: ">=1.5.0"
+    version: ">=1.5.0,<3.0.0"
   - name: community.crypto
-    version: ">=2.16.0"
+    version: ">=2.16.0,<3.0.0"
   - name: community.general
-    version: ">=8.0.0"
+    version: ">=8.0.0,<12.0.0"

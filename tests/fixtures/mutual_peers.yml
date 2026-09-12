@@ -7,7 +7,6 @@
 shared:
   host: host-a
   samba:
-    subpath: ""
   subdirs:
     piece-a:
       host: host-a
