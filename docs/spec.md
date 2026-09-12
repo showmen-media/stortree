@@ -147,10 +147,14 @@ filter directly:
   top level is always the top-level subtree itself, exactly as before.
   Either kind of block may also carry an `access` object, replacing the
   node's own grant on every host that only holds a copy of it
-  (config-schema.md "Client-side access", §6). A subtree with no
-  `rclone.remote` of its own has nothing to peer for — the client still
-  gets its local directory created, just no mount and no peer dependency
-  for it. Unlike a samba peer dependency, this one implies no Samba
+  (config-schema.md "Client-side access", §6). Whether the owning
+  host's own copy is remote-backed makes no difference: a peer mount is
+  sftp to that host's *filesystem path*, which exists just as much when
+  the content simply lives on its disk, or arrives there over a mount
+  stortree knows nothing about, as when rclone puts it there. The only
+  way to keep a subtree off its non-owning hosts is the explicit
+  `client-defaults`/`clients.<host>` opt-out. Unlike a samba peer
+  dependency, this one implies no Samba
   behavior of its own — it exists purely so a client's local tree has
   real content — but it does mean a non-owning host now needs
   `stortree_peer_trust` (§7) to reach whichever host owns each top-level

@@ -238,21 +238,45 @@ def test_every_non_owning_host_peer_sources_tree_from_its_owner():
     }
 
 
-def test_subtree_with_no_remote_gets_no_peer_dependency():
-    # A top-level subtree with no rclone.remote of its own has nothing to
-    # peer for -- the client still resolves (local directory gets created
-    # by stortree_mounts), just no mount and no peer dependency for it.
+def test_a_client_peers_a_subtree_whose_owner_has_no_remote_of_its_own():
+    # A non-owning host mounts from the owning host whether or not that
+    # host's copy is remote-backed. A peer mount is sftp to the owner's
+    # *filesystem path*, which exists just as much when the content
+    # simply lives on its disk, or arrives there over a mount stortree
+    # knows nothing about, as when rclone puts it there.
+    #
+    # This used to be gated on the node's own `rclone.remote`, which left
+    # the client with an empty local directory where the subtree should
+    # be -- and disagreed with _samba_peer_dependencies(), which has
+    # always peered a descendant regardless.
     tree = {"top": {"host": "h1", "subdirs": {"plain": {"host": "h2"}}}}
     r = resolve(tree, "h2", ["h1", "h2"])
     assert r["client_mounts"] == [
         {
             "local_path": "top",
-            "remote": None,
+            "remote": "peer-h1-top:/srv/stortree/top",
             "args": {},
             "access": {},
             "requires": [],
         }
     ]
+    assert [p["local_path"] for p in r["peer_dependencies"] if p["local_path"] == "top"] == [
+        "top"
+    ]
+
+
+def test_a_client_still_gets_no_mount_when_the_subtree_is_opted_out():
+    # The way to keep a subtree off its non-owning hosts is the explicit
+    # opt-out, not the absence of a remote.
+    tree = {
+        "top": {
+            "host": "h1",
+            "client-defaults": {"rclone": False},
+            "subdirs": {"plain": {"host": "h2"}},
+        }
+    }
+    r = resolve(tree, "h2", ["h1", "h2"])
+    assert not any(m["remote"] for m in r["client_mounts"])
     assert not any(p["local_path"] == "top" for p in r["peer_dependencies"])
 
 

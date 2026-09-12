@@ -1244,10 +1244,17 @@ def _client_mount_entries(index, hostname, samba_sourced_paths, stortree_root):
     subtree's own `rclone.remote` -- the same peer-sourcing rule
     _samba_peer_dependencies() applies to every samba descendant a host
     doesn't own, just generalized to every top-level subtree (mesh, not
-    funneled through one shared root -- see _walk_tree()). A subtree
-    with no rclone.remote of its own has nothing to peer for: the client
-    still gets its local directory created by stortree_mounts, just no
-    mount at all. `client-defaults`/`clients.<hostname>.rclone`
+    funneled through one shared root -- see _walk_tree()).
+
+    Whether the owning host's own copy is remote-backed is irrelevant
+    here, and used to be checked: a peer mount is sftp to that host's
+    *filesystem path*, which exists whether the content arrives there
+    over rclone, over a mount something else makes, or by simply living
+    on its disk. Gating on the node's own `rclone.remote` left a
+    non-owning host with an empty local directory where the subtree
+    should be -- and it was inconsistent with
+    _samba_peer_dependencies(), which has always peered a descendant
+    regardless. `client-defaults`/`clients.<hostname>.rclone`
     (docs/config-schema.md "Per-client mount opt-out") can suppress this
     entirely for a subtree that has no business being visible outside
     its own owning host.
@@ -1277,23 +1284,19 @@ def _client_mount_entries(index, hostname, samba_sourced_paths, stortree_root):
             # host already applied), and a client policy that says
             # nothing about access shouldn't start.
             access = {} if access is _UNSET else _normalize_access(access)
-            client_remote = None
-            if node["remote"]:
-                peers.append(
-                    {
-                        "owning_host": node["host"],
-                        "local_path": path,
-                        "remote_path": path,
-                        "samba_node": None,
-                        "per_user": False,
-                        "access": access,
-                        "args": args,
-                        "requires": index.requires_by_path.get(path, []),
-                    }
-                )
-                client_remote = _peer_remote_ref(
-                    node["host"], path, path, stortree_root
-                )
+            peers.append(
+                {
+                    "owning_host": node["host"],
+                    "local_path": path,
+                    "remote_path": path,
+                    "samba_node": None,
+                    "per_user": False,
+                    "access": access,
+                    "args": args,
+                    "requires": index.requires_by_path.get(path, []),
+                }
+            )
+            client_remote = _peer_remote_ref(node["host"], path, path, stortree_root)
             # A node's `requires` applies wherever it's mounted, its
             # non-owning clients included -- which is the case that
             # motivated the key at all: the cache-dir a *client* points
@@ -1996,11 +1999,11 @@ def _expand_per_user(node_path, access, remote_of, requires, group_members):
 def _plan_client_mounts(resolved):
     """This host's own copy of each top-level subtree it doesn't own, one
     entry each. Never per-user, so there's no %U fan-out to resolve here
-    the way the two stages below have to. Usually a mount -- but a
-    subtree whose node carries no `rclone.remote` has nothing to peer
-    for, and resolve() still gives it a client_mounts entry so the local
-    directory gets created, which arrives here as `remote: None` and
-    plans as a plain directory like any other.
+    the way the two stages below have to. Always a mount unless the client
+    opted out (`client-defaults`/`clients.<host>.rclone: false`), in
+    which case resolve() still gives it a client_mounts entry so the
+    local directory gets created, and it arrives here as `remote: None`
+    and plans as a plain directory.
 
     A client mount's `remote` was already synthesized by resolve()
     (_peer_remote_ref()), so the provenance plan_remote_sections() needs
