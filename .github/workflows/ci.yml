@@ -113,11 +113,27 @@ jobs:
           cp stortree/config.yml.example stortree/config.yml
           cp stortree/ldap.yml.example stortree/ldap.yml
           cp stortree/rclone.conf.example stortree/rclone.conf
+          # Optional for an operator (README.md mentions them rather than
+          # listing them in its copy block), copied here anyway: these are
+          # the only two examples nothing else validates. yamllint's
+          # default file match is *.yml/*.yaml, so a `*.yml.example` is
+          # invisible to it -- and inventory vars that fail to parse take
+          # every playbook down with them, which is exactly what the
+          # syntax check below then catches.
+          cp inventory/group_vars/all.yml.example inventory/group_vars/all.yml
+          cp inventory/host_vars/storage-node-alpha.yml.example \
+             inventory/host_vars/storage-node-alpha.yml
 
-      - name: Syntax-check both playbooks
+      - name: Syntax-check every playbook
+        # All three, and the list is the point: a playbook added without
+        # a line here is one nothing ever parses until an operator runs
+        # it. metrics-targets.yml is read-only and needs no host, but it
+        # reads group_vars and hostvars, so a syntax check is the cheap
+        # half of what CI can say about it.
         run: |
           ansible-playbook playbooks/site.yml --syntax-check
           ansible-playbook playbooks/status.yml --syntax-check
+          ansible-playbook playbooks/metrics-targets.yml --syntax-check
 
   shell:
     name: shellcheck
