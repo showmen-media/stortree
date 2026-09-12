@@ -229,6 +229,11 @@ def test_mount_unit_owner_grant_pins_uid_and_perms(
         **mount_vars(containers, BRAVO),
     )
     assert "--allow-other \\" in unit
+    # Without --default-permissions the kernel never checks the mode the
+    # mount presents and rclone permits everything, so the two --*-perms
+    # flags below are decorative and any local account can read any path
+    # in the tree. Observed on a live host before this flag existed.
+    assert "--default-permissions \\" in unit
     assert "--uid 10001 \\" in unit  # jd, per stortree_user_uids
     assert "--dir-perms 0701 \\" in unit
     assert "--file-perms 0701 \\" in unit

@@ -89,6 +89,20 @@ pattern) is exactly that case: no grant is meaningful on a cache, so
 before this it masked itself permanently by construction.
 #}
   --allow-other \
+{#
+--default-permissions makes the *kernel* check the mode this mount
+presents. Without it FUSE skips permission checking entirely and defers
+to the filesystem, and rclone permits everything -- so --dir-perms and
+--file-perms were decorative, and any local account could read any
+path in the tree regardless of the grant on it. Confirmed on a live
+host: an account with no grant anywhere near a node listed it happily,
+and the same mount with this flag denied it.
+
+Samba is unaffected either way -- it checks `valid users` before it
+touches the filesystem -- so this is defence in depth against local
+accounts, which is exactly what the mode was always supposed to be.
+#}
+  --default-permissions \
   --dir-perms {{ access | stortree_access_mode }} \
   --file-perms {{ access | stortree_access_mode }} \
 {% if access.owner is defined %}
