@@ -141,7 +141,7 @@ def test_remote_unit_presents_one_uniform_ownership_and_enforces_it(
     # account could read any path in the tree.
     unit = render(
         REMOTE_UNIT,
-        entry=transport_for(mount_plans[BRAVO], "tree/home/jd/sys-configs"),
+        entry=transport_for(mount_plans[BRAVO], "tree/home/.mounts/whitfield-media"),
         **mount_vars(containers, BRAVO),
     )
     assert "--dir-perms 0700 \\" in unit
@@ -163,13 +163,14 @@ def test_remote_unit_nests_inside_the_transport_above_it(
     # detaches it -- PartOf=, exactly as in the visible tree.
     unit = render(
         REMOTE_UNIT,
-        entry=transport_for(mount_plans[BRAVO], "tree/home/jd/sys-configs"),
+        entry=transport_for(mount_plans[BRAVO], "tree/home/.mounts/whitfield-media"),
         **mount_vars(containers, BRAVO),
     )
     assert "After=stortree-remote@tree.service" in unit
     assert "PartOf=stortree-remote@tree.service" in unit
     assert (
-        "RequiresMountsFor=/srv/.stortree-remotes/tree/home/jd/sys-configs" in unit
+        "RequiresMountsFor=/srv/.stortree-remotes/tree/home/.mounts/whitfield-media"
+        in unit
     )
 
 

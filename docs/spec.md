@@ -160,6 +160,18 @@ filter directly:
   `stortree_peer_trust` (§7) to reach whichever host owns each top-level
   subtree it client-mounts, which the role already handles the same way
   as any other peer dependency.
+- **Client grants** — every node *inside* something this host mounts
+  without owning it, whose own `access` (or an ancestor's
+  `client-defaults`/`clients` block, config-schema.md "Client-side
+  access") this host therefore has to apply to its own copy. A grant
+  describes the node, not one host's copy of it, so it holds everywhere
+  the node does; the entry exists because nothing else in the resolved
+  set names such a node, and without one its grant would reach only the
+  host that owns it. §6 covers the mechanism, which for a path inside a
+  mount can only be a presentation. Never a node this host owns (already
+  a server subtree), never a `user-subdirs` node (still `%U`-templated,
+  and it fans out instead), and never anything under a subtree a client
+  policy opted this host out of — nothing is presented there to grant.
 - **Samba shares** — every node anywhere in the tree that carries a
   `samba:` block, resolved for *every* host in `all_hosts`, not just the
   node's own resolved `host` or hosts named anywhere in `config.yml`. A
@@ -270,7 +282,7 @@ rather than tree inheritance:
 ### 2. Mount management (rclone)
 
 The `stortree_mounts` role flattens `stortree_facts`' resolved server
-subtrees, client mount, and peer dependencies into one plan
+subtrees, client mount, peer dependencies and client grants into one plan
 (`stortree_plan_mounts`) and, for every entry that actually has a
 `remote` (§1 — a server-subtree node with no `rclone.remote` of its own
 resolves with none, since `rclone` never inherits), templates one
@@ -785,6 +797,22 @@ the obvious name — the systemd slug — is exactly the wrong one:
 systemd then *unescapes* that same sequence when it parses an
 `ExecStart` path, silently pointing the mount at a different directory.
 Slugs name units; paths name paths.
+
+One transport per declaring node, with one exception: a peer mount whose
+content a transport already above it presents gets none of its own
+(`_transport_covers()`). A host that peer-mounts a whole subtree *and*
+exports a Samba share for one path inside it — the ordinary shape for a
+hidden share over content the host doesn't own (§4) — would otherwise
+open two sftp sessions to one account and run two rclone processes over
+the same bytes, each with its own VFS cache and, since
+`--vfs-cache-max-size` is per mount, its own copy of that budget. Only
+the peer references stortree synthesizes itself collapse, and only where
+the owning host, the path and the `rclone.args` all agree: operator-written
+remotes may nest too, but proving it means reading `remote:path` strings
+whose meaning belongs to the backend, and a node asking for a different
+cache than the mount above it is asking for a second mount. The
+presentation is untouched either way — it is what carries the grant, and
+it reads the covering mount from the inside.
 
 **Layer 2, presentation** (`stortree-mount@.service.j2`). One `bindfs`
 mount per visible node that needs its own ownership, reading

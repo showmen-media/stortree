@@ -400,11 +400,11 @@ tree:
               permissions: rx
 ```
 
-It becomes that host's `--uid`/`--gid`/`--dir-perms`/`--file-perms` for
-the mount (and, for a node that resolves to a plain directory rather
-than a mount, its ownership and mode) — real, kernel-enforced access on
-that host, applied exactly like the node's own grant is on its owner,
-via the same mechanism (spec.md §6).
+It becomes the `-u`/`-g`/`-p` of that host's presentation of the node
+(and, for a node that resolves to a plain directory rather than a mount,
+its ownership and mode) — real, kernel-enforced access on that host,
+applied exactly like the node's own grant is on its owner, via the same
+mechanism (spec.md §6).
 
 Three things to know about it:
 
@@ -433,10 +433,17 @@ Three things to know about it:
   where it could not be resolved. The share's *path* and the peer mounts
   behind it are unchanged either way.
 
-A top-level subtree's client mount carries no grant at all unless a
-client block gives it one — the owning host is what enforces the node's
-grant, and a peer mount of its copy already reports what that host
-applied.
+Write no `access` in a client block and the copy carries the node's own
+grant, which is the whole point: a grant describes the node, so the same
+path is the same user's on every host that has it. It reached only the
+owning host until stortree presented these mounts at all — the reasoning
+was that a peer mount reports whatever the owner applied, which no mount
+in this tree has ever done. Layer 1 flattens every uid and gid to the
+mount's own, and layer 2 re-presents the result, so ownership does not
+survive the sftp boundary in either direction; what a non-owning host
+showed instead was the uniform default of whichever presentation covered
+it. A Samba share whose `valid users` named the grant's owner was a
+share that user could traverse and not read.
 
 ### Requires
 
