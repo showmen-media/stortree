@@ -605,7 +605,7 @@ Same map-of-`name -> node` shape, but they resolve differently:
   can't present two different paths under it with two different owners.
   The same mechanism applies to any node with an `access` grant and no
   `rclone.remote` of its own, not only per-user containers. See spec.md
-  §6 (`staged_node_paths()`) for the mechanism, and its own note there
+  §6 ("The two layers") for the mechanism, and its own note there
   on what this means for a sibling like `mw-fam`'s bind mount, which
   has to wait for that presentation too.
 
@@ -965,7 +965,7 @@ what each one is and why it isn't the others.
 | Samba share name | `[tree_home]` | fold to `_` | rejected |
 
 **systemd unit slugs** flatten `tree/home/jd` to `tree-home-jd` and are
-what `stortree-mount@`, `stortree-bind@` and `stortree-present@` are
+what `stortree-remote@`, `stortree-mount@` and `stortree-bind@` are
 instantiated with. Because a path segment may itself contain `-`, each
 segment is escaped on its own before the `-` join, in the same `\xHH`
 convention `systemd-escape` uses: a directory literally named

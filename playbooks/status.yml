@@ -18,7 +18,8 @@
       #
       # All three unit families stortree_mounts installs, not just
       # stortree-mount@: a per-user bind mount (stortree-bind@) or a
-      # staged node's presentation mount (stortree-present@) can
+      # presentation mount (stortree-mount@) and its transport
+      # (stortree-remote@) can
       # fail on its own while every rclone mount stays green, and a
       # status report that can't show that is reporting a third of the
       # picture. Matches the pattern list stortree_mounts itself uses to
@@ -27,7 +28,7 @@
         cmd: >-
           systemctl list-units --type=service --all --plain --no-legend
           'stortree-mount@*.service' 'stortree-bind@*.service'
-          'stortree-present@*.service'
+          'stortree-remote@*.service'
       register: stortree_status_mounts
       changed_when: false
       failed_when: false

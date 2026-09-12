@@ -6,6 +6,10 @@ import yaml
 
 from filter_plugins.stortree import (
     _assign_plan_slugs,
+    _check_slug_collisions,
+    _layer_plan_entries,
+    _plan_user_containers,
+    ownership_mismatch,
     _relate_plan_entries,
     DEFAULT_ACCESS_PERMISSIONS,
     PER_USER_PLACEHOLDER,
@@ -29,12 +33,32 @@ from filter_plugins.stortree import (
     resolve,
     stale_unit_names,
     samba_access_tokens,
-    physical_path,
-    presented_ancestor,
-    staged_node_paths,
-    present_unit_names,
     user_uids_from_getent,
 )
+
+def relate(entries):
+    """Run the three passes plan_mounts() runs, so a unit test of the
+    relation pass exercises it the way the real pipeline does."""
+    _assign_plan_slugs(entries)
+    transports = _layer_plan_entries(entries)
+    _relate_plan_entries(entries, transports)
+    _check_slug_collisions(transports + entries)
+    return transports
+
+
+def plan_index(plan):
+    """The plan keyed by path, transports excluded.
+
+    A transport and the presentation above it deliberately share a
+    `local_path` -- they are the same directory in the two roots -- so a
+    plain {local_path: entry} dict silently drops one of them. Tests that
+    care about layer 1 use transports() instead."""
+    return {e["local_path"]: e for e in plan if e["kind"] != "transport"}
+
+
+def transports(plan):
+    """{local_path: entry} for layer 1 only."""
+    return {e["local_path"]: e for e in plan if e["kind"] == "transport"}
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -464,8 +488,12 @@ def test_an_opted_in_subdirectory_is_not_mounted_twice():
     r = resolve(tree, "h3", ["h1", "h2", "h3"])
     assert r["client_mounts"] == []
     assert [p["local_path"] for p in r["peer_dependencies"]] == ["top/share/a"]
-    assert [e["local_path"] for e in plan_mounts(r)] == ["top/share/a"]
-    assert plan_mounts(r)[0]["access"]["group"] == "Ops"
+    # One transport and one presentation for the same path -- the two
+    # layers of a single mount, not the same mount planned twice.
+    assert [e["local_path"] for e in plan_mounts(r) if e["kind"] == "mount"] == [
+        "top/share/a"
+    ]
+    assert plan_index(plan_mounts(r))["top/share/a"]["access"]["group"] == "Ops"
 
 
 def test_a_top_level_subtree_that_shares_itself_is_not_mounted_twice():
@@ -476,7 +504,7 @@ def test_a_top_level_subtree_that_shares_itself_is_not_mounted_twice():
     tree = {"top": {"host": "h1", "rclone.remote": "r1:/", "samba": None}}
     r = resolve(tree, "h2", ["h1", "h2"])
     assert r["client_mounts"] == []
-    assert [e["local_path"] for e in plan_mounts(r)] == ["top"]
+    assert [e["local_path"] for e in plan_mounts(r) if e["kind"] == "mount"] == ["top"]
     assert plan_mounts(r)[0]["remote"] == "peer-h1-top:/srv/stortree/top"
 
 
@@ -577,7 +605,7 @@ def test_client_defaults_access_grants_a_client_mount_its_own_ownership():
     }
     # it has to reach the flat plan and the getent lookups too, or the
     # unit template has no gid to render
-    assert plan_mounts(r)[0]["access"]["group"] == "Readers"
+    assert plan_index(plan_mounts(r))["top"]["access"]["group"] == "Readers"
     assert needed_groups(r) == ["Readers"]
 
 
@@ -1155,7 +1183,7 @@ def test_needed_users_with_group_members_also_covers_container_owners():
     # group_members in the first place) jd is the only user; with it,
     # every per-user container's owner is covered too, group-derived ones
     # included, since stortree_secrets needs their numeric UIDs too for a
-    # wrapper mount's --uid (staged_node_paths(), stortree_mounts).
+    # presentation mount's -u (_plan_user_containers(), stortree_mounts).
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     group_members = {
         "Whitfield Family & Friends": ["mike", "jd"],
@@ -1163,199 +1191,6 @@ def test_needed_users_with_group_members_also_covers_container_owners():
         "Media Production": ["alex"],
     }
     assert needed_users(r, group_members) == ["alex", "dana", "jd", "mike"]
-
-
-def test_staged_node_paths_lets_a_container_win_over_a_plain_grant_at_the_same_path():
-    # A user-subdirs node's own grant is what produced the container, so
-    # the same path can arrive from both collections. It must be staged
-    # once, as the container -- two entries would render two presentation
-    # units racing to mount over the same path.
-    r = resolve(
-        {"top": {"host": "h1", "subdirs": {"home": {"user-subdirs": {"d": {"access.owner": "jd"}}}}}},
-        "h1",
-        ["h1"],
-    )
-    plan = plan_mounts(r, {}) + [
-        {"local_path": "top/home/jd", "remote": None, "access": {"owner": "jd"}}
-    ]
-    staged = staged_node_paths(r, {}, plan)
-    at_path = [e for e in staged if e["local_path"] == "top/home/jd"]
-    assert len(at_path) == 1
-    # the container's literal perms, not bindfs_perms() of the grant
-    assert at_path[0]["perms"] == "0640,ug+X"
-
-
-def test_presented_ancestor_ignores_a_staged_node_that_gets_no_mount():
-    # requires_slug unset means a plain-local node, chowned directly.
-    # There is no presentation unit to order against, so nothing nested
-    # inside it should claim one.
-    staged = [{"local_path": "top/home", "slug": "top-home", "requires_slug": None}]
-    assert presented_ancestor("top/home/jd/x", staged) is None
-
-
-def test_presented_ancestor_keeps_the_deepest_regardless_of_list_order():
-    # The deepest staged ancestor owns the mountpoint. Whichever order
-    # they happen to arrive in, the shallower one must not displace it.
-    deep = {"local_path": "top/home/jd", "slug": "d", "requires_slug": "top"}
-    shallow = {"local_path": "top/home", "slug": "s", "requires_slug": "top"}
-    assert presented_ancestor("top/home/jd/x", [deep, shallow]) is deep
-    assert presented_ancestor("top/home/jd/x", [shallow, deep]) is deep
-
-
-def _container_entry(local_path, owner, requires_slug=None):
-    """One per-user container as staged_node_paths() reports it. Its
-    perms/mode are the literal container pair, not bindfs_perms() of an
-    owner grant -- see CONTAINER_PERMS for why those differ."""
-    parent = local_path.rsplit("/", 1)[0]
-    return {
-        "local_path": local_path,
-        "owner": owner,
-        "group": None,
-        "perms": "0640,ug+X",
-        "mode": "0750",
-        "staging_path": f"{parent}/.stortree-staging-{owner}",
-        "slug": _slug(local_path),
-        "requires_slug": requires_slug,
-    }
-
-
-def _staged_entry(local_path, owner, group, perms, mode, requires_slug=None):
-    """One granted plain-directory node as staged_node_paths() reports
-    it -- the kind that used not to exist, whose grant previously went
-    silently unenforced."""
-    parent = local_path.rsplit("/", 1)[0]
-    name = local_path.rsplit("/", 1)[-1]
-    return {
-        "local_path": local_path,
-        "owner": owner,
-        "group": group,
-        "perms": perms,
-        "mode": mode,
-        "staging_path": f"{parent}/.stortree-staging-{name}",
-        "slug": _slug(local_path),
-        "requires_slug": requires_slug,
-    }
-
-
-def test_staged_node_paths_owner_and_group_grants():
-    # no mount_plan given -- every container's staging path can't be
-    # checked against any real mount, so requires_slug is None
-    # throughout (stortree_mounts' "plain local, chown directly" case).
-    r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
-    group_members = {
-        "Whitfield Family & Friends": ["mike", "jd"],
-        "Michael Whitfield Family": ["dana"],
-        "Media Production": ["alex"],
-    }
-    containers = staged_node_paths(r, group_members)
-    assert containers == [
-        _container_entry("tree/home/alex", "alex"),
-        _container_entry("tree/home/dana", "dana"),
-        _container_entry("tree/home/jd", "jd"),
-        _container_entry("tree/home/mike", "mike"),
-    ]
-
-
-def test_staged_node_paths_covers_peer_dependencies_too():
-    # gadget owns nothing itself -- every per-user container it still
-    # needs to create/own comes from peer_dependencies alone, same
-    # reasoning as needed_groups()/needed_users() covering both scopes.
-    r = resolve(EXAMPLE_TREE, "some-storage-gadget", EXAMPLE_HOSTS)
-    group_members = {
-        "Whitfield Family & Friends": ["jd"],
-        "Michael Whitfield Family": [],
-        "Media Production": ["alex"],
-    }
-    containers = staged_node_paths(r, group_members)
-    assert containers == [
-        _container_entry("tree/home/alex", "alex"),
-        _container_entry("tree/home/jd", "jd"),
-    ]
-
-
-def test_staged_node_paths_dedupes_across_sibling_descendants():
-    # jd shows up via both sys-configs (owner) and fam (group membership)
-    # -- one container, not two, and it must still resolve to exactly the
-    # one owner both descendants agree on.
-    tree = {
-        "top": {
-            "host": "h1",
-            "subdirs": {
-                "home": {
-                    "user-subdirs": {
-                        "sys-configs": {"access.owner": "jd"},
-                        "fam": {"access.group": "Fam"},
-                    }
-                }
-            },
-        }
-    }
-    r = resolve(tree, "h1", ["h1"])
-    containers = staged_node_paths(r, {"Fam": ["jd", "mo"]})
-    assert containers == [
-        _container_entry("top/home/jd", "jd"),
-        _container_entry("top/home/mo", "mo"),
-    ]
-
-
-def test_staged_node_paths_ignores_non_per_user_and_ungranted_nodes():
-    tree = {
-        "top": {
-            "host": "h1",
-            "rclone.remote": "r1:/",
-            "subdirs": {
-                "shared": {"access.group": "not-per-user"},
-                "home": {
-                    "user-subdirs": {
-                        # no access at all -- an intermediate per-user
-                        # container with nothing granted contributes no
-                        # container of its own
-                        "empty": {},
-                    }
-                },
-            },
-        }
-    }
-    r = resolve(tree, "h1", ["h1"])
-    assert staged_node_paths(r, {}) == []
-
-
-def test_staged_node_paths_requires_slug_finds_the_nesting_mount():
-    # tree/home/jd's staging path (tree/home/.stortree-staging-jd) nests
-    # under "tree"'s own real mount (storagebox:/) -- requires_slug
-    # should name that mount's slug, the signal stortree_mounts uses to
-    # render a wrapper mount for this container instead of chowning it
-    # directly (plain chown can't work: "tree" is one single rclone
-    # mount with one uniform --uid/--gid for everything under it).
-    r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
-    plan = plan_mounts(r, {"Media Production": ["alex"]})
-    containers = staged_node_paths(r, {}, plan)
-    jd = next(c for c in containers if c["local_path"] == "tree/home/jd")
-    assert jd["requires_slug"] == _slug("tree")
-
-
-def test_staged_node_paths_no_requires_slug_for_a_plain_local_tree():
-    # a container under a purely local (host-set, no rclone.remote)
-    # top-level subtree nests under no real mount at all -- requires_slug
-    # stays None, so stortree_mounts chowns it directly instead of
-    # rendering a wrapper mount that has nothing to nest under.
-    tree = {
-        "top": {
-            "host": "h1",
-            "subdirs": {
-                "home": {"user-subdirs": {"sys-configs": {"access.owner": "jd"}}}
-            },
-        }
-    }
-    r = resolve(tree, "h1", ["h1"])
-    plan = plan_mounts(r, {})
-    # The granted descendant is staged too now, for the same reason and
-    # by the same rule -- and lands in the same plain-local case, so it
-    # is chowned directly rather than presented.
-    assert staged_node_paths(r, {}, plan) == [
-        _container_entry("top/home/jd", "jd"),
-        _staged_entry("top/home/jd/sys-configs", "jd", None, "0600,uo+X", "0701"),
-    ]
 
 
 def test_access_owner_defaults_to_stortree_when_unset():
@@ -1539,7 +1374,7 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
     }
 
     plan = plan_mounts(r, group_members)
-    by_local_path = {e["local_path"]: e for e in plan}
+    by_local_path = plan_index(plan)
 
     # per-user node mw-fam (access.group: Michael Whitfield Family) --
     # `group`-only, so every member's own folder is a symlink back to one
@@ -1548,7 +1383,9 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
     assert by_local_path["tree/home/mike/mw-fam"]["remote"] is None
     assert by_local_path["tree/home/mike/mw-fam"]["symlink_target"] == "tree/home/.mounts/mw-fam"
     assert "tree/home/%U/mw-fam" not in by_local_path
-    assert by_local_path["tree/home/.mounts/mw-fam"]["remote"] == "some-remote:/fam"
+    # The remote belongs to layer 1 now; the presentation reads a
+    # local path under the remotes root.
+    assert transports(plan)["tree/home/.mounts/mw-fam"]["remote"] == "some-remote:/fam"
     # the stortree-bind@.service.j2 template computes its own dependency
     # unit's slug straight from `symlink_target` (via the stortree_slug
     # filter, i.e. _slug()) rather than looking the real entry back up in
@@ -1564,7 +1401,10 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
     assert by_local_path["tree/home/mike/whitfield-media"]["symlink_target"] == "tree/home/.mounts/whitfield-media"
     assert by_local_path["tree/home/dana/whitfield-media"]["symlink_target"] == "tree/home/.mounts/whitfield-media"
     # only one real mount backs both of them
-    assert by_local_path["tree/home/.mounts/whitfield-media"]["remote"] == "some-remote:/media"
+    assert (
+        transports(plan)["tree/home/.mounts/whitfield-media"]["remote"]
+        == "some-remote:/media"
+    )
     # but nobody unresolvable (no group_members entry) gets a symlink
     assert not any(
         p.startswith("tree/home/") and p.endswith("/whitfield-media")
@@ -1604,11 +1444,14 @@ def test_plan_mounts_group_only_per_user_node_collapses_to_one_mount():
     plan = plan_mounts(r, group_members)
 
     real_mounts = [
-        e for e in plan if e["local_path"] == "tree/home/.mounts/whitfield-media"
+        e
+        for e in plan
+        if e["local_path"] == "tree/home/.mounts/whitfield-media"
+        and e["kind"] == "mount"
     ]
     assert len(real_mounts) == 1
     real_mount = real_mounts[0]
-    assert real_mount["remote"] == "some-remote:/media"
+    assert transports(plan)[real_mount["local_path"]]["remote"] == "some-remote:/media"
     assert real_mount["symlink_target"] is None
     assert real_mount["access"] == {
         "group": "Whitfield Family & Friends",
@@ -1641,7 +1484,7 @@ def test_plan_mounts_entries_carry_access_for_ownership_and_mode():
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     group_members = {"Media Production": ["alex"]}
     plan = plan_mounts(r, group_members)
-    by_local_path = {e["local_path"]: e for e in plan}
+    by_local_path = plan_index(plan)
 
     assert by_local_path["tree/home/jd/sys-configs"]["access"] == {
         "owner": "jd",
@@ -1672,14 +1515,14 @@ def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
         "Whitfield Family & Friends": ["mike"],
     }
     plan = plan_mounts(r, group_members)
-    by_local_path = {e["local_path"]: e for e in plan}
+    by_local_path = plan_index(plan)
 
     # alpha-owned, per-user, no rclone.remote of its own -- still a real
     # peer mount (sourced live from alpha's own filesystem at that exact
     # path), since it's a leaf with real per-user content, not a
     # structural container
     assert "tree/home/jd/sys-configs" in by_local_path
-    sys_configs = by_local_path["tree/home/jd/sys-configs"]
+    sys_configs = transports(plan)["tree/home/jd/sys-configs"]
     assert sys_configs["remote"] == (
         "peer-storage-node-alpha-tree-home-jd-sys-configs:"
         "/srv/stortree/tree/home/jd/sys-configs"
@@ -1692,9 +1535,9 @@ def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
     # bravo's disk for a group-only grant, so that's the only real path a
     # peer could source it from), not relayed through alpha
     assert "tree/home/mike/mw-fam" not in {
-        p for p, e in by_local_path.items() if e["remote"] and "alpha" in e["remote"]
+        p for p, e in transports(plan).items() if "alpha" in e["remote"]
     }
-    whitfield_mount = by_local_path["tree/home/.mounts/whitfield-media"]
+    whitfield_mount = transports(plan)["tree/home/.mounts/whitfield-media"]
     assert whitfield_mount["remote"] == (
         "peer-storage-node-bravo-tree-home-.mounts-whitfield-media:"
         "/srv/stortree/tree/home/.mounts/whitfield-media"
@@ -1714,14 +1557,25 @@ def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
     # under "tree/home", which was never a mount to nest under in the
     # first place
     tree_slug = by_local_path["tree"]["slug"]
-    assert sys_configs["requires_slug"] == tree_slug
-    assert whitfield_mount["requires_slug"] == tree_slug
+    # Both layers nest the same way, each against its own layer: the
+    # transports inside gadget's transport of `tree`, the presentations
+    # inside the presentation of `tree`.
+    assert sys_configs["requires_transport"] == tree_slug
+    assert whitfield_mount["requires_transport"] == tree_slug
+    # The presentations order against the *deepest* presentation above
+    # them, which for a per-user leaf is now its own container rather
+    # than the top-level subtree -- the container is a presentation in
+    # its own right, and it is what puts this mountpoint on screen.
+    assert by_local_path["tree/home/jd/sys-configs"]["requires_slug"] == "tree-home-jd"
+    assert (
+        by_local_path["tree/home/.mounts/whitfield-media"]["requires_slug"] == tree_slug
+    )
 
 
 def test_plan_mounts_nested_paths_require_their_nearest_real_mount_ancestor():
     r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
     plan = plan_mounts(r, {"Michael Whitfield Family": ["mike"]})
-    by_local_path = {e["local_path"]: e for e in plan}
+    by_local_path = plan_index(plan)
 
     tree_slug = by_local_path["tree"]["slug"]
     assert by_local_path["tree/home/.mounts/mw-fam"]["requires_slug"] == tree_slug
@@ -1752,7 +1606,7 @@ def test_plan_mounts_skips_remote_less_ancestors_for_requires_slug():
     }
     r = resolve(tree, "h1", ["h1"])
     plan = plan_mounts(r, {})
-    by_local_path = {e["local_path"]: e for e in plan}
+    by_local_path = plan_index(plan)
 
     top = by_local_path["tree/top"]
     plain = by_local_path["tree/top/plain"]
@@ -1765,10 +1619,14 @@ def test_plan_mounts_skips_remote_less_ancestors_for_requires_slug():
 
 def test_mount_unit_names():
     plan = [
-        {"slug": "backups", "remote": "r1:/"},
-        {"slug": "tree", "remote": "r1:/"},
+        {"slug": "backups", "kind": "transport"},
+        {"slug": "backups", "kind": "mount"},
+        {"slug": "tree", "kind": "mount"},
     ]
+    # A transport and the presentation above it share a slug and are
+    # different units -- one per layer, both named here.
     assert mount_unit_names(plan) == [
+        "stortree-remote@backups.service",
         "stortree-mount@backups.service",
         "stortree-mount@tree.service",
     ]
@@ -1777,8 +1635,8 @@ def test_mount_unit_names():
 def test_mount_unit_names_excludes_remote_less_entries():
     # a plain directory (no rclone.remote) gets no systemd unit at all
     plan = [
-        {"slug": "backups", "remote": "r1:/"},
-        {"slug": "plain-dir", "remote": None},
+        {"slug": "backups", "kind": "mount"},
+        {"slug": "plain-dir", "kind": "dir"},
     ]
     assert mount_unit_names(plan) == ["stortree-mount@backups.service"]
 
@@ -1790,24 +1648,13 @@ def test_mount_unit_names_includes_bind_units_for_per_user_fan_out():
     # mount (see plan_mounts()'s own docstring for why a real symlink
     # can't do this job instead).
     plan = [
-        {"slug": "tree-home-.mounts-mw\\x2dfam", "remote": "r1:/", "symlink_target": None},
-        {"slug": "tree-home-dana-mw\\x2dfam", "remote": None, "symlink_target": "tree/home/.mounts/mw-fam"},
+        {"slug": "tree-home-.mounts-mw\\x2dfam", "kind": "mount"},
+        {"slug": "tree-home-dana-mw\\x2dfam", "kind": "bind"},
     ]
     assert mount_unit_names(plan) == [
         "stortree-mount@tree-home-.mounts-mw\\x2dfam.service",
         "stortree-bind@tree-home-dana-mw\\x2dfam.service",
     ]
-
-
-def test_present_unit_names_only_covers_containers_with_a_wrapper_mount():
-    # a container with requires_slug set gets a wrapper-mount unit; one
-    # without (a plain local container, chowned directly instead) gets
-    # none at all.
-    containers = [
-        {"slug": "tree-home-jd", "requires_slug": "tree"},
-        {"slug": "top-home-jd", "requires_slug": None},
-    ]
-    assert present_unit_names(containers) == ["stortree-present@tree-home-jd.service"]
 
 
 def _entry(plan, local_path):
@@ -1949,51 +1796,6 @@ def test_requires_rejects_a_malformed_value():
         resolve({"tree": {"host": "h1", "requires": {"path": "x"}}}, "h1", ["h1"])
 
 
-CONTAINERS_FOR_PHYSICAL_PATH = [
-    {
-        "local_path": "tree/home/jd",
-        "owner": "jd",
-        "staging_path": "tree/home/.stortree-staging-jd",
-        "slug": "tree-home-jd",
-        "requires_slug": "tree",
-    },
-    {
-        "local_path": "top/home/dana",
-        "owner": "dana",
-        "staging_path": "top/home/.stortree-staging-dana",
-        "slug": "top-home-dana",
-        "requires_slug": None,
-    },
-]
-
-
-def test_physical_path_redirects_inside_a_wrapped_container():
-    # the container path itself is the wrapper's mountpoint and has to
-    # stay physically where it is; anything *under* it is only visible
-    # through the wrapper, so it has to be created in the staging
-    # directory the wrapper re-presents from.
-    assert (
-        physical_path("tree/home/jd/mw-fam", CONTAINERS_FOR_PHYSICAL_PATH)
-        == "tree/home/.stortree-staging-jd/mw-fam"
-    )
-    assert (
-        physical_path("tree/home/jd/a/b/c", CONTAINERS_FOR_PHYSICAL_PATH)
-        == "tree/home/.stortree-staging-jd/a/b/c"
-    )
-    assert physical_path("tree/home/jd", CONTAINERS_FOR_PHYSICAL_PATH) == "tree/home/jd"
-
-
-def test_physical_path_leaves_everything_else_alone():
-    # an unwrapped (plain local, directly chowned) container has no
-    # wrapper mount shadowing anything, so nothing under it moves; nor
-    # does an unrelated path, nor a same-prefix sibling of a container.
-    assert (
-        physical_path("top/home/dana/mw-fam", CONTAINERS_FOR_PHYSICAL_PATH)
-        == "top/home/dana/mw-fam"
-    )
-    assert physical_path("tree/home/jdoe/x", CONTAINERS_FOR_PHYSICAL_PATH) == "tree/home/jdoe/x"
-    assert physical_path("tree/backups", CONTAINERS_FOR_PHYSICAL_PATH) == "tree/backups"
-    assert physical_path("tree/home", []) == "tree/home"
 
 
 def test_plan_mounts_slug_distinguishes_hyphen_from_nesting():
@@ -2012,7 +1814,7 @@ def test_plan_mounts_slug_distinguishes_hyphen_from_nesting():
     }
     r = resolve(tree, "h1", ["h1"])
     plan = plan_mounts(r, {})
-    by_local_path = {e["local_path"]: e for e in plan}
+    by_local_path = plan_index(plan)
 
     assert by_local_path["tree/media-prod"]["slug"] != by_local_path["tree/media/prod"]["slug"]
 
@@ -2025,8 +1827,15 @@ def test_plan_mounts_orders_entries_shallowest_first():
     # production) fails outright creating the deeper one first.
     r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
     plan = plan_mounts(r, {"Michael Whitfield Family": ["mike"]})
-    depths = [e["local_path"].count("/") for e in plan]
-    assert depths == sorted(depths)
+    # Per layer: transports come first as a block (layer 1 must exist
+    # before anything is created or mounted against it), and each layer
+    # is shallowest-first within itself.
+    for kind_group in (
+        [e for e in plan if e["kind"] == "transport"],
+        [e for e in plan if e["kind"] != "transport"],
+    ):
+        depths = [e["local_path"].count("/") for e in kind_group]
+        assert depths == sorted(depths)
 
 
 # -- paths nothing above reaches -----------------------------------------
@@ -3152,34 +2961,34 @@ def test_plan_remote_sections_separates_master_sections_from_peer_ones():
 
 def test_stale_units_are_the_installed_ones_the_plan_no_longer_names():
     plan = [
-        {"local_path": "top", "remote": "r:/", "slug": "top"},
-        {"local_path": "top/u", "remote": None, "symlink_target": "top", "slug": "top-u"},
+        {"local_path": "top", "kind": "transport", "slug": "top"},
+        {"local_path": "top", "kind": "mount", "slug": "top"},
+        {"local_path": "top/u", "kind": "bind", "slug": "top-u"},
     ]
-    containers = [{"local_path": "top/home", "slug": "top-home", "requires_slug": "top"}]
     installed = [
+        "/etc/systemd/system/stortree-remote@top.service",
         "/etc/systemd/system/stortree-mount@top.service",
         "/etc/systemd/system/stortree-bind@top-u.service",
-        "/etc/systemd/system/stortree-present@top-home.service",
+        "/etc/systemd/system/stortree-remote@gone.service",
         "/etc/systemd/system/stortree-mount@gone.service",
         "/etc/systemd/system/stortree-bind@gone-u.service",
-        "/etc/systemd/system/stortree-present@gone-home.service",
     ]
 
-    assert stale_unit_names(installed, plan, containers) == [
+    assert stale_unit_names(installed, plan) == [
+        "stortree-remote@gone.service",
         "stortree-mount@gone.service",
         "stortree-bind@gone-u.service",
-        "stortree-present@gone-home.service",
     ]
 
 
 def test_stale_units_is_empty_when_every_installed_unit_is_still_planned():
-    plan = [{"local_path": "top", "remote": "r:/", "slug": "top"}]
+    plan = [{"local_path": "top", "kind": "mount", "slug": "top"}]
     installed = ["/etc/systemd/system/stortree-mount@top.service"]
-    assert stale_unit_names(installed, plan, []) == []
+    assert stale_unit_names(installed, plan) == []
 
 
 def test_stale_units_on_a_host_with_nothing_installed_yet():
-    assert stale_unit_names([], [], []) == []
+    assert stale_unit_names([], []) == []
 
 
 # -- the samba subpath is derived, not written -----------------------------
@@ -3290,13 +3099,78 @@ def _entries(*specs):
     ]
 
 
-def test_assign_plan_slugs_rejects_two_mounts_claiming_one_unit_name():
+def test_layer_plan_entries_keeps_the_deepest_ancestor_whatever_the_order():
+    # All three "nearest ancestor" searches -- transport for a node,
+    # presentation for a nested mount, transport for a nested transport
+    # -- have to keep the deepest match rather than the last one seen.
+    entries = _entries(("top", "r:/"), ("top/mid", "r2:/"), ("top/mid/leaf", "r3:/"))
+    transports = relate(entries)
+    by_path = {e["local_path"]: e for e in entries}
+    assert by_path["top/mid/leaf"]["transport_slug"] == "top-mid-leaf"
+    assert by_path["top/mid/leaf"]["requires_slug"] == "top-mid"
+    assert {t["local_path"]: t["requires_transport"] for t in transports} == {
+        "top": None,
+        "top/mid": "top",
+        "top/mid/leaf": "top-mid",
+    }
+
+
+def test_plan_user_containers_skips_a_per_user_node_that_implies_no_container():
+    # The per_user flag alone is not enough: a container can only be
+    # derived from a node that has both an `access` grant to name its
+    # owner and a %U in its path to say where the container sits.
+    resolved = {
+        "server_subtrees": [
+            {"per_user": True, "path": "top/home/%U/x"},  # no access
+            {"per_user": True, "path": "top/plain", "access": {"owner": "jd"}},  # no %U
+            {"per_user": True, "access": {"owner": "jd"}},  # no path at all
+        ],
+        "peer_dependencies": [],
+    }
+    assert _plan_user_containers(resolved, {}) == []
+
+
+def test_layer_plan_entries_keeps_the_deepest_ancestor_seen_out_of_order():
+    # The same three searches again, but with the entries arriving
+    # deepest-first, so the shallower ancestor is the one seen *last* and
+    # must not displace the deeper match already found.
+    entries = _entries(("top/mid/leaf", "r3:/"), ("top/mid", "r2:/"), ("top", "r:/"))
+    transports = relate(entries)
+    by_path = {e["local_path"]: e for e in entries}
+    assert by_path["top/mid/leaf"]["requires_slug"] == "top-mid"
+    assert {t["local_path"]: t["requires_transport"] for t in transports}[
+        "top/mid/leaf"
+    ] == "top-mid"
+
+
+def test_ownership_mismatch_is_quiet_when_the_grant_is_applied():
+    result = {
+        "item": {"local_path": "top/x", "access": _normalize_access({"owner": "jd"})},
+        "stat": {"pw_name": "jd", "gr_name": "stortree", "mode": "0701"},
+    }
+    assert ownership_mismatch(result, "stortree", "stortree") == ""
+
+
+def test_ownership_mismatch_names_the_difference_when_a_grant_is_unenforced():
+    # Exactly the shape the original bug had: the path exists, Ansible
+    # reported the chown as changed, and the owner is still the ancestor
+    # mount's own uniform one.
+    result = {
+        "item": {"local_path": "top/x", "access": _normalize_access({"owner": "jd"})},
+        "stat": {"pw_name": "stortree", "gr_name": "stortree", "mode": "0751"},
+    }
+    assert ownership_mismatch(result, "stortree", "stortree") == (
+        "top/x is stortree:stortree 751 (expected jd:stortree 701)"
+    )
+
+
+def test_check_slug_collisions_rejects_two_mounts_claiming_one_unit_name():
     entries = _entries(("top/leaf", "r:/"), ("top/leaf", "other:/"))
     with pytest.raises(ValueError, match="resolve to systemd unit slug"):
-        _assign_plan_slugs(entries)
+        relate(entries)
 
 
-def test_assign_plan_slugs_ignores_a_clash_between_non_mounts():
+def test_check_slug_collisions_ignores_a_clash_between_non_mounts():
     # A plain directory has no unit to collide over, so the check only
     # looks at entries with a remote.
     entries = _entries(("top/leaf", None), ("top/leaf", None))
@@ -3316,29 +3190,33 @@ def test_relate_plan_entries_skips_a_plain_directory_ancestor():
     # `top/mid/leaf` to order against -- the dependency has to reach past
     # it to `top`, the nearest ancestor that really is a mount.
     entries = _entries(("top", "r:/"), ("top/mid", None), ("top/mid/leaf", "r2:/"))
-    _assign_plan_slugs(entries)
-    _relate_plan_entries(entries)
+    relate(entries)
     by_path = {e["local_path"]: e for e in entries}
     assert by_path["top/mid/leaf"]["requires_slug"] == "top"
     assert by_path["top"]["requires_slug"] is None
 
 
-def test_relate_plan_entries_flags_the_mount_that_is_nested_inside():
-    # has_nested_children is requires_slug read backwards: whoever every
-    # other entry pointed at.
+def test_layer_plan_entries_nests_transports_as_their_nodes_nest():
+    # The remotes root mirrors the tree, so a transport sits inside
+    # whichever transport is above it and has to be ordered against it --
+    # a remount of the outer one detaches the inner, exactly as in the
+    # visible tree. This replaces has_nested_children, which existed only
+    # to force a nested-in mount to stortree:stortree and discard its
+    # grant; transports are uniformly stortree-owned anyway, so the
+    # premise is gone.
     entries = _entries(("top", "r:/"), ("top/leaf", "r2:/"))
-    _assign_plan_slugs(entries)
-    _relate_plan_entries(entries)
-    by_path = {e["local_path"]: e for e in entries}
-    assert by_path["top"]["has_nested_children"]
-    assert not by_path["top/leaf"]["has_nested_children"]
+    transports = relate(entries)
+    by_path = {t["local_path"]: t for t in transports}
+    assert by_path["top/leaf"]["requires_transport"] == "top"
+    assert by_path["top"]["requires_transport"] is None
 
 
 def test_relate_plan_entries_resolves_a_declared_requires_to_its_mount():
     entries = _entries(("cache", "r:/"), ("top", "r2:/", ["cache"]))
-    _assign_plan_slugs(entries)
-    _relate_plan_entries(entries)
-    by_path = {e["local_path"]: e for e in entries}
+    transports = relate(entries)
+    # A declared `requires` is a backend dependency, so it attaches to
+    # layer 1 -- the layer that does the caching it exists to order.
+    by_path = {t["local_path"]: t for t in transports}
     assert by_path["top"]["requires_mounts"] == [
         {"local_path": "cache", "slug": "cache"}
     ]
@@ -3350,9 +3228,8 @@ def test_relate_plan_entries_drops_a_requires_target_that_is_not_a_mount_here():
     # unit starts, or a mount another host owns that this one doesn't
     # peer -- neither has a unit to order against.
     entries = _entries(("cache", None), ("top", "r:/", ["cache", "elsewhere"]))
-    _assign_plan_slugs(entries)
-    _relate_plan_entries(entries)
-    by_path = {e["local_path"]: e for e in entries}
+    transports = relate(entries)
+    by_path = {t["local_path"]: t for t in transports}
     assert by_path["top"]["requires_mounts"] == []
 
 

@@ -79,15 +79,15 @@ implementation:
    spec.md at all — every existing mechanism enforces a *descendant's*
    `access` grant, never the per-user container path itself
    (`home/jd`), which every task in `stortree_mounts` left at the plain
-   `stortree:stortree` default. Resolved to: `staged_node_paths()`
+   `stortree:stortree` default. Resolved to: `_plan_user_containers()`
    (`filter_plugins/stortree.py`) derives the one real user each
    container belongs to, and `stortree_mounts` gives it real ownership —
    but *how* depends on what's above it, since that's the one thing this
    call couldn't just apply uniformly: a plain `chown`/`chmod` for a
    container nested under a genuinely local top-level subtree (`host`
    set, no `rclone`), since real, native Unix ownership already works
-   there; a **presentation mount** (`bindfs`, source = a
-   `.stortree-staging-<name>` sibling, target = the node itself, the
+   there; a **presentation mount** (`bindfs`, source = the same path
+   under `stortree_remotes_root`, target = the node itself, the
    resolved grant as `-u`/`-g`/`-p`) for one nested inside a
    remote-backed ancestor's own rclone mount instead, discovered the
    hard way against a live deployment: a plain `chown` there is accepted
@@ -97,8 +97,10 @@ implementation:
 
    Generalised since: the identical problem applies to *any* node with
    an `access` grant and no `rclone.remote` of its own, not just a
-   per-user container, and the same staging-plus-presentation mechanism
-   now covers both. That same constraint is also why a sibling
+   per-user container, and the same two-layer mechanism now covers
+   both -- the raw rclone mount moved out of the visible tree into
+   `stortree_remotes_root`, and a bindfs mount composes it back in under
+   the resolved grant. That same constraint is also why a sibling
    descendant with its own distinct ownership (a `group`-only grant's
    bind mount, e.g. `mw-fam`) has to wait for the presentation too,
    stacking its own real ownership on top exactly as it already stacked
@@ -261,7 +263,7 @@ everything, so it has the longest path to the backend:
 | --- | --- | --- |
 | recursive `ls -lR` | 0.178s median | 0.135s median |
 | resident memory, 4 mounts | 47.28 MB | 1.46 MB |
-| write via staging, `stat` via the presented path | not visible after 10s | visible immediately |
+| write via the transport, `stat` via the presented path | not visible after 10s | visible immediately |
 
 The staleness row is the correctness one: a presentation mount's whole
 job is to re-present a path something else is writing, and rclone's VFS

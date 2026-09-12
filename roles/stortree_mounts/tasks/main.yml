@@ -228,23 +228,6 @@
       {{ stortree | stortree_plan_mounts(stortree_group_members, stortree_root) }}
   tags: [mounts]
 
-- name: Compute this host's staged nodes
-  # Every node whose access grant can't be applied where the node sits
-  # -- a per-user <user-subdirs-prefix>/<username> folder, or any
-  # granted plain-directory node inside a remote-backed ancestor. See
-  # staged_node_paths() in filter_plugins/stortree.py for why the
-  # per-user ones can't just be read off stortree_mounts_plan's own
-  # entries (that container path never appears there as an entry of its
-  # own, only implied as an ancestor of one). stortree_mounts_plan (just
-  # computed above) is what lets it tell apart the two ways a node can
-  # get real ownership: `requires_slug` set means it nests inside a
-  # remote-backed mount and needs a presentation mount of its own (plain
-  # chown can't work there -- see staged_node_paths()'s own docstring);
-  # unset means a plain local path, chowned directly, nothing needed.
-  ansible.builtin.set_fact:
-    stortree_staged_nodes: "{{ stortree | stortree_staged_nodes(stortree_group_members, stortree_mounts_plan) }}"
-  tags: [mounts]
-
 - name: Find currently installed stortree mount units
   # Run before any path is touched below (see this file's header comment)
   # -- a path that's switching roles between runs (real per-user mount ->
@@ -254,9 +237,9 @@
   ansible.builtin.find:
     paths: /etc/systemd/system
     patterns:
+      - "stortree-remote@*.service"
       - "stortree-mount@*.service"
       - "stortree-bind@*.service"
-      - "stortree-present@*.service"
   register: stortree_mounts_installed_units
   tags: [mounts]
 
@@ -266,7 +249,7 @@
       {{ stortree_mounts_installed_units.files
          | map(attribute='path')
          | list
-         | stortree_stale_units(stortree_mounts_plan, stortree_staged_nodes) }}
+         | stortree_stale_units(stortree_mounts_plan) }}
   tags: [mounts]
 
 - name: Stop and disable stale mount units
@@ -309,8 +292,8 @@
   # state from any past slug family, not just whatever changed today.
   ansible.builtin.command:  # noqa: command-instead-of-module
     cmd: >-
-      systemctl reset-failed 'stortree-mount@*.service' 'stortree-bind@*.service'
-      'stortree-present@*.service'
+      systemctl reset-failed 'stortree-remote@*.service'
+      'stortree-mount@*.service' 'stortree-bind@*.service'
   changed_when: false
   tags: [mounts]
 
@@ -344,10 +327,14 @@
   # mounted at yet, so a first-time mount still gets its directory
   # created normally below.
   ansible.builtin.stat:
-    path: "{{ stortree_root ~ '/' ~ item.local_path }}"
-  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
+    path: >-
+      {{ (stortree_remotes_root if item.kind == 'transport' else stortree_root)
+         ~ '/' ~ item.local_path }}
+  loop: >-
+    {{ stortree_mounts_plan
+       | selectattr('kind', 'in', ['transport', 'mount']) | list }}
   loop_control:
-    label: "{{ item.local_path }}"
+    label: "{{ item.kind }} {{ item.local_path }}"
   register: stortree_mount_point_probe
   ignore_errors: true
   tags: [mounts]
@@ -388,286 +375,170 @@
          | list }}
   tags: [mounts]
 
-- name: Ensure every mount point's parent directory exists
-  # A `group`-only grant's real, shared mount resolves its %U-templated
-  # path through SHARED_MOUNT_SEGMENT (".mounts", per_user_mount_path())
-  # -- a path segment with no tree node of its own, unlike every real
-  # ancestor (e.g. "home"), which gets its own explicit entry in
-  # stortree_mounts_plan and is handled by the plain-directory/mount-
-  # point task below in the very same loop. Nothing else in this file
-  # ever creates ".mounts" explicitly, so it's left to Ansible's own
-  # implicit parent creation when the mount task below creates the
-  # deeper leaf path -- which, unlike the leaf itself, does NOT get the
-  # `owner`/`group`/`mode` given to that task; it inherits root's umask
-  # instead. Restrictive enough on some hosts to lock `stortree` (the
-  # account that actually performs the mount, see the mount-point task's
-  # own comment) out of a directory it needs to enter just to reach the
-  # leaf beneath it -- the same "fusermount: bad mount point ...
-  # Permission denied" failure as an over-restrictive leaf, just one
-  # level up. Explicit and ahead of the mount-point task below so this is
-  # never left to implicit creation; harmless where the parent's really
-  # an ordinary ancestor node too, since that node's own explicit entry
-  # (processed in the very same apply) corrects anything this leaves too
-  # permissive, exactly as it already did before this task existed.
-  #
-  # Skipped entirely once the entry itself is already actively mounted
-  # (`stortree_mounts_already_mounted_paths`, set above) -- see that
-  # task's own comment for why re-touching an already-mounted entry's
-  # parent, every single apply from here on, isn't safe to keep doing.
+- name: Note which paths are transport mountpoints
+  # A transport's own mountpoint under the remotes root is a real local
+  # directory; every *other* planned path under the remotes root
+  # resolves inside a transport and therefore onto a backend. The two
+  # need different treatment, and this is the cheapest way for the loops
+  # below to tell them apart.
+  ansible.builtin.set_fact:
+    stortree_transport_paths: >-
+      {{ stortree_mounts_plan | selectattr('kind', 'equalto', 'transport')
+         | map(attribute='local_path') | list }}
+  tags: [mounts]
+
+- name: Ensure the remotes root exists
+  # Layer 1 lives here: the raw, ungoverned view of every backend this
+  # host mounts, outside stortree_root and never part of the visible
+  # tree (docs/spec.md §2 "The two layers"). 0700 because every node is
+  # visible here regardless of who was granted what -- only the service
+  # account driving the presentation mounts above it, and root, have any
+  # business in it.
   ansible.builtin.file:
-    path: >-
-      {{ stortree_root ~ '/'
-         ~ ((item.local_path | dirname) | stortree_physical_path(stortree_staged_nodes)) }}
+    path: "{{ stortree_remotes_root }}"
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0700"
+  tags: [mounts]
+
+- name: Ensure every transport mountpoint exists under the remotes root
+  # Real local directories, created a level at a time by the plan's own
+  # shallowest-first order so a nested transport's mountpoint is made
+  # before the transport above it is asked to serve it.
+  ansible.builtin.file:
+    path: "{{ stortree_remotes_root ~ '/' ~ item.local_path }}"
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0700"
+  loop: >-
+    {{ stortree_mounts_plan | selectattr('kind', 'equalto', 'transport') | list }}
+  loop_control:
+    label: "{{ item.local_path }}"
+  when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
+  ignore_errors: true
+  tags: [mounts]
+
+- name: Ensure every resolved path exists inside its transport
+  # This is where directory creation actually lands now: the remotes
+  # root mirrors the tree, so a node's real content sits at
+  # <remotes_root>/<path>, on the backend, under exactly the name
+  # config.yml gave it. Creating it here rather than in the visible tree
+  # is what keeps a presentation mount from shadowing the directory a
+  # nested mount is about to mount onto -- the failure that took out
+  # every per-user bind on the first apply after presentation mounts
+  # existed, when the two were different directories.
+  #
+  # Ownership and mode are deliberately uniform and are not the node's
+  # grant: applying a grant here would mean chowning through the
+  # transport's FUSE layer, which reports success and persists nothing.
+  # The grant belongs to layer 2 (stortree-mount@.service.j2).
+  #
+  # Transport mountpoints are excluded -- the task above already made
+  # them, and touching them again would be writing at the mount's own
+  # root rather than into it.
+  ansible.builtin.file:
+    path: "{{ stortree_remotes_root ~ '/' ~ item.local_path }}"
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
     mode: "0751"
-  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
+  loop: >-
+    {{ stortree_mounts_plan
+       | rejectattr('kind', 'equalto', 'transport')
+       | selectattr('transport_slug') | list }}
   loop_control:
     label: "{{ item.local_path }}"
   when:
-    - (item.local_path | dirname) != ''
-    - not ((item.local_path | dirname) | stortree_path_masked(stortree_masked_mount_paths))
-    - item.local_path not in stortree_mounts_already_mounted_paths
+    - item.local_path not in stortree_transport_paths
+    - not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
   ignore_errors: true
   tags: [mounts]
 
-- name: Ensure every resolved mount point or plain directory exists
-  # Ownership/mode come from the path's own `access` grant, not a fixed
-  # default -- see this file's header comment -- *except* for a
-  # remote-backed entry's own mountpoint, which stays stortree:stortree
-  # 0751 regardless of its `access` grant. That pre-mount directory is
-  # never what an `access` grant is actually describing (the unit below
-  # already renders the same grant into rclone's --uid/--gid/--dir-perms/
-  # --file-perms, which is what's actually visible once mounted) -- it
-  # only has to be usable by whichever account performs the mount, which
-  # is unconditionally `stortree` (User= in the unit template, never the
-  # grant's own `owner`). An `owner`-granted mount chowns this directory
-  # to the granted user with mode 0700 if it follows `access` like a
-  # plain directory would: stortree then has no bits on it at all (not
-  # the owner, and the granted owner's directory carries no stortree
-  # group/other access), so `fusermount` refuses with "Permission
-  # denied" before rclone ever gets to establish the mount that would've
-  # made the grant visible in the first place.
+- name: Ensure every path not covered by a presentation exists in the tree
+  # What is left in the visible tree once layer 2 composes it: the
+  # mountpoint of each top-level presentation, and every path of a
+  # genuinely local subtree (`host` set, no `rclone.remote` anywhere
+  # above it), which has no transport and so keeps living directly here.
   #
-  # Any entry -- remote-backed or a plain directory alike -- additionally
-  # skips outright once its own path is itself masked, or nested
-  # underneath a masked ancestor (`stortree_path_masked()`, checked
-  # against `stortree_masked_mount_paths`): an already-running,
-  # unreachable mount has nothing left for this task to verify or
-  # correct for its own path, and root can't create
-  # anything nested inside it either -- attempting either used to fail
-  # outright (a masked entry's own path with "Permission denied", or a
-  # path nested underneath one with "File exists", Ansible's recursive
-  # parent-creation colliding with the very directory it can't see
-  # inside) instead of cleanly doing nothing until the masked ancestor
-  # itself is dealt with -- normally by the unit render/restart below
-  # this same run, which gives the ancestor --allow-other so it stops
-  # being masked at all (docs/runbook.md "A masked mount").
-  #
-  # `stortree_physical_path` for the same reason as the bind-mountpoint
-  # task below -- see its comment: an entry resolving *inside* a wrapped
-  # per-user container has to be created in that container's staging
-  # directory, since the container path itself is a wrapper mountpoint and
-  # anything created directly under it is shadowed the moment the wrapper
-  # mounts. Left exactly as-is for every other entry, which is all of them
-  # unless a node nests under a user-subdirs container.
-  ansible.builtin.file:
-    path: >-
-      {{ stortree_root ~ '/'
-         ~ (item.local_path | stortree_physical_path(stortree_staged_nodes)) }}
-    state: directory
-    owner: "{{ stortree_user if item.remote else (item.access | stortree_access_owner(stortree_user)) }}"
-    group: "{{ stortree_group if item.remote else (item.access | stortree_access_group(stortree_group)) }}"
-    mode: "{{ '0751' if item.remote else (item.access | stortree_access_mode) }}"
-  loop: "{{ stortree_mounts_plan | rejectattr('symlink_target') | list }}"
-  loop_control:
-    label: "{{ item.local_path }}"
-  when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
-  ignore_errors: true
-  tags: [mounts]
-
-- name: Ensure every per-user personal-mount staging directory exists
-  # The real content a wrapper mount (rendered below) re-presents with
-  # its one owner's correct --uid/--gid/--dir-perms: ordinary content,
-  # inside the very same remote-backed mount the container itself nests
-  # under, that nothing but the `stortree` account (driving both that
-  # outer mount and the wrapper mount) ever touches directly -- so its
-  # own ownership/mode here doesn't matter beyond being usable by
-  # `stortree`, same reasoning as any other pre-mount directory in this
-  # file. A sibling of the container itself (STORTREE_USER_PREFIX in
-  # filter_plugins/stortree.py), so it always resolves under the same
-  # already-existing parent (e.g. `home`) the container itself does --
-  # which the mount-point/plain-directory task above has just created, the
-  # reason this sits here rather than any earlier.
-  #
-  # Ahead of both bind-mountpoint tasks below (it used to follow them):
-  # `stortree_physical_path` redirects anything resolving inside a wrapped
-  # container into *this* directory, so it has to exist first. Same
-  # don't-rely-on-implicit-multi-level-creation reasoning as every other
-  # "...parent directory exists" task in this file, just for the one
-  # parent that isn't a tree node at all.
-  ansible.builtin.file:
-    path: "{{ stortree_root ~ '/' ~ item.staging_path }}"
-    state: directory
-    owner: "{{ stortree_user }}"
-    group: "{{ stortree_group }}"
-    mode: "0751"
-  loop: "{{ stortree_staged_nodes | selectattr('requires_slug') | list }}"
-  loop_control:
-    label: "{{ item.staging_path }}"
-  when: not (item.staging_path | stortree_path_masked(stortree_masked_mount_paths))
-  ignore_errors: true
-  tags: [mounts]
-
-- name: Ensure every per-user bind mountpoint's parent directory exists
-  # A `group`-only grant with no sibling owner-only leaf under the same
-  # `home/<user>` folder (e.g. mw-fam with no sys-configs alongside it)
-  # produces *only* a bind-mount entry for that user -- no plain-directory
-  # or mount entry ever resolves to `home/<user>` itself, so nothing
-  # above would otherwise create it. Explicit and ahead of the bind-
-  # mountpoint task below, same reason as "Ensure every mount point's
-  # parent directory exists" above: don't rely on implicit multi-level
-  # directory creation against a backend (this file's already hit one in
-  # production) that doesn't reliably support creating more than one
-  # missing path level in a single step. No `access` of its own to set
-  # ownership/mode from -- it isn't a node in the tree, just an implied
-  # container -- so it gets the same plain default every unmodeled path
-  # got before `access` existed.
-  ansible.builtin.file:
-    path: >-
-      {{ stortree_root ~ '/'
-         ~ ((item.local_path | dirname) | stortree_physical_path(stortree_staged_nodes)) }}
-    state: directory
-    owner: "{{ stortree_user }}"
-    group: "{{ stortree_group }}"
-    mode: "0751"
-  loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
-  loop_control:
-    label: "{{ item.local_path | dirname }}"
-  when: not ((item.local_path | dirname) | stortree_path_masked(stortree_masked_mount_paths))
-  ignore_errors: true
-  tags: [mounts]
-
-- name: Ensure every per-user bind mountpoint directory exists
-  # Fans a `group`-only node's one real, shared mount back out to each
-  # authorized member's own folder via a kernel bind mount, not a real
-  # symlink (stortree_plan_mounts' symlink_target field, still named for
-  # the mechanism this replaced -- see plan_mounts()'s own docstring): a
-  # symlink is a directory entry the *target* directory's own backend has
-  # to be able to represent, and not every remote backend can (an SMB
-  # share, in production, flatly refused with an I/O error trying to
-  # create one at all). A bind mount needs an ordinary, empty directory
-  # to mount onto instead -- exactly what every other mountpoint in this
-  # file already gets (the "Ensure every resolved mount point or plain
-  # directory exists" task above, which this mirrors), stortree:stortree
-  # 0751 same as any other unmodeled path (no `access` of its own -- it
-  # isn't a node in the tree, just an implied container whose real
-  # enforcement lives on the mount it's about to be bound onto). The
-  # actual bind mount itself happens via the stortree-bind@ unit rendered
-  # below, not here -- this task only has to get an empty directory in
-  # place for that unit's ExecStart to mount onto.
-  #
-  # `stortree_physical_path` (filter_plugins/stortree.py) because "in
-  # place" isn't the same path it reads as, once the per-user container
-  # this sits inside is a *wrapped* one: that container path is a wrapper
-  # mountpoint, and a directory created directly underneath it is shadowed
-  # the moment the wrapper mounts over it -- so the bind unit's ExecStart
-  # then finds no mountpoint at all. This is exactly how it failed in
-  # production the first apply after wrapper mounts existed (all eight
-  # binds, both hosts: the bind unit's own new `Requires=` pulled the
-  # wrapper up first, and `mount --bind` then had nothing to mount onto).
-  # Creating it in the wrapper's staging directory instead puts it where
-  # the wrapper actually re-presents the container's contents from, so it
-  # exists at the visible path for real. Unwrapped (plain local) containers
-  # rewrite to nothing at all and keep working exactly as before.
-  ansible.builtin.file:
-    path: "{{ stortree_root ~ '/' ~ (item.local_path | stortree_physical_path(stortree_staged_nodes)) }}"
-    state: directory
-    owner: "{{ stortree_user }}"
-    group: "{{ stortree_group }}"
-    mode: "0751"
-  loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
-  loop_control:
-    label: "{{ item.local_path }}"
-  when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
-  ignore_errors: true
-  tags: [mounts]
-
-- name: Own every plain-local per-user container by the one real user it's for
-  # Every task above that touches a per-user container path (the two
-  # "...parent directory exists" tasks, and Ansible's own implicit
-  # parent creation inside "Ensure every resolved mount point or plain
-  # directory exists") only ever sets it to the plain stortree:stortree
-  # default -- correct for an ordinary unmodeled ancestor, but a
-  # user-subdirs container is never just that: it's the one real folder
-  # a specific person's descendant grants (owner or group) actually live
-  # under, and access_mode()'s public-execute bit on the stortree:stortree
-  # default only makes it *traversable*, not owned by that person -- no
-  # different from anyone else's home directory being merely
-  # world-executable rather than actually theirs. This task runs last so
-  # it always overrides whichever of the above most recently touched that
-  # exact path, same idempotent last-word pattern as every other
-  # ownership task in this file. 0750, not 0751: this directory is now
-  # privately owned by that one real user, so (unlike the plain
-  # stortree:stortree default) nobody else ever needs to traverse through
-  # it -- only its owner and the administering `stortree` group.
-  #
-  # Scoped to `rejectattr('requires_slug')`: a container with
-  # requires_slug set nests inside a remote-backed mount, where a plain
-  # chown()/chmod() through that mount's own FUSE layer has nowhere real
-  # to persist a different owner for just this one path -- confirmed
-  # against a live deployment, where Ansible reported this exact task as
-  # `changed` while the container's real, on-disk owner never actually
-  # moved off stortree:stortree. Those containers get a wrapper mount
-  # instead (below), which can actually enforce a per-path override; only
-  # a genuinely plain-local container (no remote-backed ancestor at all)
-  # can be chowned this simply and have it stick.
+  # `requires_slug` is the test because it names the nearest presentation
+  # above a path -- when there is none, nothing is going to compose this
+  # path into view and it has to exist for real.
   ansible.builtin.file:
     path: "{{ stortree_root ~ '/' ~ item.local_path }}"
     state: directory
-    owner: "{{ item.owner | default(stortree_user, true) }}"
-    group: "{{ item.group | default(stortree_group, true) }}"
-    mode: "{{ item.mode }}"
-  loop: "{{ stortree_staged_nodes | rejectattr('requires_slug') | list }}"
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0751"
+  loop: >-
+    {{ stortree_mounts_plan
+       | rejectattr('kind', 'equalto', 'transport')
+       | rejectattr('requires_slug') | list }}
   loop_control:
     label: "{{ item.local_path }}"
   when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
   ignore_errors: true
   tags: [mounts]
 
-- name: Render systemd units for every resolved mount
+- name: Own every genuinely local granted path by its own grant
+  # The one case a plain chown still both applies and sticks: a node with
+  # no transport anywhere above it is an ordinary directory on this
+  # host's own disk, so real Unix ownership works and no mount is needed
+  # to fake it. Everything else with a grant got a presentation mount
+  # instead, because a chown through a FUSE layer reports `changed` and
+  # persists nothing -- confirmed against a live deployment.
+  #
+  # Last, so it overrides whichever task above most recently touched the
+  # same path with the uniform stortree:stortree default.
+  ansible.builtin.file:
+    path: "{{ stortree_root ~ '/' ~ item.local_path }}"
+    state: directory
+    owner: "{{ item.access | stortree_access_owner(stortree_user) }}"
+    group: "{{ item.access | stortree_access_group(stortree_group) }}"
+    mode: "{{ item.access | stortree_access_mode }}"
+  loop: >-
+    {{ stortree_mounts_plan
+       | rejectattr('kind', 'equalto', 'transport')
+       | rejectattr('transport_slug')
+       | selectattr('access') | list }}
+  loop_control:
+    label: "{{ item.local_path }}"
+  when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
+  ignore_errors: true
+  tags: [mounts]
+
+- name: Render systemd units for every transport mount
+  # Layer 1, and rendered first: every presentation below reads a path
+  # inside one of these, so nothing else can start until they do.
+  ansible.builtin.template:
+    src: stortree-remote@.service.j2
+    dest: "/etc/systemd/system/stortree-remote@{{ entry.slug }}.service"
+    mode: "0644"
+  loop: >-
+    {{ stortree_mounts_plan | selectattr('kind', 'equalto', 'transport') | list }}
+  loop_control:
+    loop_var: entry
+    label: "{{ entry.local_path }}"
+  register: stortree_remotes_units_rendered
+  notify: stortree mounts changed
+  tags: [mounts]
+
+- name: Render systemd units for every presentation mount
+  # Layer 2. Ahead of the per-user bind units below: a bind's own
+  # mountpoint lives inside whichever presentation composes it into
+  # view, so that presentation has to be up first
+  # (stortree-bind@.service.j2's own dependency on it).
   ansible.builtin.template:
     src: stortree-mount@.service.j2
     dest: "/etc/systemd/system/stortree-mount@{{ entry.slug }}.service"
     mode: "0644"
-  loop: "{{ stortree_mounts_plan | selectattr('remote') | list }}"
+  loop: >-
+    {{ stortree_mounts_plan | selectattr('kind', 'equalto', 'mount') | list }}
   loop_control:
     loop_var: entry
     label: "{{ entry.local_path }}"
   register: stortree_mounts_units_rendered
-  notify: stortree mounts changed
-  tags: [mounts]
-
-- name: Render systemd units for every per-user personal mount
-  # Only containers with requires_slug set get one -- see
-  # user_container_paths()/this file's "Own every plain-local per-user
-  # container..." task above for the other case. Rendered and enabled
-  # ahead of the per-user bind-mount units below: a descendant nested
-  # under one of these containers (e.g. mw-fam) now nests *inside* this
-  # wrapper mount's own presented tree, not directly inside the outer
-  # remote-backed mount, so its own bind-mount unit depends on this one
-  # being up first (stortree-bind@.service.j2's own preference for a
-  # matching wrapper mount over its plain requires_slug).
-  ansible.builtin.template:
-    src: stortree-present@.service.j2
-    dest: "/etc/systemd/system/stortree-present@{{ entry.slug }}.service"
-    mode: "0644"
-  loop: "{{ stortree_staged_nodes | selectattr('requires_slug') | list }}"
-  loop_control:
-    loop_var: entry
-    label: "{{ entry.local_path }}"
-  register: stortree_user_mounts_units_rendered
   notify: stortree mounts changed
   tags: [mounts]
 
@@ -676,7 +547,8 @@
     src: stortree-bind@.service.j2
     dest: "/etc/systemd/system/stortree-bind@{{ entry.slug }}.service"
     mode: "0644"
-  loop: "{{ stortree_mounts_plan | selectattr('symlink_target') | list }}"
+  loop: >-
+    {{ stortree_mounts_plan | selectattr('kind', 'equalto', 'bind') | list }}
   loop_control:
     loop_var: entry
     label: "{{ entry.local_path }}"
@@ -702,7 +574,7 @@
   ansible.builtin.set_fact:
     stortree_mounts_rendered_units: >-
       {{ stortree_mounts_units_rendered.results
-         + stortree_user_mounts_units_rendered.results
+         + stortree_remotes_units_rendered.results
          + stortree_binds_units_rendered.results }}
   tags: [mounts]
 
@@ -752,10 +624,9 @@
   # certainly appeared in the meantime, and whatever is still missing is
   # the interesting set.
   #
-  # The same three families the creation tasks cover, each through the
-  # same `stortree_physical_path` redirection (an entry inside a wrapped
-  # per-user container lives in that container's staging directory, not
-  # at its own path). Masked paths are skipped by `when:` rather than
+  # Every visible path the tree is supposed to compose, plus every
+  # transport mountpoint under the remotes root. Masked paths are
+  # skipped by `when:` rather than
   # filtered out of the loop, because `stortree_path_masked` is a filter
   # and `reject()` takes a test -- the skipped results are then dropped
   # below by `selectattr('stat', 'defined')`, since a skipped item has no
@@ -763,14 +634,14 @@
   # runbook entry (docs/runbook.md "A masked mount"), not something to
   # re-report here.
   ansible.builtin.stat:
-    path: "{{ stortree_root ~ '/' ~ item }}"
+    path: >-
+      {{ (stortree_remotes_root if item.kind == 'transport' else stortree_root)
+         ~ '/' ~ item.local_path }}
     get_checksum: false
-  loop: >-
-    {{ (stortree_mounts_plan | map(attribute='local_path')
-          | map('stortree_physical_path', stortree_staged_nodes) | list)
-     + (stortree_staged_nodes | selectattr('requires_slug')
-          | map(attribute='staging_path') | list) }}
-  when: not (item | stortree_path_masked(stortree_masked_mount_paths))
+  loop: "{{ stortree_mounts_plan }}"
+  loop_control:
+    label: "{{ item.local_path }}"
+  when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
   register: stortree_mounts_verify
   changed_when: false
   tags: [mounts]
@@ -793,8 +664,39 @@
     stortree_mounts_missing: >-
       {{ stortree_mounts_verify.results
          | selectattr('stat', 'defined') | rejectattr('stat.exists')
-         | map(attribute='item') | list }}
+         | map(attribute='item.local_path') | list }}
   when: stortree_mounts_missing | length > 0
+  tags: [mounts]
+
+- name: Report any granted path whose ownership does not match its grant
+  # Existence was never the interesting question. The bug this layering
+  # exists to fix looked exactly like success: Ansible reported the chown
+  # as `changed`, the path existed, and `stat` kept returning the
+  # ancestor mount's own uniform owner on every apply afterwards. Nothing
+  # compared the two, so nothing noticed for as long as it took someone
+  # to look by hand.
+  #
+  # Advisory, not fatal, and deliberately so: a brand-new nested entry
+  # legitimately reads wrong until the apply that mounts its presentation
+  # completes, and a masked ancestor has its own runbook entry. What it
+  # buys is that a grant which silently stops being applied says so.
+  ansible.builtin.debug:
+    msg: >-
+      {{ stortree_mounts_misowned | length }} granted path(s) do not match
+      their resolved grant: {{ stortree_mounts_misowned | join('; ') }}.
+      Expected owner/group/mode come from the node's `access` block; a
+      path that still disagrees after a second apply means its
+      presentation mount is not up -- check
+      `systemctl status stortree-mount@<slug>`.
+  vars:
+    stortree_mounts_misowned: >-
+      {{ stortree_mounts_verify.results
+         | selectattr('stat', 'defined') | selectattr('stat.exists')
+         | selectattr('item.access')
+         | rejectattr('item.kind', 'equalto', 'transport')
+         | map('stortree_ownership_mismatch', stortree_user, stortree_group)
+         | reject('equalto', '') | list }}
+  when: stortree_mounts_misowned | length > 0
   tags: [mounts]
 
 - name: Fail when a directory is still missing and strict mode is on
@@ -807,7 +709,7 @@
     stortree_mounts_missing: >-
       {{ stortree_mounts_verify.results
          | selectattr('stat', 'defined') | rejectattr('stat.exists')
-         | map(attribute='item') | list }}
+         | map(attribute='item.local_path') | list }}
   when:
     - stortree_mounts_strict | bool
     - stortree_mounts_missing | length > 0

@@ -40,14 +40,22 @@ SOURCES = sorted(
 # the many `stortree_*` *variables* (stortree_root, stortree_mounts_plan,
 # ...) that share the prefix. `\s` spans newlines, which matters: the
 # roles routinely break a long expression across lines after the pipe.
-_FILTER_CALL = re.compile(r"\|\s*(stortree_[a-z_]+)")
+# Two spellings, because both are real uses: `| stortree_x(...)`, and
+# `map('stortree_x', ...)` / `select(...)` / `reject(...)`, where the
+# filter is named as a quoted string instead. Missing the second one
+# would report a filter the roles genuinely call as dead.
+_FILTER_CALL = re.compile(
+    r"\|\s*(stortree_[a-z_]+)"
+    r"|(?:map|select|reject|selectattr|rejectattr)\(\s*['\"](stortree_[a-z_]+)['\"]"
+)
 
 def referenced_filters():
     """Every `stortree_*` name used as a filter anywhere in the roles,
     playbooks or Molecule scenarios, as {name: [files]}."""
     found = {}
     for path in SOURCES:
-        for name in _FILTER_CALL.findall(path.read_text()):
+        for piped, quoted in _FILTER_CALL.findall(path.read_text()):
+            name = piped or quoted
             found.setdefault(name, []).append(str(path.relative_to(REPO_ROOT)))
     return found
 

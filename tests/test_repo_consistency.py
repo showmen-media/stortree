@@ -25,11 +25,11 @@ from conftest import EXAMPLE_HOSTS, REPO_ROOT
 from filter_plugins.stortree import (
     DEFAULT_STORTREE_ETC,
     DEFAULT_STORTREE_ROOT,
+    DEFAULT_STORTREE_REMOTES_ROOT,
     PEER_SSH_KEY_NAME,
     mount_unit_names,
     plan_mounts,
     resolve,
-    present_unit_names,
 )
 
 # The three copies of docs/config-schema.md's worked example: what the
@@ -210,6 +210,13 @@ def test_the_plugins_path_fallbacks_match_the_role_defaults():
     # produces another, which is exactly the gap that makes a fallback
     # worth having a guard on at all.
     assert role_defaults("stortree_facts")["stortree_root"] == DEFAULT_STORTREE_ROOT
+    # Same guard for layer 1's root: the plugin falls back to its own
+    # constant when called outside a play, and the two drifting apart
+    # would put the transport mounts somewhere the role never creates.
+    assert (
+        role_defaults("stortree_facts")["stortree_remotes_root"]
+        == DEFAULT_STORTREE_REMOTES_ROOT
+    )
     assert role_defaults("stortree_common")["stortree_etc"] == DEFAULT_STORTREE_ETC
 
 
@@ -263,19 +270,17 @@ def test_every_unit_family_the_plugin_names_is_swept_by_the_role():
     # detects stale unit files, the `systemctl reset-failed` that clears
     # ghost state, and playbooks/status.yml's own `list-units` -- and
     # each names the unit families literally. A fourth place invents the
-    # names: mount_unit_names()/present_unit_names(). A family added
-    # there but missed in any of the three sweeps is a unit that is
-    # rendered and started but never listed, never reset, and never
-    # cleaned up when it goes stale, on every apply, silently.
+    # names: mount_unit_names(), off UNIT_FAMILIES. A family added there
+    # but missed in any of the three sweeps is a unit that is rendered
+    # and started but never listed, never reset, and never cleaned up
+    # when it goes stale, on every apply, silently.
     plan = [
-        {"local_path": "a", "remote": "r:/", "slug": "a"},
-        {"local_path": "b", "remote": None, "symlink_target": "a", "slug": "b"},
+        {"local_path": "a", "kind": "transport", "slug": "a"},
+        {"local_path": "a", "kind": "mount", "slug": "a"},
+        {"local_path": "b", "kind": "bind", "slug": "b"},
+        {"local_path": "c", "kind": "dir", "slug": "c"},
     ]
-    containers = [{"local_path": "c", "slug": "c", "requires_slug": "a"}]
-    families = {
-        name.split("@", 1)[0] + "@"
-        for name in mount_unit_names(plan) + present_unit_names(containers)
-    }
+    families = {name.split("@", 1)[0] + "@" for name in mount_unit_names(plan)}
     assert len(families) == 3, f"unexpected unit families: {families}"
 
     sweeps = {
@@ -348,7 +353,10 @@ def test_the_mounts_verification_covers_the_paths_the_role_creates():
     assert len(verify) == 1
     loop = verify[0]["loop"]
     assert "stortree_mounts_plan" in loop
-    assert "staging_path" in loop
+    # The verification loop walks the whole plan, both layers: a
+    # transport mountpoint under the remotes root and a presented path
+    # in the tree are both things this apply was supposed to create.
+    assert "stortree_remotes_root" in str(verify[0]["ansible.builtin.stat"]["path"])
     # ...and it must not re-report a masked path, which has its own
     # runbook entry rather than being a failure.
     assert "stortree_path_masked" in str(verify[0]["when"])

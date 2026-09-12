@@ -145,9 +145,9 @@ stranded mount while it is reachable, then start in the other order:
 
 ```sh
 systemctl stop 'stortree-mount@<nested-slug>.service'
-systemctl stop 'stortree-present@<node-slug>.service'
+systemctl stop 'stortree-mount@<node-slug>.service'
 fusermount -uz /srv/stortree/<nested path>        # now reachable
-systemctl start 'stortree-present@<node-slug>.service'
+systemctl start 'stortree-mount@<node-slug>.service'
 systemctl start 'stortree-mount@<nested-slug>.service'
 ```
 

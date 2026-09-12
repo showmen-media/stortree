@@ -12,6 +12,21 @@
 # drift guard in tests/test_repo_consistency.py.
 stortree_root: /srv/stortree
 
+# Where layer-1 (transport) rclone mounts live -- a local directory on
+# every managed host, deliberately outside stortree_root and never part
+# of the visible tree (docs/spec.md §2 "The two layers"). It mirrors the
+# tree, so <stortree_remotes_root>/<path> and <stortree_root>/<path> are
+# the same directory on the backend reached by two different local
+# paths.
+#
+# It is local, which is the point: nothing here is ever written to a
+# backend, so a remote's own directory structure holds only the paths
+# config.yml describes. Kept in step with
+# filter_plugins/stortree.py's DEFAULT_STORTREE_REMOTES_ROOT by the same
+# drift guard in tests/test_repo_consistency.py that covers
+# stortree_root.
+stortree_remotes_root: /srv/.stortree-remotes
+
 # Paths on the control node, relative to the playbook. Override if your
 # stortree/ checkout lives somewhere else (spec.md "Config layout").
 stortree_repo_root: "{{ playbook_dir }}/.."
