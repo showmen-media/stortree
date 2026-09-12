@@ -1,0 +1,59 @@
+---
+# A scrape config for the target list playbooks/metrics-targets.yml
+# generates. Copy the relevant parts into your own prometheus.yml -- this
+# is not applied to anything by stortree, and no stortree playbook
+# manages your Prometheus.
+#
+# The target file is regenerated from the fleet, so point Prometheus at
+# wherever you have the playbook write it (stortree_metrics_targets_file)
+# or ship it there afterwards; file_sd re-reads it on its own, with no
+# Prometheus restart.
+
+scrape_configs:
+  - job_name: stortree-rclone
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/file_sd/stortree-targets.json
+        refresh_interval: 5m
+
+    # Without this, every series is identified by "ip:port" -- and the
+    # port is derived from a path hash, so it tells a human nothing.
+    # stortree_host and stortree_node are on every target already.
+    relabel_configs:
+      - source_labels: [stortree_host, stortree_node]
+        separator: "/"
+        target_label: instance
+
+    # Only if stortree_metrics_htpasswd is set on the hosts. Mandatory
+    # there for the `rc` flavour, whose endpoint also serves
+    # config/dump.
+    # basic_auth:
+    #   username: prometheus
+    #   password_file: /etc/prometheus/stortree.password
+
+# What to do with it. rclone publishes its own accounting -- bytes
+# transferred, errors, checks, transfers -- per mount process; the VFS
+# cache's own state is not in /metrics (it lives behind the rc API's
+# vfs/stats), so don't expect cache size or upload queue depth here.
+#
+# The most useful signal is not an rclone metric at all. `up` goes to 0
+# when the endpoint stops answering, which for these units means the
+# rclone process for that one mount is gone:
+#
+#   - alert: StortreeMountProcessGone
+#     expr: up{job="stortree-rclone"} == 0
+#     for: 10m
+#     annotations:
+#       summary: >-
+#         rclone for {{ $labels.stortree_node }} on
+#         {{ $labels.stortree_host }} is not answering -- check
+#         `systemctl status stortree-remote@{{ $labels.stortree_slug }}`
+#
+# Read that alert for exactly what it says. It catches a dead process,
+# and it does not catch the failure mode this tree has actually hit in
+# production: a mount detached by a remount above it, where the rclone
+# process is alive and answering, its counters are fine, and the path it
+# was serving has quietly reverted to the empty directory underneath.
+# Nothing rclone exposes can see that from inside the process --
+# `playbooks/status.yml` and the mountpoint probes in stortree_mounts
+# are what find it.

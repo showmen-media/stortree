@@ -174,6 +174,9 @@ def test_no_real_site_config_is_tracked_in_git():
         "stortree/rclone.conf",
         "stortree/sshd_config",
         "inventory/hosts.yml",
+        "inventory/group_vars/all.yml",
+        "inventory/host_vars/storage-node-alpha.yml",
+        "prometheus/stortree-targets.json",
     }
     assert forbidden.isdisjoint(tracked)
 
@@ -361,3 +364,35 @@ def test_the_mounts_verification_covers_the_paths_the_role_creates():
     # ...and it must not re-report a masked path, which has its own
     # runbook entry rather than being a failure.
     assert "stortree_path_masked" in str(verify[0]["when"])
+
+
+def test_the_metrics_fragment_lives_in_the_directory_stortree_common_creates():
+    # stortree_metrics_fragment is spelled as a literal path rather than
+    # "{{ stortree_etc }}/..." because stortree_etc is a stortree_common
+    # default and playbooks/metrics-targets.yml applies stortree_facts
+    # alone -- the same constraint that put stortree_root in
+    # stortree_facts. The cost of that literal is this guard: change
+    # stortree_etc and the fragment would otherwise be written into a
+    # directory nothing creates, and read back from one nothing wrote.
+    etc = role_defaults("stortree_common")["stortree_etc"]
+    assert (
+        role_defaults("stortree_facts")["stortree_metrics_fragment"]
+        == f"{etc}/metrics-targets.json"
+    )
+
+    # ...and the guard only holds while the writer and the reader both
+    # go through the variable instead of re-spelling the path. (The
+    # role names `metrics-targets.json.j2` as a template *source*, which
+    # is a file in the role, not the destination on the host.)
+    for path in (
+        REPO_ROOT / "roles/stortree_mounts/tasks/main.yml",
+        REPO_ROOT / "playbooks/metrics-targets.yml",
+    ):
+        text = path.read_text()
+        assert "stortree_metrics_fragment" in text, path
+        # Comments stripped: both files explain /etc/stortree's 0750 in
+        # prose, and prose about a path is not a second spelling of it.
+        directives = "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert etc not in directives, path

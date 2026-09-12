@@ -1,0 +1,44 @@
+{#
+This host's own endpoints, as a Prometheus file_sd fragment.
+
+Written here, on the host, rather than assembled on the control node,
+because the host is where the answer is authoritative: these are the
+ports its unit files actually render, from the same facts that rendered
+them. playbooks/metrics-targets.yml only collects the fragments and
+concatenates them, so the control node never has to recompute a plan --
+or hold the LDAP group memberships it would need to compute one.
+
+One object per transport mount, because that is the granularity of an
+rclone metrics server: one process, one mount, one endpoint (see
+metrics_ports() in filter_plugins/stortree.py).
+
+Targets prefer the non-loopback listeners, so a scraper elsewhere gets
+an address it can actually reach. A loopback-only host still gets its
+endpoints listed -- they are reachable from an agent running on the host
+itself, or through an SSH tunnel -- rather than silently emitting
+nothing, which would look identical to metrics being switched off.
+
+`stortree_slug` is a label rather than a nicety: it is the one string an
+alert has to carry for the person woken by it to run `systemctl status
+stortree-remote@<slug>`, and it is not derivable from the path by eye
+(slugs are systemd-escaped -- see _slug()).
+#}
+{% set scrape = stortree_metrics_listeners | rejectattr('loopback') | list %}
+{% set rows = [] %}
+{% for entry in stortree_mounts_plan | selectattr('kind', 'equalto', 'transport') | sort(attribute='local_path') %}
+{%   set port = stortree_metrics_ports[entry.slug] %}
+{%   set addresses = [] %}
+{%   for listener in (scrape if scrape else stortree_metrics_listeners) %}
+{%     set _ = addresses.append(listener.listen ~ ':' ~ port) %}
+{%   endfor %}
+{%   set _ = rows.append({
+         'targets': addresses,
+         'labels': {
+           'stortree_host': inventory_hostname,
+           'stortree_node': entry.local_path,
+           'stortree_slug': entry.slug,
+           'stortree_remote': entry.remote,
+         },
+       }) %}
+{% endfor %}
+{{ rows | to_nice_json }}

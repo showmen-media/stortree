@@ -1048,6 +1048,18 @@ misspelled `access.group` drops the grant and leaves the path at its
 permissive default. All four resolve to something plausible, and none of
 them announce themselves at apply time.
 
+A rejected key is sometimes a setting that is real but belongs
+elsewhere. This file describes the *tree* — what exists, who owns it,
+who may read it — and `resolve()` is a pure per-host function whose
+conclusions about a host must match the ones that host reaches about
+itself. Operational policy that no other host depends on is not that,
+and lives in ordinary Ansible inventory instead: `stortree_samba_hosts`
+(above), the Samba `[global]` overrides in
+[runbook.md](runbook.md#changing-sambas-global-settings-eg-workgroup),
+and whether a host publishes rclone metrics
+([runbook.md](runbook.md) "Publishing rclone metrics"). See
+`inventory/group_vars/all.yml.example`.
+
 One consequence worth knowing: dotted shorthand splits on the *last* dot
 only (see below), so a three-segment key like
 `rclone.args.vfs-cache-mode:` expands to a key literally named

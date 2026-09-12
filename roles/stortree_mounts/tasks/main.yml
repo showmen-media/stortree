@@ -215,6 +215,50 @@
     mode: "0644"
   tags: [mounts]
 
+- name: Read the rclone version this host actually has
+  # Only to decide between the two metrics spellings, and only when the
+  # operator left that on `auto`. The roles install rclone from apt, so
+  # the answer legitimately differs across a fleet that spans two Debian
+  # releases (bookworm ships 1.60.1; --metrics-addr arrived in 1.68),
+  # and guessing wrong is not a missing counter but a mount that never
+  # starts -- rclone rejects an unknown flag outright and the transport
+  # unit is Type=notify.
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    cmd: rclone version
+  register: stortree_metrics_rclone_version
+  changed_when: false
+  # Reads nothing but a version string, and has to run under --check
+  # too: a skipped command leaves no stdout, which the decision below
+  # would read as "too old to serve /metrics" and fail the assert on a
+  # host that is perfectly fine. A dry run is documented in
+  # docs/runbook.md and must not report that.
+  check_mode: false
+  when:
+    - stortree_metrics_enabled
+    - stortree_metrics_flavour == "auto"
+  tags: [mounts]
+
+- name: Decide which metrics flavour this host's rclone can serve
+  # Falls back to `rc` when the version can't be parsed rather than to
+  # the newer flag: `rc` works on every rclone that has ever had an rc
+  # server, and the assert below keeps it from reaching the network
+  # without authentication. The opposite fallback would take the mount
+  # down on exactly the old hosts this exists to cope with.
+  ansible.builtin.set_fact:
+    stortree_metrics_mode: >-
+      {{ stortree_metrics_flavour if stortree_metrics_flavour != "auto"
+         else ("metrics-addr"
+               if stortree_metrics_rclone_semver is version("1.68.0", ">=")
+               else "rc") }}
+  vars:
+    stortree_metrics_rclone_semver: >-
+      {{ stortree_metrics_rclone_version.stdout
+         | default("", true)
+         | regex_search("[0-9]+\.[0-9]+\.[0-9]+")
+         | default("0.0.0", true) }}
+  when: stortree_metrics_enabled
+  tags: [mounts]
+
 - name: Compute this host's flat mount plan
   # stortree_group_members (resolved by stortree_secrets, which always
   # runs before this role -- site.yml §8) covers every group referenced
@@ -226,6 +270,58 @@
   ansible.builtin.set_fact:
     stortree_mounts_plan: >-
       {{ stortree | stortree_plan_mounts(stortree_group_members, stortree_root) }}
+  tags: [mounts]
+
+- name: Allocate a metrics port and resolve the listen addresses for every mount
+  # Both are pure functions with their own failure modes, run here so
+  # they fail the apply at a controlled point rather than at
+  # `systemctl start`: a port two mounts both want, or an interface name
+  # that resolves to no address on this host, is a mount that does not
+  # come up (rclone exits when it cannot bind; Type=notify) and takes
+  # every presentation and bind above it down with it through PartOf=.
+  #
+  # Computed unconditionally, cheap either way, so the render task below
+  # never has to reason about whether these exist -- the template reads
+  # them only inside its own `stortree_metrics_enabled` guard.
+  ansible.builtin.set_fact:
+    stortree_metrics_ports: >-
+      {{ stortree_mounts_plan
+         | stortree_metrics_ports(stortree_metrics_base_port,
+                                  stortree_metrics_port_span,
+                                  stortree_metrics_port_overrides) }}
+    stortree_metrics_listeners: >-
+      {{ stortree_metrics_bind | stortree_metrics_listeners(ansible_facts) }}
+  tags: [mounts]
+
+- name: Refuse a metrics configuration that would publish this host's credentials
+  # The `rc` flavour serves /metrics on the rc port, and the rc port
+  # also serves config/dump -- which reads back the scoped rclone.conf
+  # stortree_secrets put on this host, credentials for every backend it
+  # mounts included. Loopback is not an exemption: every LDAP user with
+  # a shell here is a local user, which is rather the point of the tree,
+  # and an unauthenticated rc endpoint on 127.0.0.1 hands them the file
+  # /etc/stortree's own 0750 exists to keep away from them.
+  #
+  # Fail-closed here rather than a warning, because the failure this
+  # prevents is silent and permanent: nothing about a host serving its
+  # own credentials on a port looks wrong afterwards.
+  ansible.builtin.assert:
+    that:
+      - stortree_metrics_flavour in ["auto", "metrics-addr", "rc"]
+      - not stortree_metrics_enabled or stortree_metrics_listeners | length > 0
+      - >-
+        not stortree_metrics_enabled
+        or stortree_metrics_mode != "rc"
+        or stortree_metrics_htpasswd
+    fail_msg: >-
+      stortree_metrics_flavour must be auto, metrics-addr or rc
+      (is {{ stortree_metrics_flavour }});
+      stortree_metrics_bind must name at least one address or interface
+      when metrics are enabled;
+      and the rc flavour -- which this host is on if its rclone predates
+      1.68 -- requires stortree_metrics_htpasswd, because its endpoint
+      serves config/dump alongside the counters.
+    quiet: true
   tags: [mounts]
 
 - name: Find currently installed stortree mount units
@@ -606,6 +702,30 @@
   loop: "{{ stortree_mounts_rendered_units }}"
   loop_control:
     label: "{{ item.entry.local_path }}"
+  tags: [mounts]
+
+- name: Publish this host's metrics endpoints for the control node to collect
+  # After the units are up, and describing what was actually rendered.
+  # playbooks/metrics-targets.yml collects these fragments into one
+  # file_sd list; see the template for why the host writes its own.
+  ansible.builtin.template:
+    src: metrics-targets.json.j2
+    dest: "{{ stortree_metrics_fragment }}"
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0644"
+  when: stortree_metrics_enabled
+  tags: [mounts]
+
+- name: Remove the metrics fragment on a host no longer publishing any
+  # Convergence, not tidiness: a stale fragment left behind would keep
+  # feeding this host's old ports to Prometheus long after the endpoints
+  # stopped existing, and the resulting scrape failures would look like
+  # a broken mount rather than a setting someone turned off.
+  ansible.builtin.file:
+    path: "{{ stortree_metrics_fragment }}"
+    state: absent
+  when: not stortree_metrics_enabled
   tags: [mounts]
 
 - name: Re-stat every directory this apply was supposed to create

@@ -1,0 +1,23 @@
+---
+# Per-host overrides. Copy to inventory/host_vars/<hostname>.yml.
+#
+# Anything from group_vars/all.yml can be narrowed here, because these
+# are ordinary Ansible variables at a higher precedence. Metrics in
+# particular are a plain per-host boolean rather than a fleet-wide list
+# of opted-in hosts, and that is a deliberate difference from
+# stortree_samba_hosts: whether this host publishes counters changes
+# nothing for any other host, whereas every host's peer-trust
+# provisioning depends on what the others decided about Samba. So there
+# is nothing to keep in agreement here, and no list to edit in two
+# places.
+
+# This host alone stays quiet, on an otherwise metrics-enabled fleet.
+stortree_metrics_enabled: false
+
+# Or: this host alone publishes on its VPN interface, while the rest of
+# the fleet stays on loopback. Named interfaces are resolved to an
+# address at render time -- and a name that resolves to nothing fails
+# the apply rather than falling back to a wildcard bind.
+# stortree_metrics_bind:
+#   - 127.0.0.1
+#   - wg0

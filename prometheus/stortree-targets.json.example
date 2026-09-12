@@ -1,0 +1,35 @@
+[
+    {
+        "labels": {
+            "stortree_host": "storage-node-alpha",
+            "stortree_node": "tree",
+            "stortree_remote": "storagebox:stortree",
+            "stortree_slug": "tree"
+        },
+        "targets": [
+            "10.10.0.11:25419"
+        ]
+    },
+    {
+        "labels": {
+            "stortree_host": "storage-node-bravo",
+            "stortree_node": "tree",
+            "stortree_remote": "peer-storage-node-alpha-tree:/srv/stortree/tree",
+            "stortree_slug": "tree"
+        },
+        "targets": [
+            "10.10.0.12:25419"
+        ]
+    },
+    {
+        "labels": {
+            "stortree_host": "storage-node-bravo",
+            "stortree_node": "tree/home/.mounts/whitfield-media",
+            "stortree_remote": "peer-storage-node-alpha-tree-home-.mounts-whitfield-media:/srv/.stortree-remotes/tree/home/.mounts/whitfield-media",
+            "stortree_slug": "tree-home-.mounts-whitfield\\x2dmedia"
+        },
+        "targets": [
+            "10.10.0.12:21807"
+        ]
+    }
+]

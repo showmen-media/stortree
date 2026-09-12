@@ -293,9 +293,9 @@ Run by hand on a checkout (and by `ci.yml` on the unmerged
   `fail_under` floor in `pyproject.toml`, so a new branch has to arrive
   with the test that exercises it.
 - `ansible-playbook playbooks/site.yml --syntax-check`, and the same for
-  `status.yml`, against config copied from the `*.example` files by the
-  same commands README.md gives an operator — so a stale example fails
-  before someone's first run does.
+  `status.yml` and `metrics-targets.yml`, against config copied from the
+  `*.example` files by the same commands README.md gives an operator —
+  so a stale example fails before someone's first run does.
 - `ansible-lint` (clean at the `production` profile) and `yamllint
   --strict` over the whole repo. The skips that remain are listed with
   their rationale in `.ansible-lint`.
@@ -309,6 +309,21 @@ is in daily use for unrelated services. The scenario files exist and are
 checked for internal consistency by `tests/test_repo_consistency.py`,
 but nothing has ever applied a role to a container, mounted a real
 remote, or exercised a genuine two-host peer dependency.
+
+**Not applied to a host: the metrics endpoints.** The allocation, the
+listener resolution, both unit templates, the target fragment, the
+flavour decision and every branch of the role's safety assert are
+covered by `pytest`, and the collector playbook round-trips against a
+local inventory. What no check here touches is the claim the whole
+design rests on — that rclone exits when it cannot bind its listener,
+which on a `Type=notify` unit makes a misconfigured endpoint a failed
+*mount* rather than a missing counter, taking every presentation and
+bind above it with it through `PartOf=`. That is read from upstream
+behaviour, not watched on these hosts. It is also why the feature
+defaults to off, why the first enable belongs behind `--limit`
+([runbook.md](runbook.md) "Publishing rclone metrics"), and why the
+role fails the apply on a port collision or an unresolvable interface
+rather than letting either reach a unit file.
 
 That is the gap, and it is specifically the **clean-slate** gap: the
 production fleet above only ever exercises an apply onto hosts that

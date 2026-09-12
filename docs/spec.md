@@ -30,6 +30,8 @@ project is a set of roles, a filter plugin, and a playbook.
 inventory/
   hosts.yml          # storage hosts + connection vars, ordinary Ansible inventory
                      # — every host here participates (§1), named in config.yml or not
+  group_vars/        # optional: fleet-wide operator settings (Samba globals, metrics)
+  host_vars/         # optional: the same, narrowed to one host
 stortree/
   config.yml         # the directory tree: hosts, clients, subdirs, access grants (non-secret)
   ldap.yml           # LDAP server connection + group/POSIX mapping (vaulted)
@@ -50,6 +52,9 @@ roles/
 playbooks/
   site.yml           # the only entrypoint: apply the whole tree to every host
   status.yml         # read-only facts/report play
+  metrics-targets.yml  # read-only: collect each host's metrics endpoints (§8)
+prometheus/
+  prometheus.yml.example  # scrape config for the list that playbook generates
 docs/config-schema.md
 ```
 
@@ -805,6 +810,15 @@ the only layer that talks to a backend and the only layer that caches,
 so every operator-supplied `rclone.args` value belongs to it, and there
 is nothing to split between layers.
 
+It is also the only layer that can be *monitored* as rclone, and so the
+only one that renders a metrics listener (off by default; see §8). That
+endpoint is per mount rather than per host because an rclone metrics or
+rc server only ever reports the process it runs in — a separate rclone
+started anywhere else, by an operator or by a GUI, cannot see or adopt
+these mounts. Layer 2 below is `bindfs`, and the per-user fan-out under
+it is `mount --bind`; neither is rclone, and neither has anything to
+serve.
+
 Because layer 1 is local, a backend's own directory structure holds only
 the paths `config.yml` describes. An earlier revision staged inside the
 tree, in a sibling directory next to each node it served, and every
@@ -1078,6 +1092,21 @@ invocations — there is no separate CLI to install or learn:
   that gathers resolved role, active mount unit states, Samba share
   status (`smbstatus`), and SSSD/PAM sanity checks, and prints a per-host
   summary. No state-changing modules.
+
+- **Metrics targets**: `ansible-playbook playbooks/metrics-targets.yml` —
+  read-only, and only meaningful once `stortree_metrics_enabled` is on
+  somewhere. `site.yml` gives each rclone mount on an enabled host its
+  own metrics endpoint and leaves a Prometheus `file_sd` fragment there
+  describing them; this collects those fragments into one target list on
+  the control node. It collects rather than recomputes, so the control
+  node never needs the LDAP group memberships a mount plan is resolved
+  against. Re-run it after any apply that changes which mounts exist or
+  where they bind. Enablement is ordinary inventory precedence —
+  fleet-wide in `group_vars/all.yml`, narrowed in `host_vars/<host>.yml`
+  — with no fleet-level list to keep in agreement, because unlike
+  `stortree_samba_hosts` nothing on any other host depends on what this
+  one publishes. See [runbook.md](runbook.md) "Publishing rclone
+  metrics".
 
 If a host is unreachable, that one host's tasks fail and Ansible reports
 it while continuing (or halting, depending on `--limit`/strategy) — same

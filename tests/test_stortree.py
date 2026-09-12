@@ -25,6 +25,8 @@ from filter_plugins.stortree import (
     group_gids_from_getent,
     group_members_from_getent,
     merged_getent_results,
+    metrics_listeners,
+    metrics_ports,
     mount_unit_names,
     needed_groups,
     needed_users,
@@ -4058,3 +4060,164 @@ def test_an_opted_out_host_is_not_served_peer_trust_for_the_shares_it_dropped():
 
     served_off = resolve(tree, "h2", hosts, samba_hosts=["h1", "h2"])["peer_served_by"]
     assert {p["serving_host"] for p in served_off} == {"h1"}
+
+
+# -- metrics_ports ---------------------------------------------------------
+
+
+def _transport(local_path):
+    return {"local_path": local_path, "kind": "transport", "slug": _slug(local_path)}
+
+
+def test_metrics_ports_covers_transports_and_nothing_else():
+    # Presentations are bindfs and binds are `mount --bind`; neither is
+    # an rclone process, so neither has anything to serve.
+    plan = [
+        _transport("tree"),
+        {"local_path": "tree", "kind": "mount", "slug": "tree"},
+        {"local_path": "tree/home/jd", "kind": "bind", "slug": "tree-home-jd"},
+        {"local_path": "tree/docs", "kind": "dir", "slug": "tree-docs"},
+    ]
+    assert set(metrics_ports(plan)) == {"tree"}
+
+
+def test_metrics_ports_are_derived_from_the_path_not_the_position():
+    # The property the whole design rests on: adding a node must not
+    # move any other node's port. An index-based allocation would move
+    # every port after the insertion, rewriting those units' ExecStart,
+    # restarting those transports -- and PartOf= would take every
+    # presentation and bind above them down too. One unrelated edit to
+    # config.yml would remount the host's whole tree.
+    before = metrics_ports([_transport("tree"), _transport("zzz")])
+    after = metrics_ports(
+        [_transport("aaa"), _transport("tree"), _transport("zzz")]
+    )
+    assert after["tree"] == before["tree"]
+    assert after["zzz"] == before["zzz"]
+
+
+def test_metrics_ports_do_not_depend_on_plan_order():
+    forwards = metrics_ports([_transport("a"), _transport("b")])
+    backwards = metrics_ports([_transport("b"), _transport("a")])
+    assert forwards == backwards
+
+
+def test_metrics_ports_stay_inside_the_configured_range():
+    plan = [_transport(f"tree/node{i}") for i in range(12)]
+    ports = metrics_ports(plan, base_port=30000, span=1000)
+    assert len(ports) == 12
+    assert all(30000 <= p < 31000 for p in ports.values())
+
+
+def test_metrics_ports_take_an_override_by_tree_path():
+    # Keyed by path, not slug: a slug is a systemd instance name with
+    # \xHH escapes in it, and an operator pinning a port for a firewall
+    # rule should not have to spell one.
+    ports = metrics_ports(
+        [_transport("tree/back-ups")], overrides={"tree/back-ups": 20500}
+    )
+    assert ports[_slug("tree/back-ups")] == 20500
+
+
+def test_metrics_ports_raise_when_two_nodes_want_one_port():
+    # Reported here rather than discovered as a dead mount: rclone exits
+    # when it cannot bind and the transport unit is Type=notify.
+    with pytest.raises(ValueError) as excinfo:
+        metrics_ports(
+            [_transport("tree/a"), _transport("tree/b")],
+            overrides={"tree/a": 20500, "tree/b": 20500},
+        )
+    message = str(excinfo.value)
+    assert "tree/a" in message and "tree/b" in message
+    assert "stortree_metrics_port_overrides" in message
+
+
+def test_metrics_ports_reject_a_range_that_is_not_a_valid_port_range():
+    with pytest.raises(ValueError):
+        metrics_ports([_transport("tree")], base_port=60000, span=10000)
+
+
+# -- metrics_listeners -----------------------------------------------------
+
+
+def test_metrics_listeners_pass_a_literal_address_through():
+    (listener,) = metrics_listeners(["127.0.0.1"], {})
+    assert listener == {
+        "address": "127.0.0.1",
+        "listen": "127.0.0.1",
+        "device": None,
+        "loopback": True,
+    }
+
+
+def test_metrics_listeners_bracket_ipv6_for_the_listen_string():
+    # `--metrics-addr 2001:db8::1:20123` would not parse.
+    (listener,) = metrics_listeners(["2001:db8::1"], {})
+    assert listener["listen"] == "[2001:db8::1]"
+
+
+def test_metrics_listeners_treat_the_wildcard_as_not_loopback():
+    # 0.0.0.0 is the most exposed bind there is; the role's safety
+    # assert must not mistake it for a private one.
+    (listener,) = metrics_listeners(["0.0.0.0"], {})
+    assert listener["loopback"] is False
+
+
+def test_metrics_listeners_resolve_an_interface_name_from_facts():
+    facts = {"wg0": {"ipv4": {"address": "10.10.0.4"}}}
+    (listener,) = metrics_listeners(["wg0"], facts)
+    assert listener["address"] == "10.10.0.4"
+    assert listener["device"] == "sys-subsystem-net-devices-wg0.device"
+
+
+def test_metrics_listeners_escape_a_device_unit_the_way_systemd_does():
+    # "-" is a path separator in a systemd unit name, so an interface
+    # whose own name contains one has to be escaped -- same rule, and
+    # the same function, as the mount unit slugs.
+    facts = {"br_lan": {"ipv4": {"address": "192.168.1.2"}}}
+    (listener,) = metrics_listeners(["br-lan"], facts)
+    assert listener["device"] == "sys-subsystem-net-devices-br\\x2dlan.device"
+
+
+def test_metrics_listeners_find_an_interface_under_ansibles_mangled_key():
+    # Ansible flattens "-", "." and ":" to "_" in fact keys, so the name
+    # an operator writes is not always the key the facts arrive under.
+    facts = {"vlan_10": {"ipv4": {"address": "192.168.10.2"}}}
+    (listener,) = metrics_listeners(["vlan.10"], facts)
+    assert listener["address"] == "192.168.10.2"
+
+
+def test_metrics_listeners_fall_back_to_a_routable_ipv6_address():
+    facts = {
+        "wg0": {
+            "ipv6": [
+                {"address": "fe80::1", "scope": "link"},
+                {"address": "2001:db8::5", "scope": "global"},
+            ]
+        }
+    }
+    (listener,) = metrics_listeners(["wg0"], facts)
+    assert listener["listen"] == "[2001:db8::5]"
+
+
+def test_metrics_listeners_reject_an_interface_that_is_not_there():
+    # Never a silent fallback to a wildcard bind: guessing 0.0.0.0 for
+    # an interface that doesn't exist would publish every mount's
+    # endpoint on every network the host is attached to.
+    with pytest.raises(ValueError) as excinfo:
+        metrics_listeners(["wg0"], {"eth0": {"ipv4": {"address": "10.0.0.1"}}})
+    assert "wg0" in str(excinfo.value)
+
+
+def test_metrics_listeners_reject_an_interface_with_only_a_link_local_address():
+    # Binding fe80:: needs a zone id the facts don't carry in `address`,
+    # so rclone would fail to bind -- and that failure is a dead mount,
+    # not a missing counter.
+    facts = {"wg0": {"ipv6": [{"address": "fe80::1", "scope": "link"}]}}
+    with pytest.raises(ValueError):
+        metrics_listeners(["wg0"], facts)
+
+
+def test_metrics_listeners_of_nothing_is_empty():
+    assert metrics_listeners([], {}) == []
+    assert metrics_listeners(None, {}) == []

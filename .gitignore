@@ -1,6 +1,8 @@
 # Real, site-specific config -- never committed. Copy the *.example
 # files instead (see README.md "Setup").
 inventory/hosts.yml
+inventory/group_vars/*.yml
+inventory/host_vars/*.yml
 stortree/config.yml
 stortree/ldap.yml
 stortree/rclone.conf
@@ -18,6 +20,9 @@ __pycache__/
 .coverage.*
 htmlcov/
 collections/
+
+# Generated from the fleet, not edited: names real hosts and addresses.
+prometheus/stortree-targets.json
 
 # Molecule / Ansible run artifacts
 .molecule/

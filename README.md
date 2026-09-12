@@ -57,6 +57,14 @@ needs.
   tree that carries a `samba:` config. There's no "designated Samba
   host," and a host doesn't need to be named in `config.yml` to join in
   — see [docs/config-schema.md](docs/config-schema.md).
+- **Optional Prometheus metrics**, off by default: each rclone mount
+  publishes its own endpoint (one process, one mount — no separate
+  rclone or manager can adopt mounts it didn't start), with ports
+  derived per node so an unrelated config edit never renumbers and
+  remounts the rest. Enable it fleet-wide or per host from inventory,
+  and `playbooks/metrics-targets.yml` collects every host's endpoints
+  into one `file_sd` list — see
+  [docs/runbook.md](docs/runbook.md) "Publishing rclone metrics".
 - **Automatic peer routing** — a host that needs data owned by another
   host in the tree — most often to assemble a complete Samba share it
   doesn't itself own, per the point above — gets SSH trust to that owning
@@ -157,6 +165,12 @@ cp stortree/ldap.yml.example stortree/ldap.yml
 cp stortree/rclone.conf.example stortree/rclone.conf
 ansible-vault encrypt stortree/ldap.yml stortree/rclone.conf
 ```
+
+Operator settings that aren't part of the tree — Samba globals, whether
+hosts publish metrics — go in ordinary Ansible inventory files, also
+uncommitted:
+`inventory/group_vars/all.yml.example` for the fleet and
+`inventory/host_vars/<host>.yml.example` for one host.
 
 Then `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 && .venv/bin/ansible-galaxy collection install -r requirements.yml`. See

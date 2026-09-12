@@ -33,7 +33,9 @@ from __future__ import annotations
 import collections
 import configparser
 import difflib
+import hashlib
 import io
+import ipaddress
 import re
 
 # Interpretation call #1 (docs/plan.md): the dotted access shorthand
@@ -3156,6 +3158,184 @@ def path_masked(path, masked_paths):
     return any(path == m or path.startswith(m + "/") for m in masked_paths)
 
 
+# -- metrics endpoints (monitoring, layered over the plan) ----------------
+#
+# Every rclone metrics (or rc) server is per-*process*. A manager or rcd
+# running anywhere else cannot see a mount this host started -- upstream
+# is explicit about it ("No, you need to mount them on that rclone"), and
+# `mount/listmounts` on a CLI-started mount comes back empty. So there is
+# no single endpoint per host to point a scraper at: there is one per
+# transport unit, each needing a listen address of its own.
+#
+# Which makes this a mount-availability concern rather than a monitoring
+# nicety. rclone exits when it cannot bind its metrics listener, and the
+# transport unit is Type=notify, so a port two mounts both want is not a
+# missing counter -- it is a mount that never comes up, and (PartOf=)
+# every presentation and bind above it going down with it. That is why
+# the allocation lives here as a pure function with a collision check
+# that raises, instead of being assembled in Jinja at render time where
+# the first anyone would hear of a clash is `systemctl status`.
+
+# 20000-29999 by default: clear of the well-known ports a storage host
+# actually runs (9090 Prometheus, 9100 node_exporter -- and losing a
+# mount to node_exporter's port would be a genuinely baffling outage),
+# and below the 32768 floor of Linux's default ip_local_port_range, so a
+# listener can't lose a race to an outbound connection's ephemeral port.
+DEFAULT_METRICS_BASE_PORT = 20000
+DEFAULT_METRICS_PORT_SPAN = 10000
+
+
+def metrics_ports(
+    mount_plan,
+    base_port=DEFAULT_METRICS_BASE_PORT,
+    span=DEFAULT_METRICS_PORT_SPAN,
+    overrides=None,
+):
+    """slug -> TCP port for every transport entry in a plan_mounts()
+    result: the port that mount's own metrics (or rc) server listens on,
+    on every address stortree_metrics_bind resolved to.
+
+    Derived from the node's path, and deliberately not from its position
+    in the plan. Assigning base_port + index would be simpler, shorter
+    and predictable, and it is wrong: adding one node near the start of
+    the tree shifts every later node's port, which rewrites those units'
+    ExecStart, which makes "Restart any unit whose file actually changed"
+    restart them -- and a transport restart cascades through PartOf= to
+    every presentation and bind above it. Editing one unrelated entry in
+    config.yml would remount the host's whole tree and drop every open
+    Samba handle on it. A path-derived port moves only when that node's
+    own path moves, which is already a remount.
+
+    The cost of hashing instead of counting is that two paths can land
+    on one port -- ~0.2% for a 20-mount host over the default span, and
+    reported here rather than discovered as a dead mount. `overrides` is
+    the escape hatch: `{tree path: port}` (paths, not slugs -- a slug is
+    a systemd instance name, not something an operator should have to
+    spell), which also wins over the derived port for a node that has to
+    sit somewhere specific for a firewall rule.
+
+    Transports only. Presentations and binds are bindfs and `mount
+    --bind`; neither is rclone and neither has anything to serve."""
+    if base_port < 1 or span < 1 or base_port + span > 65536:
+        raise ValueError(
+            f"stortree: metrics port range {base_port}-{base_port + span - 1} "
+            "is not a valid TCP port range"
+        )
+    overrides = overrides or {}
+    ports = {}
+    claimed = {}
+    # Sorted so the pair named in a collision message is stable between
+    # runs on the same config, rather than following plan order.
+    transports = sorted(
+        (e for e in mount_plan if e["kind"] == "transport"),
+        key=lambda e: e["local_path"],
+    )
+    for entry in transports:
+        path = entry["local_path"]
+        if path in overrides:
+            port = int(overrides[path])
+        else:
+            digest = hashlib.sha256(path.encode("utf-8")).digest()
+            port = base_port + int.from_bytes(digest[:4], "big") % span
+        clash = claimed.get(port)
+        if clash is not None:
+            raise ValueError(
+                f"stortree: {clash!r} and {path!r} both want metrics port "
+                f"{port} -- set stortree_metrics_port_overrides for one of "
+                "them (a mount whose listener cannot bind does not start)"
+            )
+        claimed[port] = path
+        ports[entry["slug"]] = port
+    return ports
+
+
+def _interface_address(name, facts):
+    """The address to listen on for one interface name, from gathered
+    facts. Raises rather than falling back to a wildcard bind: guessing
+    0.0.0.0 for an interface that isn't there would silently publish
+    every mount's endpoint on every network the host is attached to."""
+    # Ansible flattens the characters a real interface name can contain
+    # ("br-lan" -> ansible_facts["br_lan"]), so try both spellings
+    # before concluding the interface doesn't exist.
+    for key in (name, re.sub(r"[-.:]", "_", name)):
+        interface = facts.get(key)
+        if interface:
+            break
+    else:
+        raise ValueError(
+            f"stortree: no gathered facts for interface {name!r} -- "
+            "stortree_metrics_bind names it, but this host has no such "
+            "interface (or the play did not gather facts)"
+        )
+    ipv4 = (interface.get("ipv4") or {}).get("address")
+    if ipv4:
+        return ipv4
+    # Link-local is skipped on purpose: binding fe80:: needs a zone id
+    # the facts don't carry in `address`, and rclone would fail to bind.
+    ipv6 = next(
+        (
+            a.get("address")
+            for a in (interface.get("ipv6") or [])
+            if a.get("address") and a.get("scope") != "link"
+        ),
+        None,
+    )
+    if ipv6:
+        return ipv6
+    raise ValueError(
+        f"stortree: interface {name!r} has no routable address to bind "
+        "metrics to -- give it one, or name an address directly in "
+        "stortree_metrics_bind"
+    )
+
+
+def metrics_listeners(bind, facts):
+    """Turn `stortree_metrics_bind` -- addresses, interface names, or
+    both -- into what the transport unit and the targets file need:
+
+        [{"address", "listen", "device", "loopback"}, ...]
+
+    rclone binds addresses, never interfaces, so an interface name has
+    to be resolved against this host's own facts at render time; that is
+    also why `stortree_metrics_bind` is host-local operational policy in
+    inventory rather than anything config.yml could describe, since the
+    same name resolves differently on every host.
+
+    `listen` is the address as it goes into a listen string, bracketed
+    when it's IPv6 so `--metrics-addr [2001:db8::1]:20123` parses.
+    `device` is the systemd .device unit for an interface-derived
+    address -- escaped the way systemd escapes it, via the same
+    _escape_slug_segment() the unit slugs use -- for the unit to order
+    itself after, or None for a literal address, which is nothing
+    systemd can wait on. `loopback` is what the role's safety assert
+    reads: an rc-flavour endpoint serves config/dump, so binding one off
+    loopback without authentication publishes this host's scoped
+    rclone.conf, credentials and all."""
+    listeners = []
+    for item in bind or []:
+        try:
+            ip = ipaddress.ip_address(item)
+        except ValueError:
+            address = _interface_address(item, facts)
+            ip = ipaddress.ip_address(address)
+            device = (
+                "sys-subsystem-net-devices-"
+                + _escape_slug_segment(item)
+                + ".device"
+            )
+        else:
+            address, device = item, None
+        listeners.append(
+            {
+                "address": address,
+                "listen": f"[{address}]" if ip.version == 6 else address,
+                "device": device,
+                "loopback": ip.is_loopback,
+            }
+        )
+    return listeners
+
+
 class FilterModule(object):
     def filters(self):
         return {
@@ -3172,6 +3352,8 @@ class FilterModule(object):
             "stortree_needed_groups": needed_groups,
             "stortree_needed_users": needed_users,
             "stortree_plan_mounts": plan_mounts,
+            "stortree_metrics_ports": metrics_ports,
+            "stortree_metrics_listeners": metrics_listeners,
             "stortree_slug": _slug,
             "stortree_stale_units": stale_unit_names,
             "stortree_path_masked": path_masked,

@@ -21,10 +21,12 @@ failing render rather than at apply time.
 import pytest
 
 from conftest import EXAMPLE_HOSTS, REPO_ROOT
+from filter_plugins.stortree import metrics_listeners, metrics_ports
 
 REMOTE_UNIT = "stortree-remote@.service.j2"
 MOUNT_UNIT = "stortree-mount@.service.j2"
 BIND_UNIT = "stortree-bind@.service.j2"
+METRICS_TARGETS = "metrics-targets.json.j2"
 SMB_CONF = "smb.conf.j2"
 SSSD_CONF = "sssd.conf.j2"
 
@@ -63,11 +65,36 @@ def directives(rendered, name):
 
 def mount_vars(containers, host):
     """The variable set roles/stortree_mounts/tasks/main.yml has in
-    scope when it renders a unit template. Just the one now: which
-    mounts have something nested inside them used to be a separate fact
-    the role derived and passed alongside, and is a field on the entry
-    itself since (plan_mounts()' `has_nested_children`)."""
-    return {}
+    scope when it renders a unit template: the metrics settings, off, as
+    roles/stortree_facts/defaults/main.yml leaves them. (Which mounts
+    have something nested inside them used to be a separate fact the
+    role derived and passed alongside, and is a field on the entry
+    itself since -- plan_mounts()' `has_nested_children`.)
+
+    Off is the honest default here, not a convenience: a template that
+    reads a metrics variable outside its own `stortree_metrics_enabled`
+    guard has to fail these renders, and it only does if the guarded
+    variables are genuinely absent."""
+    return {"stortree_metrics_enabled": False}
+
+
+# One interface, as ansible_facts would report it, for the listener
+# resolution the unit template renders off.
+METRICS_FACTS = {"wg0": {"ipv4": {"address": "10.10.0.4"}}}
+
+
+def metrics_vars(plan, bind=("127.0.0.1",), mode="metrics-addr", htpasswd=None):
+    """What the role has in scope once metrics are switched on -- the
+    two facts it derives ("Allocate a metrics port and resolve the
+    listen addresses for every mount") plus the two settings it passes
+    straight through."""
+    return {
+        "stortree_metrics_enabled": True,
+        "stortree_metrics_mode": mode,
+        "stortree_metrics_htpasswd": htpasswd,
+        "stortree_metrics_listeners": metrics_listeners(list(bind), METRICS_FACTS),
+        "stortree_metrics_ports": metrics_ports(plan),
+    }
 
 
 # -- every template at least parses ---------------------------------------
@@ -217,6 +244,206 @@ def test_remote_unit_stop_is_tolerant_of_an_already_gone_mountpoint(
     )
     assert "mountpoint -q" in unit
     assert "|| exit 0" in unit
+
+
+# -- metrics endpoints on the transport unit ------------------------------
+
+
+def test_remote_unit_renders_nothing_about_metrics_when_they_are_off(
+    render, mount_plans, containers
+):
+    unit = render(
+        REMOTE_UNIT,
+        entry=transport_for(mount_plans[ALPHA], "tree"),
+        **mount_vars(containers, ALPHA),
+    )
+    assert "--metrics-addr" not in unit
+    assert "--rc" not in unit
+
+
+def test_remote_unit_renders_one_metrics_addr_per_listener(
+    render, mount_plans, containers
+):
+    # Both flags may be repeated, which is what makes a list of bind
+    # addresses expressible at all -- and why this can't live in
+    # `rclone.args`, a dict, one key one value.
+    plan = mount_plans[ALPHA]
+    entry = transport_for(plan, "tree")
+    unit = render(
+        REMOTE_UNIT,
+        entry=entry,
+        **metrics_vars(plan, bind=("127.0.0.1", "wg0")),
+    )
+    port = metrics_ports(plan)[entry["slug"]]
+    assert f"  --metrics-addr 127.0.0.1:{port} \\" in unit
+    assert f"  --metrics-addr 10.10.0.4:{port} \\" in unit
+    # Nothing of the rc API on this flavour: counters only, no
+    # config/dump.
+    assert "--rc" not in unit
+
+
+def test_remote_unit_gives_every_mount_on_a_host_its_own_port(
+    render, mount_plans, containers
+):
+    # The failure this prevents is not a missing counter: rclone exits
+    # when it cannot bind, and a Type=notify unit that exits is a mount
+    # that never comes up.
+    plan = mount_plans[BRAVO]
+    ports = metrics_ports(plan)
+    assert len(set(ports.values())) == len(ports) > 1
+
+    rendered = [
+        render(REMOTE_UNIT, entry=entry, **metrics_vars(plan))
+        for entry in plan
+        if entry["kind"] == "transport"
+    ]
+    listened = [
+        line.split()[-2].rsplit(":", 1)[-1]
+        for unit in rendered
+        for line in unit.splitlines()
+        if "--metrics-addr" in line
+    ]
+    assert len(set(listened)) == len(listened)
+
+
+def test_remote_unit_orders_itself_after_an_interface_it_binds_to(
+    render, mount_plans, containers
+):
+    # rclone binds at startup and exits if the address isn't there yet.
+    # Wants=, never Requires=: a Requires= on an absent .device unit
+    # fails the start job outright and systemd does not retry that --
+    # Restart=on-failure covers a process that died, not a dependency
+    # that was missing -- leaving the mount down until someone restarts
+    # it by hand.
+    plan = mount_plans[ALPHA]
+    unit = render(
+        REMOTE_UNIT,
+        entry=transport_for(plan, "tree"),
+        **metrics_vars(plan, bind=("wg0",)),
+    )
+    device = "sys-subsystem-net-devices-wg0.device"
+    assert device in directives(unit, "After")
+    assert device in directives(unit, "Wants")
+    assert device not in directives(unit, "Requires")
+
+
+def test_remote_unit_orders_itself_after_nothing_for_a_literal_address(
+    render, mount_plans, containers
+):
+    # A literal address is nothing systemd can wait on.
+    plan = mount_plans[ALPHA]
+    unit = render(
+        REMOTE_UNIT,
+        entry=transport_for(plan, "tree"),
+        **metrics_vars(plan, bind=("10.10.0.4",)),
+    )
+    assert "sys-subsystem-net-devices" not in unit
+
+
+def test_remote_unit_rc_flavour_always_carries_its_htpasswd(
+    render, mount_plans, containers
+):
+    # The older spelling serves /metrics on the rc port, and the rc port
+    # also serves config/dump -- this host's scoped rclone.conf,
+    # credentials and all. The role refuses to render this flavour
+    # without an htpasswd (see its own assert); the template must
+    # actually place the flag when it does.
+    plan = mount_plans[ALPHA]
+    entry = transport_for(plan, "tree")
+    unit = render(
+        REMOTE_UNIT,
+        entry=entry,
+        **metrics_vars(plan, mode="rc", htpasswd="/etc/stortree/metrics.htpasswd"),
+    )
+    port = metrics_ports(plan)[entry["slug"]]
+    assert "  --rc \\" in unit
+    assert "  --rc-enable-metrics \\" in unit
+    assert "  --rc-htpasswd /etc/stortree/metrics.htpasswd \\" in unit
+    assert f"  --rc-addr 127.0.0.1:{port} \\" in unit
+    assert "--metrics-addr" not in unit
+
+
+def test_remote_unit_keeps_the_config_flag_last_whatever_metrics_render(
+    render, mount_plans, containers
+):
+    # Every rendered ExecStart line but the last one ends in a
+    # continuation; a metrics block appended after --config would end
+    # the command early and silently mount with no config file.
+    plan = mount_plans[ALPHA]
+    unit = render(
+        REMOTE_UNIT,
+        entry=transport_for(plan, "tree"),
+        **metrics_vars(plan, bind=("127.0.0.1", "wg0")),
+    )
+    exec_start = unit.split("ExecStart=")[1].split("ExecStop=")[0].rstrip("\n")
+    assert exec_start.rstrip().endswith("--config /etc/stortree/rclone.conf")
+    assert all(
+        line.rstrip().endswith("\\")
+        for line in exec_start.splitlines()[:-1]
+    )
+
+
+# -- metrics-targets.json.j2 ----------------------------------------------
+
+
+def targets(render, plan, host, **overrides):
+    import json
+
+    return json.loads(
+        render(
+            METRICS_TARGETS,
+            inventory_hostname=host,
+            stortree_mounts_plan=plan,
+            **metrics_vars(plan, **overrides),
+        )
+    )
+
+
+def test_metrics_fragment_lists_one_object_per_transport(
+    render, mount_plans, containers
+):
+    plan = mount_plans[BRAVO]
+    rows = targets(render, plan, BRAVO)
+    assert len(rows) == len([e for e in plan if e["kind"] == "transport"])
+    assert {row["labels"]["stortree_host"] for row in rows} == {BRAVO}
+
+
+def test_metrics_fragment_labels_the_unit_an_alert_would_have_to_name(
+    render, mount_plans, containers
+):
+    # The slug is not derivable from the path by eye (systemd escaping),
+    # and it is exactly what whoever is woken up has to type after
+    # `systemctl status stortree-remote@`.
+    plan = mount_plans[ALPHA]
+    (row,) = [r for r in targets(render, plan, ALPHA) if r["labels"]["stortree_node"] == "tree"]
+    entry = transport_for(plan, "tree")
+    assert row["labels"]["stortree_slug"] == entry["slug"]
+    assert row["labels"]["stortree_remote"] == entry["remote"]
+    assert row["targets"] == [f"127.0.0.1:{metrics_ports(plan)[entry['slug']]}"]
+
+
+def test_metrics_fragment_prefers_an_address_a_scraper_can_reach(
+    render, mount_plans, containers
+):
+    # With both bound, publishing the loopback target too would just
+    # double-scrape the same process through an address no other host
+    # can reach.
+    plan = mount_plans[ALPHA]
+    rows = targets(render, plan, ALPHA, bind=("127.0.0.1", "wg0"))
+    assert all(
+        target.startswith("10.10.0.4:") for row in rows for target in row["targets"]
+    )
+
+
+def test_metrics_fragment_still_lists_a_loopback_only_host(
+    render, mount_plans, containers
+):
+    # Reachable from an agent on the host or through a tunnel. Emitting
+    # nothing would be indistinguishable from metrics being switched
+    # off.
+    plan = mount_plans[ALPHA]
+    rows = targets(render, plan, ALPHA)
+    assert rows and all(row["targets"] for row in rows)
 
 
 # -- stortree-mount@.service.j2 (layer 2, presentation) -------------------

@@ -74,6 +74,85 @@ Reports, per host: resolved server subtrees, whether it has a client
 mount, exported Samba shares, peer dependency count, who depends on it,
 live mount-unit states, `smbstatus`, and SSSD domain status.
 
+## Publishing rclone metrics
+
+Off until you turn it on, and off is a real state -- an apply against a
+fleet that has never enabled it changes nothing.
+
+```yaml
+# inventory/group_vars/all.yml
+stortree_metrics_enabled: true
+stortree_metrics_bind:
+  - 127.0.0.1
+```
+
+```
+ansible-playbook playbooks/site.yml --ask-vault-pass --limit storage-node-alpha
+ansible-playbook playbooks/metrics-targets.yml
+```
+
+Do the first apply with `--limit`. Every setting here ends up inside an
+`ExecStart`, and rclone exits rather than starting without the listener
+it was told to bind -- on a `Type=notify` unit that is a mount that does
+not come up, and `PartOf=` takes every presentation and bind above it
+down as well. One host first makes that a contained surprise.
+
+`site.yml` gives every rclone mount its own endpoint (one process, one
+mount, one port -- there is no host-wide endpoint, and no separate
+rclone or manager elsewhere can adopt these mounts) and writes the
+Prometheus `file_sd` fragment listing them.
+`playbooks/metrics-targets.yml` then collects those fragments into one
+target file on the control node; see
+[prometheus/prometheus.yml.example](../prometheus/prometheus.yml.example)
+for the scrape config and for what the numbers are and aren't worth.
+Re-run it after any apply that changes which mounts exist or where they
+bind.
+
+Per host rather than fleet-wide, or the other way round: ordinary
+Ansible precedence, `host_vars/<host>.yml` over `group_vars/`. Unlike
+`stortree_samba_hosts` there is no list to keep in agreement, because
+nothing on any other host changes because of what this one publishes.
+
+Two settings decide whether this is safe, and the apply refuses rather
+than guessing:
+
+- **`stortree_metrics_bind`** is the access control -- there is no
+  firewall role in this repo. Loopback is reachable from an agent on the
+  host or an SSH tunnel; naming an interface is what publishes the
+  endpoint. A name that resolves to no address on a host fails the
+  apply there, rather than falling back to a wildcard bind.
+- **`stortree_metrics_htpasswd`** is mandatory whenever a host's rclone
+  predates 1.68, because the only way to publish metrics on those is
+  `--rc --rc-enable-metrics`, and that endpoint also serves
+  `config/dump` -- this host's scoped `rclone.conf`, backend credentials
+  and all. Loopback is no exemption: every LDAP user with a shell here
+  is a local user. `stortree_metrics_flavour` picks per host by reading
+  `rclone version`; Debian bookworm ships 1.60.1, eight releases before
+  `--metrics-addr`.
+
+### "both want metrics port N"
+
+Ports are derived from each node's path so that editing one entry in
+`config.yml` doesn't renumber -- and so restart -- every other mount on
+the host. Two paths can hash to one port, which fails the apply naming
+both. Pin either one:
+
+```yaml
+stortree_metrics_port_overrides:
+  tree/home/media: 20500
+```
+
+### An endpoint that never comes up on an interface
+
+An interface that appears later than the mount (WireGuard, a bridge
+something other than networkd brings up) means rclone had nothing to
+bind when it started. The unit orders itself after that interface's
+`.device` unit where systemd knows about it, and `Restart=on-failure`
+covers a late arrival -- but only within systemd's default start-limit
+burst, so an interface that takes minutes needs
+`systemctl restart stortree-remote@<slug>` afterwards. Binding loopback
+and scraping through a tunnel avoids the whole class.
+
 ## Onboarding a new LDAP user for Samba
 
 A user's Samba password only syncs on an actual PAM event on a given
