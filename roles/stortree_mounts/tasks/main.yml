@@ -312,7 +312,7 @@
       - >-
         not stortree_metrics_enabled
         or stortree_metrics_mode != "rc"
-        or stortree_metrics_htpasswd
+        or stortree_metrics_htpasswd is truthy
     fail_msg: >-
       stortree_metrics_flavour must be auto, metrics-addr or rc
       (is {{ stortree_metrics_flavour }});
