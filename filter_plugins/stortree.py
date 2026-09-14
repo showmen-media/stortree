@@ -2397,12 +2397,16 @@ def _slug(path):
     subtree's own name (_walk_tree()) -- so there is no empty-path case
     to reserve a name for; back when one shared tree root existed, that
     root's own subtree mount resolved to `local_path == ""` and mapped to
-    a reserved "root" slug, which nothing can produce now. Also exposed
-    directly as the `stortree_slug` filter: a per-user bind-mount unit's
-    own template needs to compute its `symlink_target`'s unit slug from
-    that raw path string alone (there's no separate plan_mounts() entry
-    lookup handy at render time), the same way plan_mounts() computes
-    every entry's own `slug` field here."""
+    a reserved "root" slug, which nothing can produce now.
+
+    Internal only. This used to be exposed as a `stortree_slug` filter so
+    the per-user bind-mount template could slug its `symlink_target` from
+    the raw path at render time -- but a path is exactly the wrong thing
+    to derive that unit name from: it can name a unit that does not
+    exist, because whether a given path is a presentation depends on the
+    plan and not on the path. `_relate_plan_entries()` resolves it to
+    `symlink_target_slug` against the entries that actually became
+    presentations instead, and answers "there is no unit" with None."""
     return "-".join(_escape_slug_segment(seg) for seg in path.split("/"))
 
 
@@ -2960,6 +2964,7 @@ def _relate_plan_entries(entries, transports):
     order against, this same apply creates it before any unit starts) or
     a subtree some other host owns and this one does not peer."""
     presented = [e for e in entries if e["kind"] == "mount"]
+    presented_by_path = {e["local_path"]: e["slug"] for e in presented}
 
     for e in entries:
         best = None
@@ -2976,6 +2981,30 @@ def _relate_plan_entries(entries, transports):
         # (slugs are escaped for systemd and are not paths -- see
         # _layer_plan_entries()).
         e["requires_slug_path"] = best["local_path"] if best else None
+        # The presentation a bind mounts *from*, when there is one --
+        # and there is not always one, which is the whole reason this is
+        # a field rather than the bind template slugging `symlink_target`
+        # itself. A `group`-only node collapses to one shared mount at
+        # `.mounts/<name>` plus a bind per member; whether that shared
+        # path is a *presentation* depends on something the path alone
+        # cannot say. With a transport above it (the node carries its own
+        # `rclone.remote`, or some ancestor does) the grant can only be
+        # applied by a bindfs mount, so there is a `stortree-mount@` unit
+        # to depend on. On the host that owns the subtree, with no
+        # `rclone` anywhere above, the same node is an ordinary local
+        # directory whose grant is a real chown -- no mount, and so no
+        # unit. Slugging the path regardless produced a bind that
+        # `Requires=` a unit nothing ever rendered, which systemd refuses
+        # to start at all ("Unit stortree-mount@... not found"), taking
+        # down a member's folder over a dependency that was never
+        # meaningful. Looked up by path against the entries that actually
+        # became presentations, so it answers the real question instead
+        # of assuming it.
+        e["symlink_target_slug"] = (
+            presented_by_path.get(e["symlink_target"])
+            if e["symlink_target"]
+            else None
+        )
 
     transport_by_path = {t["local_path"]: t["slug"] for t in transports}
 
@@ -3746,7 +3775,6 @@ class FilterModule(object):
             "stortree_plan_mounts": plan_mounts,
             "stortree_metrics_ports": metrics_ports,
             "stortree_metrics_listeners": metrics_listeners,
-            "stortree_slug": _slug,
             "stortree_stale_units": stale_unit_names,
             "stortree_path_masked": path_masked,
             "stortree_mounted_transports": mounted_transport_slugs,

@@ -26,9 +26,30 @@ directory underneath, silently, until something restarts this unit --
 which nothing ever did, because as far as systemd was concerned it never
 stopped.
 #}
-After=stortree-mount@{{ entry.symlink_target | stortree_slug }}.service
-Requires=stortree-mount@{{ entry.symlink_target | stortree_slug }}.service
-PartOf=stortree-mount@{{ entry.symlink_target | stortree_slug }}.service
+{#
+Only when the source actually is a presentation. A `group`-only node
+collapses to one shared mount at `.mounts/<name>` plus a bind per
+member -- but on the host that owns the subtree, with no `rclone`
+anywhere above it, that shared path is an ordinary local directory whose
+grant is a real chown rather than a bindfs mount, so there is no
+`stortree-mount@` unit to name. Naming one regardless is not a
+dependency that goes unmet later, it is a unit systemd refuses to start
+at all ("Unit stortree-mount@... not found") -- which took out both
+members' folders the first time a node like that reached a fleet.
+`symlink_target_slug` is None in exactly that case
+(_relate_plan_entries()); the `requires_slug` edge below has always been
+guarded the same way, for the same reason.
+
+RequiresMountsFor stays either way: the bind's source has to be on a
+mounted filesystem whether or not a presentation is what mounts it, and
+for a plain local directory this resolves to whatever real mount
+contains it.
+#}
+{% if entry.symlink_target_slug %}
+After=stortree-mount@{{ entry.symlink_target_slug }}.service
+Requires=stortree-mount@{{ entry.symlink_target_slug }}.service
+PartOf=stortree-mount@{{ entry.symlink_target_slug }}.service
+{% endif %}
 RequiresMountsFor={{ stortree_root }}/{{ entry.symlink_target }}
 {% if entry.requires_slug %}
 After=stortree-mount@{{ entry.requires_slug }}.service

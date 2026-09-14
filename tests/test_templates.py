@@ -660,6 +660,41 @@ def test_bind_unit_stop_tolerates_an_already_unmounted_path(
     assert "ExecStop=-/bin/sh -c 'mountpoint -q" in unit
 
 
+def test_bind_unit_names_no_source_unit_when_the_source_is_a_plain_directory(
+    render, mount_plans, containers
+):
+    # A `group`-only node collapses to one shared mount at
+    # `.mounts/<name>` plus a bind per member -- but on the host that
+    # owns the subtree, with no `rclone` anywhere above it, that shared
+    # path is an ordinary local directory: its grant is a real chown, so
+    # nothing renders a `stortree-mount@` unit for it.
+    #
+    # Deriving the source unit's name by slugging `symlink_target` named
+    # one anyway, and a `Requires=` on a unit that does not exist is not
+    # a dependency that goes unmet later -- systemd refuses to start the
+    # bind at all ("Unit stortree-mount@... not found"), so both members
+    # lost the folder over an edge that was never meaningful. Production
+    # hit this the first time such a node reached a fleet.
+    entry = dict(
+        entry_for(mount_plans[BRAVO], "tree/home/mw/mw-fam"),
+        symlink_target_slug=None,
+    )
+    unit = render(BIND_UNIT, entry=entry, **mount_vars(containers, BRAVO))
+
+    assert "stortree-mount@tree-home-.mounts-mw\x2dfam.service" not in unit
+    # The container edge is a separate question and still applies...
+    assert "PartOf=stortree-mount@tree-home-mw.service" in unit
+    # ...as does needing the filesystem the source actually lives on.
+    assert (
+        "RequiresMountsFor=/srv/stortree/tree/home/.mounts/mw-fam" in unit
+    )
+    # And the bind itself is unchanged -- only the dependency was wrong.
+    assert (
+        "ExecStart=/bin/mount --bind /srv/stortree/tree/home/.mounts/mw-fam "
+        "/srv/stortree/tree/home/mw/mw-fam" in unit
+    )
+
+
 # -- smb.conf.j2 ----------------------------------------------------------
 
 
