@@ -45,7 +45,7 @@
 {% endfor %}
 
 {% for share in stortree.samba_shares %}
-{# The section header is the name clients mount. resolve()
+{# The section header is the name SMB clients mount. resolve()
    settles it -- the node's own `samba.name` where it sets one,
    otherwise its path folded into a legal name -- and rejects two
    nodes landing on the same one (config-schema.md "Share

@@ -35,7 +35,7 @@ accumulating drift.
 ## Bring in one new host
 
 Add it to `inventory/hosts.yml` (and optionally to `stortree/config.yml`
-as a node's `host:` or under `clients:` -- neither is required, see
+as a node's `host:` or under `peers:` -- neither is required, see
 config-schema.md "Every inventory host participates"), then:
 
 ```
@@ -70,7 +70,7 @@ Read-only -- no state-changing modules:
 ansible-playbook playbooks/status.yml --ask-vault-pass
 ```
 
-Reports, per host: resolved server subtrees, whether it has a client
+Reports, per host: resolved server subtrees, whether it has a subtree
 mount, exported Samba shares, peer dependency count, who depends on it,
 live mount-unit states, `smbstatus`, and SSSD domain status.
 
@@ -472,7 +472,7 @@ content that existed only to back them, and has its `smbd` stopped and
 disabled; the package and `/etc/samba/smb.conf` are deliberately left in
 place for you to remove by hand if the host is done with Samba for good.
 It also stops announcing itself, on all three protocols above: a host
-that exports nothing has nothing to be found for. Its own client mounts
+that exports nothing has nothing to be found for. Its own subtree mounts
 of the tree are unaffected. See
 [config-schema.md](config-schema.md) "What universality costs" for why
 this is a fleet-level list rather than a per-host flag.

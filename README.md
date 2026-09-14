@@ -35,11 +35,11 @@ needs.
 
 ## What it does
 
-- **One declarative tree** (`config.yml`) describes every host, client
+- **One declarative tree** (`config.yml`) describes every host, subtree
   mount, subdirectory, and access rule — see
   [docs/config-schema.md](docs/config-schema.md).
 - **rclone mounts**, generated as systemd units, either as a host's own
-  client mount or as the local storage backing a Samba share.
+  subtree mount or as the local storage backing a Samba share.
 - **Samba shares** access-controlled by the same Unix ownership/mode the
   playbook sets on the underlying path or rclone mount — one enforcement
   mechanism, reachable identically over Samba or SSH, not a separate ACL
@@ -107,7 +107,7 @@ flowchart LR
 ```
 
 No host is special at runtime — the control node applies the same roles
-to every host, and any host can serve subtrees, mount as a client, and
+to every host, and any host can serve subtrees, mount as a peer, and
 authenticate against LDAP. Samba sharing in particular is universal:
 every participating host — including one that owns no subtree of its own
 and one with no mention in `config.yml` at all, present only in the

@@ -1,6 +1,6 @@
 ---
 # Declarative cross-host SSH trust for peer-sourced data -- every
-# non-root host's own root client mount (spec.md §1) as well as
+# non-root host's own subtree mount (spec.md §1) as well as
 # peer-sourced Samba data (spec.md §7). Runs against every host in the
 # same play, so by the time this task file runs for host H,
 # stortree_facts has already resolved every other host too (linear

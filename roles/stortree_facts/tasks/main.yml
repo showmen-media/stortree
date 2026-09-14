@@ -17,7 +17,7 @@
     # role-private working variable.
     # `stortree_root` (this role's own defaults/main.yml, which is why
     # it lives there -- see that file) rather than the filter's own
-    # fallback: a client mount of a subtree this host doesn't own
+    # fallback: a subtree mount of a subtree this host doesn't own
     # resolves to a peer reference with the owning host's absolute path
     # baked in, so an overridden root has to reach resolve() or that
     # path is silently wrong.

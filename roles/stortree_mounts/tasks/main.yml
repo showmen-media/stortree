@@ -33,7 +33,7 @@
 # creation can't be fatal, and so the verification has to come last.
 #
 # One rclone-mount@<slug>.service per resolved mount (server subtree,
-# client mount, or peer-sourced samba descendant this host doesn't own --
+# subtree mount, or peer-sourced samba descendant this host doesn't own --
 # mesh-sourced directly from whichever host actually owns it, spec.md
 # §1/§2), resolving a user-subdirs entry's %U-templated path against its
 # own `access` grant (spec.md §2, docs/plan.md interpretation call #2):

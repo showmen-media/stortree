@@ -28,33 +28,33 @@ its own, shaped exactly like any other node below it:
                                # with host+remote both set, <hostname> self-mounts it,
                                # same rule as any other node (see "Node inheritance")
 
-  client-defaults:            # applies to this node and everything under it — write it
+  peer-defaults:              # applies to this node and everything under it — write it
                                # on a subdirectory as readily as on a top-level subtree
     rclone.args: {...}        # base rclone mount args, merged into every non-owning
                                # host's peer mount of this node — including one with
-                               # no entry under clients: below
+                               # no entry under peers: below
     rclone: false              # optional — set instead of/alongside .args to keep this
                                # node off every non-owning host by default; see
-                               # "Per-client mount opt-out" below
+                               # "Per-peer mount opt-out" below
     access: {...}              # optional — the {group?, owner?, permissions?} object a
                                # node itself takes, replacing this node's own grant on
-                               # every non-owning host; see "Client-side access" below
+                               # every non-owning host; see "Peer-side access" below
     samba: {...}               # optional — the same share settings a node itself takes,
                                # replacing this node's own export on every non-owning
                                # host (and adding one where the node has none); see
                                # "Per-host shares" below. Does not inherit — it marks
                                # this node only, never its descendants
 
-  clients:
+  peers:
     <hostname>:
-      rclone.args: {...}      # this client's overrides, merged over client-defaults —
-                               # a host needs no entry here to become a client; see
+      rclone.args: {...}      # this peer's overrides, merged over peer-defaults —
+                               # a host needs no entry here to become a peer; see
                                # "Every inventory host participates" below
-      rclone: false            # optional per-client override of client-defaults.rclone;
-                               # see "Per-client mount opt-out" below
-      access: {...}            # optional per-client override of client-defaults.access;
-                               # see "Client-side access" below
-      samba: {...}             # optional per-client override of client-defaults.samba;
+      rclone: false            # optional per-peer override of peer-defaults.rclone;
+                               # see "Per-peer mount opt-out" below
+      access: {...}            # optional per-peer override of peer-defaults.access;
+                               # see "Peer-side access" below
+      samba: {...}             # optional per-peer override of peer-defaults.samba;
                                # `samba: false` withdraws the share on this host alone.
                                # See "Per-host shares" below
 
@@ -80,7 +80,7 @@ its own, shaped exactly like any other node below it:
                                # gets Samba's per-user `%U`, one without serves
                                # the node itself
     name: "<share-name>"      # optional — the share's name in smb.conf, i.e. what
-                               # clients mount as //<host>/<name>; defaults to the
+                               # SMB clients mount as //<host>/<name>; defaults to the
                                # node's path with everything outside [A-Za-z0-9_-]
                                # folded to `_` (`tree/home` → `tree_home`)
     hidden: true               # optional — keep the share out of the host's browse
@@ -99,7 +99,7 @@ its own, shaped exactly like any other node below it:
 A filled-in tree, used as the running example for the rest of this doc —
 a default host serving most of the tree directly, a second host serving a
 couple of subtrees of its own, and a third host that only ever
-client-mounts. It shows both `cache-dir` patterns from spec.md §1:
+peer-mounts. It shows both `cache-dir` patterns from spec.md §1:
 `media-prod` points its `cache-dir` straight at a plain path under the
 fixed `/srv/stortree` root (the host's own local tree, no separate mount
 needed), while `storage-node-bravo` instead points its `cache-dir` at
@@ -110,7 +110,7 @@ rather than competing for space on the box itself. `.bravo-cache` and
 than nested inside it — nesting a VFS-cache backing store inside another
 host's own remote-backed mount is exactly the kind of collision
 top-level subtrees exist to avoid (see "Top-level subtrees" below), and
-each sets `client-defaults.rclone: false` since nothing but its own
+each sets `peer-defaults.rclone: false` since nothing but its own
 owning host ever needs it mounted (or, for `.gcs-cache`, created at all)
 anywhere else:
 
@@ -122,13 +122,13 @@ tree:
   requires:
     - .bravo-cache
 
-  client-defaults:
+  peer-defaults:
     rclone.args:
       vfs-cache-mode: full
       vfs-cache-max-age: 100h
       dir-cache-time: 5m
 
-  clients:
+  peers:
     some-storage-gadget:
       rclone.args:
         vfs-cache-max-size: 20G
@@ -169,12 +169,12 @@ tree:
 .bravo-cache:
   host: storage-node-bravo
   rclone.remote: some-remote:/.stortree-cache
-  client-defaults:
+  peer-defaults:
     rclone: false
 
 .gcs-cache:
   host: storage-node-alpha
-  client-defaults:
+  peer-defaults:
     rclone: false
 ```
 
@@ -201,7 +201,7 @@ mounts.
 `.bravo-cache` is itself a resolved top-level subtree, like `tree` —
 server-owned by `storage-node-bravo`, mounted from `some-remote` (a
 device on that host's own local network). Its only purpose is to back
-the `cache-dir` that `clients.storage-node-bravo.rclone.args` points at
+the `cache-dir` that `peers.storage-node-bravo.rclone.args` points at
 above: `storage-node-bravo` caches the files `storagebox` serves (as
 `tree`'s own remote, via `storage-node-alpha`) onto that local-network
 disk rather than its own — a real, off-host mount, needed because
@@ -222,7 +222,7 @@ content, since `media-prod` is nested there — replacing a cache with a
 second, redundant, self-referential mount of identical remote data.
 
 `some-storage-gadget` owns no subtree at all — it only appears under
-`tree`'s `clients:` — but because `home` carries a `samba:` block, it
+`tree`'s `peers:` — but because `home` carries a `samba:` block, it
 still ends up exporting a `home` Samba share of its own: it peer-sources
 every piece of `home` it doesn't own (which, since it owns none of
 `home`, is all of it) — `sys-configs` and `media-prod` from
@@ -259,7 +259,34 @@ though the resolved filesystem still puts them all under the one fixed
   "Node inheritance" below). There's no single implicit "tree root" that
   behaves differently from everything nested inside it.
 
-### Per-client mount opt-out
+### Peers
+
+A host that holds a copy of a subtree it doesn't own is a **peer** of the
+subtree's owning host, and `peers:`/`peer-defaults:` are where its copy
+is configured — mount args, an `access` grant of its own, a `samba:`
+block of its own.
+
+The name is the mechanism. A non-owning host never mounts the subtree's
+`rclone.remote` itself and never holds credentials for it: it makes an
+sftp mount of the owning host's own already-mounted copy, over the
+host-to-host trust `stortree_peer_trust` provisions (spec.md §1, §7).
+That is the same peer relationship a Samba peer dependency uses, and the
+synthesized rclone remote is named for it (`peer-<host>-<path>`, see
+"Peer section names" below). The word "client" in this repo means an SMB
+client connecting to a share — a machine outside the fleet — and never
+one of these hosts.
+
+> **Renamed.** These keys were `clients:` and `client-defaults:`. The old
+> names still parse as far as an error message: `resolve()` rejects them
+> by name and tells you what to rename them to ("Unknown keys are an
+> error" below). Nothing about the blocks' contents changed. The
+> resolved facts they feed were renamed to match — `client_mounts` is
+> now `subtree_mounts` and `client_grants` is now `subtree_grants`,
+> named for what the mount is rather than the protocol it uses, since
+> `peer_dependencies` already names a different list of peer mounts
+> (spec.md §1).
+
+### Per-peer mount opt-out
 
 By default, every top-level subtree is peer-mounted (or, with no
 `rclone.remote` of its own, just created as an empty placeholder
@@ -267,7 +294,7 @@ directory) onto every inventory host that doesn't own it (see "Every
 inventory host participates" below). A subtree that has no business
 being visible anywhere but its own owning host — a per-host VFS-cache
 backing store, remote-backed like `.bravo-cache` above or genuinely
-local like `.gcs-cache` — can opt out with `client-defaults.rclone:
+local like `.gcs-cache` — can opt out with `peer-defaults.rclone:
 false` either way: it's not just about skipping a peer mount nobody
 needs, a remote-less subtree like `.gcs-cache` would otherwise still get
 that pointless empty placeholder directory created on every other host.
@@ -276,23 +303,23 @@ that pointless empty placeholder directory created on every other host.
 <name>:
   host: <hostname>
   rclone.remote: <remote-spec>
-  client-defaults:
+  peer-defaults:
     rclone: false             # no non-owning host gets a mount of this by default
-  clients:
+  peers:
     <hostname>:
-      rclone: false            # or true / {args: {...}} — always wins over client-defaults
+      rclone: false            # or true / {args: {...}} — always wins over peer-defaults
 ```
 
-`clients.<hostname>.rclone` always wins over `client-defaults.rclone`
-when both are set for the same host: with `client-defaults.rclone:
-false`, a `clients.<hostname>.rclone` entry that's truthy (`true`, or a
+`peers.<hostname>.rclone` always wins over `peer-defaults.rclone`
+when both are set for the same host: with `peer-defaults.rclone:
+false`, a `peers.<hostname>.rclone` entry that's truthy (`true`, or a
 dict — with or without `.args`) becomes an *allow-list* — only hosts
 listed that way get a mount, everyone else gets none. With
-`client-defaults.rclone` left at its default (unset, i.e. enabled), a
-`clients.<hostname>.rclone: false` entry becomes a *deny-list* instead —
+`peer-defaults.rclone` left at its default (unset, i.e. enabled), a
+`peers.<hostname>.rclone: false` entry becomes a *deny-list* instead —
 every non-owning host gets a mount except the ones explicitly disabled.
 The owning host itself is never affected either way — it always
-self-mounts via `server_subtrees`, never through this client-mount path
+self-mounts via `server_subtrees`, never through this peer-mount path
 at all. This applies uniformly to a top-level subtree's own peer mount
 and to any Samba descendant nested under it (see "Samba sharing is
 universal" below) — one setting governs everything a non-owning host
@@ -301,7 +328,7 @@ says otherwise.
 
 #### At any depth
 
-`client-defaults`/`clients` are ordinary node keys, valid on a
+`peer-defaults`/`peers` are ordinary node keys, valid on a
 subdirectory exactly as on a top-level subtree, and a node that writes
 neither simply inherits whatever its nearest ancestor set. So a tree
 that only ever writes them at the top level behaves exactly as it always
@@ -311,8 +338,8 @@ and everything under it, without touching its siblings.
 
 Two axes of precedence, composing the same way at every level:
 
-- **Within one node**, an explicit `clients.<hostname>` beats that same
-  node's `client-defaults` — the rule above, unchanged.
+- **Within one node**, an explicit `peers.<hostname>` beats that same
+  node's `peer-defaults` — the rule above, unchanged.
 - **Across nodes**, a nearer (deeper) node beats a more distant
   ancestor.
 
@@ -320,22 +347,22 @@ Two axes of precedence, composing the same way at every level:
 down the chain, every level contributing, with the nearest and most
 specific block winning any individual key conflict — so a subdirectory
 adds a couple of args to whatever its subtree already set for that
-client rather than replacing the lot.
+peer rather than replacing the lot.
 
 The most useful shape this buys is the allow-list idiom one level down —
-a subtree kept off every client, with a single node inside it handed to
+a subtree kept off every peer, with a single node inside it handed to
 one host:
 
 ```yaml
 research:
   host: storage-node-alpha
   rclone.remote: storagebox:/research
-  client-defaults:
+  peer-defaults:
     rclone: false             # nothing under `research` reaches any other host...
   subdirs:
     published:
       rclone.remote: storagebox:/research-published
-      clients:
+      peers:
         some-storage-gadget:
           rclone: true         # ...except this one node, on this one host
     embargoed:
@@ -343,16 +370,16 @@ research:
 ```
 
 `some-storage-gadget` ends up with one mount, at `research/published`,
-peer-sourced from `storage-node-alpha` the same way a top-level client
+peer-sourced from `storage-node-alpha` the same way a top-level subtree
 mount is — there's no ancestor mount left for it to reach the node
 through, so the node gets one of its own. Every other host gets nothing
 of `research` at all, and `research/embargoed` reaches nobody but
 `storage-node-alpha`.
 
 Note that "truthy means enabled" holds at every level too: a
-`clients.<hostname>.rclone.args` (or `client-defaults.rclone.args`)
+`peers.<hostname>.rclone.args` (or `peer-defaults.rclone.args`)
 written on a node *under* an opted-out ancestor re-enables that node,
-since writing client-side mount args for it is taken to mean clients are
+since writing peer-side mount args for it is taken to mean peers are
 meant to have it. Write `rclone: false` alongside the args if you meant
 to keep it off.
 
@@ -367,7 +394,7 @@ block governs is the mounts that node gets **in its own right**:
 - its own separate peer mount as a Samba descendant its owning host
   differs on (see "Samba sharing is universal" below) — the common case,
   and the one where a nested opt-out really does remove something;
-- its own client mount as the shallowest enabled node of its branch,
+- its own subtree mount as the shallowest enabled node of its branch,
   which only exists when every ancestor is opted out.
 
 Where a node has neither, a block written on it resolves to nothing.
@@ -376,17 +403,17 @@ typically a Samba descendant on one host and plain content inside an
 ancestor's mount on another — so nothing rejects it; it's just worth
 knowing which of the two you're writing.
 
-A `user-subdirs` descendant is never a client mount of the shallowest-
+A `user-subdirs` descendant is never a subtree mount of the shallowest-
 enabled kind: its path is still `%U`-templated and fans out into one
 mount per granted user (see "`subdirs` vs `user-subdirs`" below), which
-a single client mount can't describe. It reaches a non-owning host
+a single subtree mount can't describe. It reaches a non-owning host
 through the Samba path instead, where the fan-out is resolved — and a
-client block on it governs that, exactly as on any other Samba
+peer block on it governs that, exactly as on any other Samba
 descendant.
 
-### Client-side access
+### Peer-side access
 
-`client-defaults`/`clients.<hostname>` also take an `access` object —
+`peer-defaults`/`peers.<hostname>` also take an `access` object —
 the same `{group?, owner?, permissions?}` a node itself takes ("Access"
 below) — describing what a **non-owning** host applies to its own copy
 of the node:
@@ -403,7 +430,7 @@ tree:
           access.group: Media Production      # what the owner enforces
           host: storage-node-bravo
           rclone.remote: some-remote:/media
-          client-defaults:
+          peer-defaults:
             access:                            # what every other host enforces
               group: Media Production
               permissions: rx
@@ -421,11 +448,11 @@ Three things to know about it:
   an ancestor and its descendant follow down the tree ("Access
   inheritance" below), and it composes with it: the node's grant is
   whatever it inherited and wrote, and this is written over that. So
-  `clients.<host>.access.owner: some-service-account` hands that host's
+  `peers.<host>.access.owner: some-service-account` hands that host's
   copy to that account and leaves the node's group in place, which is
   usually what naming a host-local principal was for. Between blocks,
   nearest and most specific wins each key it sets:
-  `clients.<hostname>` over `client-defaults`, deeper node over
+  `peers.<hostname>` over `peer-defaults`, deeper node over
   shallower. To take something back rather than add to it, write `null`
   for that key, or `access:` with nothing in it to drop the whole grant
   on that host — both different from writing no `access` at all, which
@@ -433,14 +460,14 @@ Three things to know about it:
   mounts the node rather than owning it, dropping the grant means
   *presenting* the default there, which takes a bindfs mount of its own;
   stortree plans one ("Access inheritance" below).
-- **The owning host is never affected.** `clients`/`client-defaults`
+- **The owning host is never affected.** `peers`/`peer-defaults`
   only ever describe a host that doesn't own the node, so the node's own
   `access` is what its owner enforces, always.
 - **It does change what the Samba share admits, on this host.** A
   share's `valid users`/`write list` name the principals the filesystem
   underneath will actually let in, so they follow the grant each host
-  enforces: the node's own on the host that owns it, the client-side one
-  everywhere it was written. With no client-side grant anywhere in a
+  enforces: the node's own on the host that owns it, the peer-side one
+  everywhere it was written. With no peer-side grant anywhere in a
   share's subtree — the ordinary case — every host derives the same
   list, exactly as before. This is what makes host-local identity work:
   a service account that exists only on one host (a local Unix user,
@@ -448,7 +475,7 @@ Three things to know about it:
   where it could not be resolved. The share's *path* and the peer mounts
   behind it are unchanged either way.
 
-Write no `access` in a client block and the copy carries the node's own
+Write no `access` in a peer block and the copy carries the node's own
 grant, which is the whole point: a grant describes the node, so the same
 path is the same user's on every host that has it. It reached only the
 owning host until stortree presented these mounts at all — the reasoning
@@ -502,9 +529,9 @@ Some details:
   level of config.yml (`.bravo-cache`, `tree/backups`) — the same strings
   used everywhere else in this doc. Leading/trailing `/` are trimmed.
 - **It applies wherever the node is mounted**, including hosts that
-  client-mount it rather than own it. That's what makes the example work:
+  peer-mount it rather than own it. That's what makes the example work:
   the cache dependency belongs to *bravo's* mount of `tree`, and bravo is
-  a client of `tree`, not its owner.
+  a peer of `tree`, not its owner.
 - **A target that isn't a mount on this host drops out silently**, with
   no unit dependency rendered. That covers both a target some other host
   owns and this one doesn't mount (in the example, `.bravo-cache` is
@@ -684,10 +711,10 @@ between the two forms: a string settles the whole mode, a mapping settles
 the classes it mentions.
 
 A node's `access` is what its *owning* host enforces. A host that only
-holds a copy of the node — a client mount, or a peer-sourced Samba
+holds a copy of the node — a subtree mount, or a peer-sourced Samba
 descendant — enforces the same grant by default, and can be given a
-different one with an `access` inside `client-defaults`/`clients`; see
-"Client-side access" above.
+different one with an `access` inside `peer-defaults`/`peers`; see
+"Peer-side access" above.
 
 `group`/`owner` names are resolved against POSIX identities provided by
 SSSD (backed by the configured LDAP server — see `ldap.yml` below).
@@ -746,8 +773,8 @@ project-data:
       access:                     # drops it — back to the plain default
 ```
 
-Four rules, and a client block's `access` follows all four over the
-result ("Client-side access" above):
+Four rules, and a peer block's `access` follows all four over the
+result ("Peer-side access" above):
 
 - **No `access` key at all: inherit.** The whole grant, from the nearest
   ancestor that has one. A node with no granted ancestor gets the plain
@@ -798,29 +825,29 @@ absence of something. See spec.md §2 for the two layers this is talking about.
 
 ### Every inventory host participates
 
-`clients:` is only ever for a per-host override, never a prerequisite for
-being a client. Every host in the Ansible inventory
+`peers:` is only ever for a per-host override, never a prerequisite for
+being a peer. Every host in the Ansible inventory
 (`inventory/hosts.yml`, spec.md "Config layout") that isn't itself a
-given top-level subtree's resolved `host` gets a client mount of that
-subtree, whether or not it has a `clients:` entry there and whether or
+given top-level subtree's resolved `host` gets a subtree mount of that
+subtree, whether or not it has a `peers:` entry there and whether or
 not it's named anywhere in `config.yml` at all — unless that subtree's
-own `client-defaults`/`clients.<hostname>` opts it out (see "Per-client
-mount opt-out" above). With a `clients:` entry, `clients.<hostname>.
-rclone.args` merges over `client-defaults`; without one, it just gets
-`client-defaults` verbatim. That mount is **not** a direct mount of the
+own `peer-defaults`/`peers.<hostname>` opts it out (see "Per-peer
+mount opt-out" above). With a `peers:` entry, `peers.<hostname>.
+rclone.args` merges over `peer-defaults`; without one, it just gets
+`peer-defaults` verbatim. That mount is **not** a direct mount of the
 subtree's own `rclone.remote` — it's a peer-sftp mount of the resolved
 owner's (`host:`'s) own copy of that subtree, provisioned by
 `stortree_peer_trust` the same way as any other peer dependency (spec.md
-§1/§7); a client never holds credentials for the subtree's remote itself.
+§1/§7); a peer never holds credentials for the subtree's remote itself.
 This applies independently to every top-level subtree — a host can own
-one, client-mount another, and be opted out of a third, all at once —
-and, where a subtree's own nodes carry their own `client-defaults`/
-`clients`, independently within a subtree too ("At any depth" above).
+one, peer-mount another, and be opted out of a third, all at once —
+and, where a subtree's own nodes carry their own `peer-defaults`/
+`peers`, independently within a subtree too ("At any depth" above).
 
 The same goes for "Samba sharing is universal" below and for cross-host
 peer dependencies (spec.md §1/§7): both apply to every inventory host
 equally, not only ones named in `config.yml`. Naming a host in
-`config.yml` — as a node's `host:`, or under `clients:` — only ever
+`config.yml` — as a node's `host:`, or under `peers:` — only ever
 *adds* something on top of what it already gets by being in the
 inventory (subtree ownership, or a per-host `rclone.args` override); it's
 never required to get the baseline. Adding a host to
@@ -838,7 +865,7 @@ Only an explicit `samba: false` opts a node back out. That export is
 not limited to the node's own resolved `host` (or that host's usual peer
 dependencies, spec.md §1) — **every host in the Ansible inventory**
 exposes the share, including a host that owns no subtree of its own and
-only ever appears under `clients:` (`some-storage-gadget` above), and even
+only ever appears under `peers:` (`some-storage-gadget` above), and even
 a host with no mention in `config.yml` whatsoever (see "Every inventory
 host participates" above). A host that already owns some or all of the
 node's data serves it from there; whatever it doesn't own, it
@@ -846,13 +873,13 @@ peer-sources from the actual owning host — the same peer-trust mechanism
 spec.md §1/§7 describes for a Samba node's own descendants, just not
 restricted to hosts that already serve some other part of the tree.
 There's no "designated Samba host": if a node has a `samba:` block, every
-inventory host — server, client-only, or entirely unnamed in
+inventory host — server, peer-only, or entirely unnamed in
 `config.yml` — ends up serving it.
 
 Two things narrow that, both opt-in and neither changing the default:
 `stortree_samba_hosts` takes a host out of exporting anything ("What
 universality costs" below), and a `samba:` written inside a
-`client-defaults`/`clients.<hostname>` block scopes one node's share to
+`peer-defaults`/`peers.<hostname>` block scopes one node's share to
 the hosts it names ("Per-host shares" below). A config that writes
 neither behaves exactly as this section describes.
 
@@ -873,7 +900,7 @@ to be a choice instead.)
 `stortree_samba_hosts` (roles/stortree_facts/defaults/main.yml) is that
 choice: a fleet-level list, defaulting to every host, of the hosts that
 actually export shares. Narrow it in inventory or `group_vars` for a
-host that has no business serving SMB — one that is only a client of the
+host that has no business serving SMB — one that is only a peer of the
 tree, or one kept in the fleet purely to own a subtree others consume:
 
 ```yaml
@@ -886,7 +913,7 @@ stortree_samba_hosts:
 An excluded host resolves no `samba_shares` **and** none of the peer
 dependencies that exist only to back them — the mount, not the smb.conf
 stanza, is what universality actually costs, so dropping only the stanza
-would save nothing. Its own client mounts are untouched: opting out of
+would save nothing. Its own subtree mounts are untouched: opting out of
 *exporting* the tree says nothing about wanting it locally. On the
 serving side, hosts that own that content stop provisioning SSH trust
 for mounts the excluded host will never make, because every host reads
@@ -905,7 +932,7 @@ at peer mounts that no longer resolve.
 #### Per-host shares
 
 `stortree_samba_hosts` above decides which hosts export *anything*. A
-`samba:` written inside a `client-defaults`/`clients.<hostname>` block
+`samba:` written inside a `peer-defaults`/`peers.<hostname>` block
 decides which hosts export *this node* — the one way a share exists on
 some hosts and not others:
 
@@ -915,7 +942,7 @@ tree:
   rclone.remote: storagebox:/
   subdirs:
     spool:
-      clients.storage-node-bravo:
+      peers.storage-node-bravo:
         samba:
           name: spool
           hidden: true
@@ -942,17 +969,17 @@ Four things to know about it:
   blocks, a `samba:` marks the one node it's written on and says nothing
   about that node's descendants — exactly as a node's own `samba:`
   behaves. Cascading would export every descendant under a single name.
-- **The owning host never reads it.** `clients`/`client-defaults`
+- **The owning host never reads it.** `peers`/`peer-defaults`
   describe a host holding a *copy*; the owner holds the original. A node
   is exported on its owner if, and only if, it carries its own `samba:`.
 - **It replaces the node's own export on that host**, rather than
   merging with it. On a node with no `samba:` it adds a share there; on
   one that has a `samba:` it renames or hides that host's copy, and
   `samba: false` withdraws it there while leaving every other host's
-  intact. Within a node `clients.<hostname>` beats `client-defaults`,
+  intact. Within a node `peers.<hostname>` beats `peer-defaults`,
   the same precedence `rclone` and `access` follow.
 - **`valid users` follows the grant that host enforces** — see
-  "Client-side access" above. That is what lets the `nvr` grant reach
+  "Peer-side access" above. That is what lets the `nvr` grant reach
   bravo's share and no other host's.
 
 Nothing else changes: the share path is still derived from the node
@@ -994,7 +1021,7 @@ certainly setting.
 
 #### Share names
 
-The share's name — its `smb.conf` section header, and what a client
+The share's name — its `smb.conf` section header, and what an SMB client
 mounts as `//<host>/<name>` — is derived from the node's path by default,
 with every character outside `A-Za-z0-9_-` folded to `_`: `tree/home` is
 exported as `tree_home`. `samba.name` overrides that, on the node
@@ -1037,14 +1064,14 @@ an apply limited to one host still reports it.
 Every key in a node is either one this schema defines or a mistake, and
 `resolve()` treats it as the latter: an unrecognized key anywhere in the
 tree — at the node level, or inside `rclone:`, `access:`, `samba:`,
-`client-defaults:` or a `clients:` entry (including the `rclone:`/
+`peer-defaults:` or a `peers:` entry (including the `rclone:`/
 `access:`/`samba:` objects nested in those) — fails the run, naming the node it's
 on and, where there's a near match, the key it's probably meant to be.
 
 This matters more here than the usual argument for strictness, because
 the schema has no key whose absence is loud. A misspelled
 `rclone.remote` leaves the node a plain directory and the share on top
-of it serving an empty path; a misspelled `client-defaults` re-enables a
+of it serving an empty path; a misspelled `peer-defaults` re-enables a
 subtree that was meant to stay off every other host, and provisions the
 SSH trust to go with it; a misspelled `subdirs` drops a whole subtree; a
 misspelled `access.group` drops the grant and leaves the path at its
@@ -1199,7 +1226,7 @@ master copy with every remote's credentials, encrypted at rest with
 way as `ldap.yml`. A host only ever receives the filtered sections it's
 resolved to need (see spec.md §3), never the whole file. "Resolved to
 need" means the remotes that host *mounts with itself*: the ones behind
-subtrees it owns, plus any a `clients:` block hands it directly. A remote
+subtrees it owns, plus any a `peers:` block hands it directly. A remote
 behind a subtree it doesn't own never reaches it, even though it exports
 that subtree over Samba — it peer-sources the owning host instead.
 

@@ -131,10 +131,10 @@ def test_alpha_owns_everything_not_overridden():
     assert backups["remote"] is None
     assert backups["args"] == {}
     # alpha doesn't own .bravo-cache, but that subtree's own
-    # client-defaults.rclone: false keeps it off every host that isn't
-    # explicitly listed in its `clients:` -- alpha isn't, so no client
+    # peer-defaults.rclone: false keeps it off every host that isn't
+    # explicitly listed in its `peers:` -- alpha isn't, so no subtree
     # mount at all
-    assert r["client_mounts"] == []
+    assert r["subtree_mounts"] == []
 
 
 def test_bravo_owns_three_subtrees_with_a_different_remote():
@@ -150,28 +150,28 @@ def test_bravo_owns_three_subtrees_with_a_different_remote():
         "some-remote:/.stortree-cache"
     )
 
-    # bravo also has a `clients:` entry on `tree` -- both lists at once
-    # (spec.md §1). .gcs-cache is disabled by default (client-defaults.
-    # rclone: false) and bravo isn't in its `clients:`, so it gets none.
-    assert len(r["client_mounts"]) == 1
-    mount = r["client_mounts"][0]
+    # bravo also has a `peers:` entry on `tree` -- both lists at once
+    # (spec.md §1). .gcs-cache is disabled by default (peer-defaults.
+    # rclone: false) and bravo isn't in its `peers:`, so it gets none.
+    assert len(r["subtree_mounts"]) == 1
+    mount = r["subtree_mounts"][0]
     assert mount["local_path"] == "tree"
-    # the client mount is peer-sourced from alpha (tree's own owner),
+    # the subtree mount is peer-sourced from alpha (tree's own owner),
     # not a direct mount of tree's own rclone.remote -- see the matching
     # peer_dependencies entry below
     assert mount["remote"] == "peer-storage-node-alpha-tree:/srv/stortree/tree"
-    # client-defaults merged with clients.storage-node-bravo overrides
-    assert mount["args"]["vfs-cache-mode"] == "full"  # from client-defaults
+    # peer-defaults merged with peers.storage-node-bravo overrides
+    assert mount["args"]["vfs-cache-mode"] == "full"  # from peer-defaults
     assert mount["args"]["vfs-cache-max-size"] == "5G"  # bravo's own override
     assert mount["args"]["cache-dir"] == "/srv/stortree/.bravo-cache"
 
 
-def test_gadget_owns_nothing_but_gets_a_client_mount_and_full_samba_share():
+def test_gadget_owns_nothing_but_gets_a_subtree_mount_and_full_samba_share():
     r = resolve(EXAMPLE_TREE, "some-storage-gadget", EXAMPLE_HOSTS)
     assert r["server_subtrees"] == []
-    assert len(r["client_mounts"]) == 1
-    assert r["client_mounts"][0]["local_path"] == "tree"
-    assert r["client_mounts"][0]["args"]["vfs-cache-max-size"] == "20G"
+    assert len(r["subtree_mounts"]) == 1
+    assert r["subtree_mounts"][0]["local_path"] == "tree"
+    assert r["subtree_mounts"][0]["args"]["vfs-cache-max-size"] == "20G"
 
     assert len(r["samba_shares"]) == 1
     share = r["samba_shares"][0]
@@ -202,14 +202,14 @@ def test_alpha_peer_served_by_includes_bravo_and_gadget():
     r = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     servers = {p["serving_host"] for p in r["peer_served_by"]}
     assert servers == {"storage-node-bravo", "some-storage-gadget"}
-    # .gcs-cache is alpha's own too, but client-defaults.rclone: false
+    # .gcs-cache is alpha's own too, but peer-defaults.rclone: false
     # keeps it out of peer_served_by for hosts that aren't in its
-    # `clients:` (neither bravo nor gadget is)
+    # `peers:` (neither bravo nor gadget is)
     assert not any(p["local_path"] == ".gcs-cache" for p in r["peer_served_by"])
 
 
 def test_every_non_owning_host_peer_sources_tree_from_its_owner():
-    # A client mount of a top-level subtree is never a direct mount of
+    # A subtree mount of a top-level subtree is never a direct mount of
     # that subtree's own rclone.remote -- it's a peer-sftp mount of the
     # owning host's own copy, sourced the same way as any samba peer
     # dependency (docs/spec.md §1).
@@ -222,13 +222,13 @@ def test_every_non_owning_host_peer_sources_tree_from_its_owner():
         ]
         assert len(tree_peers) == 1
         assert (
-            r["client_mounts"][0]["remote"]
+            r["subtree_mounts"][0]["remote"]
             == "peer-storage-node-alpha-tree:/srv/stortree/tree"
         )
 
-    # alpha itself never peer-sources its own client mount of tree -- it
+    # alpha itself never peer-sources its own subtree mount of tree -- it
     # owns tree outright (test_alpha_owns_everything_not_overridden
-    # already asserts client_mounts == [] for it)
+    # already asserts subtree_mounts == [] for it)
     alpha = resolve(EXAMPLE_TREE, "storage-node-alpha", EXAMPLE_HOSTS)
     assert not any(p["local_path"] == "tree" for p in alpha["peer_dependencies"])
 
@@ -241,7 +241,7 @@ def test_every_non_owning_host_peer_sources_tree_from_its_owner():
     }
 
 
-def test_a_client_peers_a_subtree_whose_owner_has_no_remote_of_its_own():
+def test_a_peer_mounts_a_subtree_whose_owner_has_no_remote_of_its_own():
     # A non-owning host mounts from the owning host whether or not that
     # host's copy is remote-backed. A peer mount is sftp to the owner's
     # *filesystem path*, which exists just as much when the content
@@ -249,12 +249,12 @@ def test_a_client_peers_a_subtree_whose_owner_has_no_remote_of_its_own():
     # knows nothing about, as when rclone puts it there.
     #
     # This used to be gated on the node's own `rclone.remote`, which left
-    # the client with an empty local directory where the subtree should
+    # the peer with an empty local directory where the subtree should
     # be -- and disagreed with _samba_peer_dependencies(), which has
     # always peered a descendant regardless.
     tree = {"top": {"host": "h1", "subdirs": {"plain": {"host": "h2"}}}}
     r = resolve(tree, "h2", ["h1", "h2"])
-    assert r["client_mounts"] == [
+    assert r["subtree_mounts"] == [
         {
             "local_path": "top",
             "remote": "peer-h1-top:/srv/stortree/top",
@@ -268,53 +268,53 @@ def test_a_client_peers_a_subtree_whose_owner_has_no_remote_of_its_own():
     ]
 
 
-def test_a_client_still_gets_no_mount_when_the_subtree_is_opted_out():
+def test_a_peer_still_gets_no_mount_when_the_subtree_is_opted_out():
     # The way to keep a subtree off its non-owning hosts is the explicit
     # opt-out, not the absence of a remote.
     tree = {
         "top": {
             "host": "h1",
-            "client-defaults": {"rclone": False},
+            "peer-defaults": {"rclone": False},
             "subdirs": {"plain": {"host": "h2"}},
         }
     }
     r = resolve(tree, "h2", ["h1", "h2"])
-    assert not any(m["remote"] for m in r["client_mounts"])
+    assert not any(m["remote"] for m in r["subtree_mounts"])
     assert not any(p["local_path"] == "top" for p in r["peer_dependencies"])
 
 
-# -- client-defaults.rclone / clients.<host>.rclone opt-out --------------
+# -- peer-defaults.rclone / peers.<host>.rclone opt-out --------------
 
 
-def test_client_defaults_rclone_false_keeps_a_subtree_local_by_default():
+def test_peer_defaults_rclone_false_keeps_a_subtree_local_by_default():
     tree = {
         "private": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client-defaults": {"rclone": False},
+            "peer-defaults": {"rclone": False},
         }
     }
     for hostname in ("h2", "h3"):
         r = resolve(tree, hostname, ["h1", "h2", "h3"])
-        assert r["client_mounts"] == []
+        assert r["subtree_mounts"] == []
         assert not any(p["local_path"] == "private" for p in r["peer_dependencies"])
     # the owner is unaffected either way -- it self-mounts via
-    # server_subtrees, never through the client-mount/gating path at all
+    # server_subtrees, never through the subtree-mount/gating path at all
     owner = resolve(tree, "h1", ["h1", "h2", "h3"])
     assert paths(owner["server_subtrees"]) == {"private"}
 
 
-def test_clients_override_acts_as_an_allow_list_when_defaults_are_false():
+def test_peers_override_acts_as_an_allow_list_when_defaults_are_false():
     tree = {
         "private": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client-defaults": {"rclone": False},
-            "clients": {"h2": {"rclone": {"args": {"vfs-cache-max-size": "1G"}}}},
+            "peer-defaults": {"rclone": False},
+            "peers": {"h2": {"rclone": {"args": {"vfs-cache-max-size": "1G"}}}},
         }
     }
     allowed = resolve(tree, "h2", ["h1", "h2", "h3"])
-    assert allowed["client_mounts"] == [
+    assert allowed["subtree_mounts"] == [
         {
             "local_path": "private",
             "remote": "peer-h1-private:/srv/stortree/private",
@@ -325,33 +325,33 @@ def test_clients_override_acts_as_an_allow_list_when_defaults_are_false():
     ]
 
     denied = resolve(tree, "h3", ["h1", "h2", "h3"])
-    assert denied["client_mounts"] == []
+    assert denied["subtree_mounts"] == []
     assert not any(p["local_path"] == "private" for p in denied["peer_dependencies"])
 
 
-def test_clients_override_acts_as_a_deny_list_when_defaults_are_enabled():
+def test_peers_override_acts_as_a_deny_list_when_defaults_are_enabled():
     tree = {
         "shared": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "clients": {"h2": {"rclone": False}},
+            "peers": {"h2": {"rclone": False}},
         }
     }
     denied = resolve(tree, "h2", ["h1", "h2", "h3"])
-    assert denied["client_mounts"] == []
+    assert denied["subtree_mounts"] == []
 
     allowed = resolve(tree, "h3", ["h1", "h2", "h3"])
-    assert len(allowed["client_mounts"]) == 1
-    assert allowed["client_mounts"][0]["local_path"] == "shared"
+    assert len(allowed["subtree_mounts"]) == 1
+    assert allowed["subtree_mounts"][0]["local_path"] == "shared"
 
 
 def test_bravo_cache_and_gcs_cache_reach_no_other_host():
     # the two independent per-host VFS-cache subtrees in the worked
-    # example are exactly what client-defaults.rclone: false exists for
+    # example are exactly what peer-defaults.rclone: false exists for
     # -- confirm neither ever shows up for a host that doesn't own it
     for hostname in EXAMPLE_HOSTS:
         r = resolve(EXAMPLE_TREE, hostname, EXAMPLE_HOSTS)
-        mounted_paths = {m["local_path"] for m in r["client_mounts"]}
+        mounted_paths = {m["local_path"] for m in r["subtree_mounts"]}
         owned_paths = paths(r["server_subtrees"])
         for cache_path, owner in ((".bravo-cache", "storage-node-bravo"), (".gcs-cache", "storage-node-alpha")):
             if hostname == owner:
@@ -363,11 +363,11 @@ def test_bravo_cache_and_gcs_cache_reach_no_other_host():
                 )
 
 
-# -- nested clients / client-defaults ------------------------------------
+# -- nested peers / peer-defaults ------------------------------------
 
 
-def test_a_nested_client_block_governs_only_its_own_branch():
-    # `clients`/`client-defaults` written on a subdirectory, not on the
+def test_a_nested_peer_block_governs_only_its_own_branch():
+    # `peers`/`peer-defaults` written on a subdirectory, not on the
     # top-level subtree: h2 loses just that one Samba descendant and
     # keeps its sibling, which is the whole point of reading the block
     # at every level rather than only at the top.
@@ -382,7 +382,7 @@ def test_a_nested_client_block_governs_only_its_own_branch():
                         "a": {
                             "host": "h3",
                             "rclone.remote": "r3:/a",
-                            "clients": {"h2": {"rclone": False}},
+                            "peers": {"h2": {"rclone": False}},
                         },
                         "b": {"host": "h3", "rclone.remote": "r3:/b"},
                     },
@@ -413,25 +413,25 @@ def test_a_nested_client_block_governs_only_its_own_branch():
 
 
 def test_a_nested_block_beats_its_ancestors_and_inherits_where_it_says_nothing():
-    # Two axes at once (_client_policy): `clients.<host>` beats
-    # `client-defaults` within a node, a deeper node beats a shallower
+    # Two axes at once (_peer_policy): `peers.<host>` beats
+    # `peer-defaults` within a node, a deeper node beats a shallower
     # one, and `args` accumulate down the whole chain instead of the
     # nearest block replacing them.
     tree = {
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client-defaults": {"rclone.args": {"dir-cache-time": "5m", "x": "top"}},
+            "peer-defaults": {"rclone.args": {"dir-cache-time": "5m", "x": "top"}},
             "subdirs": {
                 "share": {
                     "samba": None,
-                    "client-defaults": {"rclone.args": {"x": "share"}},
-                    "clients": {"h2": {"rclone.args": {"vfs-cache-mode": "full"}}},
+                    "peer-defaults": {"rclone.args": {"x": "share"}},
+                    "peers": {"h2": {"rclone.args": {"vfs-cache-mode": "full"}}},
                     "subdirs": {
                         "deep": {
                             "host": "h3",
                             "rclone.remote": "r3:/deep",
-                            "clients": {"h2": {"rclone.args": {"x": "deep"}}},
+                            "peers": {"h2": {"rclone.args": {"x": "deep"}}},
                         }
                     },
                 }
@@ -444,7 +444,7 @@ def test_a_nested_block_beats_its_ancestors_and_inherits_where_it_says_nothing()
     )
     assert deep["args"] == {
         "dir-cache-time": "5m",  # inherited from the top-level subtree
-        "vfs-cache-mode": "full",  # from an intermediate node's clients entry
+        "vfs-cache-mode": "full",  # from an intermediate node's peers entry
         "x": "deep",  # deepest, most specific block wins the conflict
     }
 
@@ -452,33 +452,33 @@ def test_a_nested_block_beats_its_ancestors_and_inherits_where_it_says_nothing()
 def test_a_subdirectory_can_be_opted_back_in_under_an_opted_out_subtree():
     # The allow-list idiom, one level down: the subtree is off every
     # non-owning host, and a single node inside it is handed to one
-    # client on its own. It gets a client mount at its *own* path,
+    # peer on its own. It gets a subtree mount at its *own* path,
     # sourced from its own resolved owner -- there's no ancestor mount
     # left to reach it through.
     tree = {
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client-defaults": {"rclone": False},
+            "peer-defaults": {"rclone": False},
             "subdirs": {
                 "pub": {
                     "rclone.remote": "r1:/pub",
-                    "clients": {"h2": {"rclone": True}},
+                    "peers": {"h2": {"rclone": True}},
                 },
                 "priv": {"rclone.remote": "r1:/priv"},
             },
         }
     }
     allowed = resolve(tree, "h2", ["h1", "h2", "h3"])
-    assert [m["local_path"] for m in allowed["client_mounts"]] == ["top/pub"]
-    assert allowed["client_mounts"][0]["remote"] == (
+    assert [m["local_path"] for m in allowed["subtree_mounts"]] == ["top/pub"]
+    assert allowed["subtree_mounts"][0]["remote"] == (
         "peer-h1-top-pub:/srv/stortree/top/pub"
     )
     # the mount is real all the way down, not just an entry in resolve()
     assert "top/pub" in {e["local_path"] for e in plan_mounts(allowed)}
 
     denied = resolve(tree, "h3", ["h1", "h2", "h3"])
-    assert denied["client_mounts"] == []
+    assert denied["subtree_mounts"] == []
 
     # the owner serves exactly that one path, to exactly that one host
     served = resolve(tree, "h1", ["h1", "h2", "h3"])["peer_served_by"]
@@ -489,14 +489,14 @@ def test_an_opted_in_subdirectory_is_not_mounted_twice():
     # A node can be reached two ways at once -- a Samba descendant this
     # host peer-sources *and* the shallowest enabled node of its own
     # branch. Both are the same mount of the same path from the same
-    # host, and planning it twice is a unit-slug clash, so the client
+    # host, and planning it twice is a unit-slug clash, so the subtree
     # mount defers to the Samba peer dependency (which additionally
     # carries the node's own `access`).
     tree = {
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client-defaults": {"rclone": False},
+            "peer-defaults": {"rclone": False},
             "subdirs": {
                 "share": {
                     "samba": None,
@@ -505,7 +505,7 @@ def test_an_opted_in_subdirectory_is_not_mounted_twice():
                             "host": "h2",
                             "rclone.remote": "r2:/a",
                             "access.group": "Ops",
-                            "client-defaults": {"rclone": True},
+                            "peer-defaults": {"rclone": True},
                         }
                     },
                 }
@@ -513,7 +513,7 @@ def test_an_opted_in_subdirectory_is_not_mounted_twice():
         }
     }
     r = resolve(tree, "h3", ["h1", "h2", "h3"])
-    assert r["client_mounts"] == []
+    assert r["subtree_mounts"] == []
     assert [p["local_path"] for p in r["peer_dependencies"]] == ["top/share/a"]
     # One transport and one presentation for the same path -- the two
     # layers of a single mount, not the same mount planned twice.
@@ -524,13 +524,13 @@ def test_an_opted_in_subdirectory_is_not_mounted_twice():
 
 
 def test_a_top_level_subtree_that_shares_itself_is_not_mounted_twice():
-    # The same double-source, reachable with no nested client block at
+    # The same double-source, reachable with no nested peer block at
     # all: a remote-backed top-level subtree carrying `samba:` with no
     # children is its own Samba descendant (_has_own_content()) as well
-    # as its own client-mount target.
+    # as its own subtree-mount target.
     tree = {"top": {"host": "h1", "rclone.remote": "r1:/", "samba": None}}
     r = resolve(tree, "h2", ["h1", "h2"])
-    assert r["client_mounts"] == []
+    assert r["subtree_mounts"] == []
     assert [e["local_path"] for e in plan_mounts(r) if e["kind"] == "mount"] == ["top"]
     assert plan_mounts(r)[0]["remote"] == "peer-h1-top:/srv/stortree/top"
 
@@ -546,23 +546,23 @@ def test_a_nested_opt_out_under_a_mounted_ancestor_carves_no_hole():
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "subdirs": {"inner": {"client-defaults": {"rclone": False}}},
+            "subdirs": {"inner": {"peer-defaults": {"rclone": False}}},
         }
     }
     r = resolve(tree, "h2", ["h1", "h2"])
-    assert [m["local_path"] for m in r["client_mounts"]] == ["top"]
+    assert [m["local_path"] for m in r["subtree_mounts"]] == ["top"]
 
 
-def test_a_per_user_node_is_never_a_client_mount_target():
+def test_a_per_user_node_is_never_a_subtree_mount_target():
     # A `user-subdirs` descendant's path is still %U-templated and fans
-    # out into one mount per granted user; a client_mounts entry
+    # out into one mount per granted user; a subtree_mounts entry
     # describes a single mount and has no expansion step, so the descent
     # stops there. Nothing is silently mounted at a literal "%U" path.
     tree = {
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client-defaults": {"rclone": False},
+            "peer-defaults": {"rclone": False},
             "subdirs": {
                 "home": {
                     "user-subdirs": {
@@ -570,7 +570,7 @@ def test_a_per_user_node_is_never_a_client_mount_target():
                             "host": "h3",
                             "rclone.remote": "r3:/docs",
                             "access.group": "Staff",
-                            "client-defaults": {"rclone": True},
+                            "peer-defaults": {"rclone": True},
                         }
                     }
                 }
@@ -578,7 +578,7 @@ def test_a_per_user_node_is_never_a_client_mount_target():
         }
     }
     r = resolve(tree, "h2", ["h1", "h2", "h3"])
-    assert r["client_mounts"] == []
+    assert r["subtree_mounts"] == []
     assert not any(PER_USER_PLACEHOLDER in e["local_path"] for e in plan_mounts(r))
 
 
@@ -590,42 +590,42 @@ def test_the_descent_stops_at_a_subtree_this_host_serves_itself():
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client-defaults": {"rclone": False},
+            "peer-defaults": {"rclone": False},
             "subdirs": {"mine": {"host": "h2", "rclone.remote": "r2:/mine"}},
         }
     }
     r = resolve(tree, "h2", ["h1", "h2"])
-    assert r["client_mounts"] == []
+    assert r["subtree_mounts"] == []
     assert paths(r["server_subtrees"]) == {"top/mine"}
 
 
-def test_a_nested_client_block_leaves_the_worked_example_alone():
+def test_a_nested_peer_block_leaves_the_worked_example_alone():
     # The whole feature is additive: a tree that only ever writes
-    # `client-defaults`/`clients` on its top-level subtrees resolves
+    # `peer-defaults`/`peers` on its top-level subtrees resolves
     # exactly as it did when that was the only level read at all.
     for hostname in EXAMPLE_HOSTS:
         r = resolve(EXAMPLE_TREE, hostname, EXAMPLE_HOSTS)
-        for mount in r["client_mounts"]:
+        for mount in r["subtree_mounts"]:
             assert "/" not in mount["local_path"]
 
 
-# -- access in a client block --------------------------------------------
+# -- access in a peer block --------------------------------------------
 
 
-def test_client_defaults_access_grants_a_client_mount_its_own_ownership():
-    # A top-level client mount carries no `access` at all by default --
-    # the owning host is what enforces the node's own grant. A client
+def test_peer_defaults_access_grants_a_subtree_mount_its_own_ownership():
+    # A top-level subtree mount carries no `access` at all by default --
+    # the owning host is what enforces the node's own grant. A peer
     # block is how this host's own copy gets one, which is what turns
     # into rclone's --uid/--gid/--dir-perms for that mount.
     tree = {
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client-defaults": {"access": {"group": "Readers", "permissions": "rx"}},
+            "peer-defaults": {"access": {"group": "Readers", "permissions": "rx"}},
         }
     }
     r = resolve(tree, "h2", ["h1", "h2"])
-    assert r["client_mounts"][0]["access"] == {
+    assert r["subtree_mounts"][0]["access"] == {
         "group": "Readers",
         "permissions": "rx",
         "permissions_explicit": True,
@@ -636,10 +636,10 @@ def test_client_defaults_access_grants_a_client_mount_its_own_ownership():
     assert needed_groups(r) == ["Readers"]
 
 
-def test_a_client_access_merges_over_the_nodes_own_grant():
-    # One key at a time (_client_policy, _client_grant), the same rule
-    # an ancestor and its descendant follow: `clients.<host>` wins the
-    # keys it sets, `client-defaults` the ones only it sets, and the
+def test_a_peer_access_merges_over_the_nodes_own_grant():
+    # One key at a time (_peer_policy, _peer_grant), the same rule
+    # an ancestor and its descendant follow: `peers.<host>` wins the
+    # keys it sets, `peer-defaults` the ones only it sets, and the
     # node's own grant supplies the rest. Overriding the owner used to
     # drop the group with it, which is how a grant meant to hold
     # fleet-wide stopped at whichever host also named a local principal.
@@ -655,8 +655,8 @@ def test_a_client_access_merges_over_the_nodes_own_grant():
                             "host": "h3",
                             "rclone.remote": "r3:/leaf",
                             "access": {"group": "Owners", "permissions": "rwx"},
-                            "client-defaults": {"access.group": "Readers"},
-                            "clients": {"h2": {"access": {"owner": "jd"}}},
+                            "peer-defaults": {"access.group": "Readers"},
+                            "peers": {"h2": {"access": {"owner": "jd"}}},
                         }
                     },
                 }
@@ -668,7 +668,7 @@ def test_a_client_access_merges_over_the_nodes_own_grant():
         for p in resolve(tree, host, ["h1", "h2", "h3"])["peer_dependencies"]
         if p["local_path"] == "top/share/leaf"
     )
-    # h2 gets its own `owner`, `client-defaults`' group (the node's
+    # h2 gets its own `owner`, `peer-defaults`' group (the node's
     # `Owners` overridden by the nearer block that set that key), and
     # the node's own explicit level, which nothing in the chain touched.
     assert leaf_access("h2") == {
@@ -677,14 +677,14 @@ def test_a_client_access_merges_over_the_nodes_own_grant():
         "permissions": "rwx",
         "permissions_explicit": True,
     }
-    # h1 has no `clients` entry of its own, so it stops at
-    # client-defaults over the node.
+    # h1 has no `peers` entry of its own, so it stops at
+    # peer-defaults over the node.
     assert leaf_access("h1") == {
         "group": "Readers",
         "permissions": "rwx",
         "permissions_explicit": True,
     }
-    # the owning host is untouched: `clients`/`client-defaults` only ever
+    # the owning host is untouched: `peers`/`peer-defaults` only ever
     # describe a host that doesn't own the node
     owner = resolve(tree, "h3", ["h1", "h2", "h3"])
     assert by_path(owner["server_subtrees"], "top/share/leaf")["access"] == {
@@ -694,7 +694,7 @@ def test_a_client_access_merges_over_the_nodes_own_grant():
     }
 
 
-def test_an_empty_client_access_drops_the_nodes_grant_on_that_client():
+def test_an_empty_peer_access_drops_the_nodes_grant_on_that_peer():
     # `access:` written with nothing in it is the way to say "no grant
     # here", distinct from writing no `access` at all (which keeps
     # whatever the entry would otherwise have carried).
@@ -710,7 +710,7 @@ def test_an_empty_client_access_drops_the_nodes_grant_on_that_client():
                             "host": "h3",
                             "rclone.remote": "r3:/leaf",
                             "access.group": "Owners",
-                            "clients": {"h2": {"access": None}},
+                            "peers": {"h2": {"access": None}},
                         }
                     },
                 }
@@ -734,32 +734,32 @@ def test_an_empty_client_access_drops_the_nodes_grant_on_that_client():
     assert needed_groups(dropped) == []
 
 
-def test_a_client_access_owner_reaches_needed_users():
+def test_a_peer_access_owner_reaches_needed_users():
     tree = {
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "clients": {"h2": {"access.owner": "jd"}},
+            "peers": {"h2": {"access.owner": "jd"}},
         }
     }
     assert needed_users(resolve(tree, "h2", ["h1", "h2"])) == ["jd"]
 
 
-def test_client_block_rejects_an_unknown_access_key():
+def test_peer_block_rejects_an_unknown_access_key():
     tree = {
         "top": {
             "host": "h1",
-            "clients": {"h2": {"access": {"grup": "Ops"}}},
+            "peers": {"h2": {"access": {"grup": "Ops"}}},
         }
     }
-    with pytest.raises(ValueError, match=r"unknown `clients\.h2\.access` key 'grup'"):
+    with pytest.raises(ValueError, match=r"unknown `peers\.h2\.access` key 'grup'"):
         resolve(tree, "h2", ["h1", "h2"])
 
 
-def test_client_defaults_rejects_an_unknown_access_key():
-    tree = {"top": {"host": "h1", "client-defaults": {"access": {"perms": "rx"}}}}
+def test_peer_defaults_rejects_an_unknown_access_key():
+    tree = {"top": {"host": "h1", "peer-defaults": {"access": {"perms": "rx"}}}}
     with pytest.raises(
-        ValueError, match=r"unknown `client-defaults\.access` key 'perms'"
+        ValueError, match=r"unknown `peer-defaults\.access` key 'perms'"
     ):
         resolve(tree, "h2", ["h1", "h2"])
 
@@ -861,7 +861,7 @@ def test_mutual_peer_dependency():
     assert {p["serving_host"] for p in b["peer_served_by"]} == {"host-a"}
 
 
-def test_client_only_host_still_resolves_peer_dependencies():
+def test_peer_only_host_still_resolves_peer_dependencies():
     r = resolve(EXAMPLE_TREE, "some-storage-gadget", EXAMPLE_HOSTS)
     assert r["server_subtrees"] == []
     assert len(r["peer_dependencies"]) > 0
@@ -873,7 +873,7 @@ def test_host_unnamed_anywhere_in_config_resolves_like_any_other():
     gadget = resolve(EXAMPLE_TREE, "some-storage-gadget", hosts)
 
     assert charlie["server_subtrees"] == []
-    assert len(charlie["client_mounts"]) == 1
+    assert len(charlie["subtree_mounts"]) == 1
     assert {p["owning_host"] for p in charlie["peer_dependencies"]} == {
         p["owning_host"] for p in gadget["peer_dependencies"]
     }
@@ -1008,7 +1008,7 @@ def test_filter_rclone_conf_scopes_to_needed_sections_plus_peers():
         "server_subtrees": [
             {"path": "own", "remote": "remote-a:/x", "args": {}, "access": {}}
         ],
-        "client_mounts": [],
+        "subtree_mounts": [],
         "samba_shares": [],
         "peer_dependencies": [
             {
@@ -1042,7 +1042,7 @@ def test_filter_rclone_conf_expands_per_user_peer_sections():
     # (plan_remote_sections())
     resolved = {
         "server_subtrees": [],
-        "client_mounts": [],
+        "subtree_mounts": [],
         "samba_shares": [],
         "peer_dependencies": [
             {
@@ -1075,7 +1075,7 @@ def test_filter_rclone_conf_group_only_peer_section_collapses_to_one():
     # exist)
     resolved = {
         "server_subtrees": [],
-        "client_mounts": [],
+        "subtree_mounts": [],
         "samba_shares": [],
         "peer_dependencies": [
             {
@@ -1539,7 +1539,7 @@ def test_plan_mounts_expands_per_user_nodes_and_orders_nesting():
         for p in by_local_path
     )
 
-    # bravo's client mount of `tree` nests everything under it that's
+    # bravo's subtree mount of `tree` nests everything under it that's
     # sourced through that peer connection
     tree_slug = by_local_path["tree"]["slug"]
     assert by_local_path["tree/home/.mounts/mw-fam"]["requires_slug"] == tree_slug
@@ -1676,7 +1676,7 @@ def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
     assert "tree/home" not in by_local_path
 
     # every peer-sourced entry under `tree` nests directly under gadget's
-    # own client mount of `tree` (also peer-sourced, from alpha) -- not
+    # own subtree mount of `tree` (also peer-sourced, from alpha) -- not
     # under "tree/home", which was never a mount to nest under in the
     # first place
     tree_slug = by_local_path["tree"]["slug"]
@@ -1736,7 +1736,7 @@ def test_plan_mounts_keeps_a_nested_peer_transport_of_a_different_host():
     # and not just the path: gadget's mount of `tree` comes from alpha,
     # but whitfield-media and mw-fam inside it are bravo's. Reading them
     # through alpha's copy would relay one host's content through
-    # another -- exactly what _client_mount_entries() sources directly to
+    # another -- exactly what _subtree_mount_entries() sources directly to
     # avoid -- and alpha may not even mount them.
     group_members = {
         "Whitfield Family & Friends": ["jd", "mw"],
@@ -1791,13 +1791,13 @@ def peer_dependency(local_path, **overrides):
 
 def test_plan_mounts_keeps_a_nested_peer_transport_asking_for_different_args():
     # Layer 1 is the only layer that caches, so `args` are what a mount
-    # is *for* beyond the bytes it carries. A node whose client policy
+    # is *for* beyond the bytes it carries. A node whose peer policy
     # asks for a different cache than the subtree above it is asking for
     # a second mount, and collapsing would silently hand it the outer
     # mount's cache instead.
     resolved = {
         "server_subtrees": [],
-        "client_mounts": [],
+        "subtree_mounts": [],
         "samba_shares": [],
         "peer_dependencies": [
             peer_dependency("top", args={"vfs-cache-mode": "full"}),
@@ -1825,7 +1825,7 @@ def test_plan_mounts_keeps_a_nested_peer_transport_reading_another_path():
     # from somewhere else in the owning host's tree.
     resolved = {
         "server_subtrees": [],
-        "client_mounts": [],
+        "subtree_mounts": [],
         "samba_shares": [],
         "peer_dependencies": [
             peer_dependency("top"),
@@ -1846,7 +1846,7 @@ GRANT_TREE = {
         },
     },
 }
-GRANT_HOSTS = ["owner", "client"]
+GRANT_HOSTS = ["owner", "peer"]
 
 
 def test_a_nodes_own_grant_is_applied_on_a_host_that_mounts_it_without_owning_it():
@@ -1857,45 +1857,45 @@ def test_a_nodes_own_grant_is_applied_on_a_host_that_mounts_it_without_owning_it
     # present it, since a chown inside a FUSE mount reports success and
     # persists nothing.
     owner = plan_index(plan_mounts(resolve(GRANT_TREE, "owner", GRANT_HOSTS), {}))
-    client = plan_index(plan_mounts(resolve(GRANT_TREE, "client", GRANT_HOSTS), {}))
+    peer = plan_index(plan_mounts(resolve(GRANT_TREE, "peer", GRANT_HOSTS), {}))
 
-    for plan in (owner, client):
+    for plan in (owner, peer):
         assert access_owner(plan["top/shared"]["access"], "stortree") == "jd"
         assert access_mode(plan["top/shared"]["access"]) == "0701"
 
     assert owner["top/shared"]["kind"] == "dir"
-    assert client["top/shared"]["kind"] == "mount"
-    assert client["top/shared"]["transport_slug"] == "top"
+    assert peer["top/shared"]["kind"] == "mount"
+    assert peer["top/shared"]["transport_slug"] == "top"
 
     # The node below inherits that same grant (_walk_tree()) and needs
     # nothing of its own to apply it on either host: the owner chowns a
-    # real directory, and on the client the presentation above already
+    # real directory, and on the peer the presentation above already
     # shows every path inside it as `jd` (_grant_presented_above()), so
     # one bindfs covers the whole subtree.
-    for plan in (owner, client):
+    for plan in (owner, peer):
         assert access_owner(plan["top/shared/inner"]["access"], "stortree") == "jd"
         assert plan["top/shared/inner"]["kind"] == "dir"
 
 
-def test_a_top_level_subtrees_own_grant_reaches_the_hosts_that_client_mount_it():
-    # The mounted node itself, not just what's inside it: a client mount
+def test_a_top_level_subtrees_own_grant_reaches_the_hosts_that_peer_mount_it():
+    # The mounted node itself, not just what's inside it: a subtree mount
     # is this host's copy of that node, and §6's rule is about the node.
     # _samba_peer_dependencies() has always fallen back this way for a
-    # descendant; the client-mount path used to substitute `{}`, which
+    # descendant; the subtree-mount path used to substitute `{}`, which
     # is how a grant could stop at whichever host happened to own it.
     tree = {"top": {"host": "owner", "access.owner": "jd"}}
     for host in GRANT_HOSTS:
         plan = plan_index(plan_mounts(resolve(tree, host, GRANT_HOSTS), {}))
         assert access_owner(plan["top"]["access"], "stortree") == "jd"
 
-    # A client block on the node still replaces it for the host it names.
-    tree["top"]["clients"] = {"client": {"access.owner": "mw"}}
-    plan = plan_index(plan_mounts(resolve(tree, "client", GRANT_HOSTS), {}))
+    # A peer block on the node still replaces it for the host it names.
+    tree["top"]["peers"] = {"peer": {"access.owner": "mw"}}
+    plan = plan_index(plan_mounts(resolve(tree, "peer", GRANT_HOSTS), {}))
     assert access_owner(plan["top"]["access"], "stortree") == "mw"
 
 
-def test_a_client_block_grant_beats_the_nodes_own_on_the_host_it_names():
-    # `clients.<host>.access` describes one host's copy, and it wins
+def test_a_peer_block_grant_beats_the_nodes_own_on_the_host_it_names():
+    # `peers.<host>.access` describes one host's copy, and it wins
     # there -- including on a node with no `samba:` or `rclone:` in that
     # block to give it an entry any other way.
     tree = {
@@ -1905,40 +1905,40 @@ def test_a_client_block_grant_beats_the_nodes_own_on_the_host_it_names():
             "subdirs": {
                 "shared": {
                     "access.owner": "jd",
-                    "clients": {"client": {"access.owner": "mw"}},
+                    "peers": {"peer": {"access.owner": "mw"}},
                 },
             },
         },
     }
-    client = plan_index(plan_mounts(resolve(tree, "client", GRANT_HOSTS), {}))
-    assert access_owner(client["top/shared"]["access"], "stortree") == "mw"
+    peer = plan_index(plan_mounts(resolve(tree, "peer", GRANT_HOSTS), {}))
+    assert access_owner(peer["top/shared"]["access"], "stortree") == "mw"
     # ...and nowhere else.
     owner = plan_index(plan_mounts(resolve(tree, "owner", GRANT_HOSTS), {}))
     assert access_owner(owner["top/shared"]["access"], "stortree") == "jd"
 
 
-def test_a_grant_is_not_applied_where_the_client_never_mounts_the_subtree():
+def test_a_grant_is_not_applied_where_the_peer_never_mounts_the_subtree():
     # No mount, no presentation, and no directory either: an opted-out
     # subtree's descendants aren't this host's business at all
-    # (docs/config-schema.md "Per-client mount opt-out"). Applying a
+    # (docs/config-schema.md "Per-peer mount opt-out"). Applying a
     # grant here would mean creating the path first, which is precisely
     # what the opt-out is for.
     tree = {
         "top": {
             "host": "owner",
             "rclone.remote": "r:/",
-            "client-defaults.rclone": False,
+            "peer-defaults.rclone": False,
             "subdirs": {"shared": {"access.owner": "jd"}},
         },
     }
-    resolved = resolve(tree, "client", GRANT_HOSTS)
-    assert resolved["client_grants"] == []
+    resolved = resolve(tree, "peer", GRANT_HOSTS)
+    assert resolved["subtree_grants"] == []
     assert "top/shared" not in plan_index(plan_mounts(resolved, {}))
 
 
 def test_an_opt_out_below_a_mounted_ancestor_does_not_drop_that_nodes_grant():
     # `rclone: false` on a node underneath an enabled ancestor carves no
-    # hole out of the ancestor's mount (_client_mount_targets()), so the
+    # hole out of the ancestor's mount (_subtree_mount_targets()), so the
     # path is presented on this host regardless. Reading that key here
     # too would leave it presented and ungoverned -- the one outcome
     # neither reading of the opt-out is asking for.
@@ -1949,14 +1949,14 @@ def test_an_opt_out_below_a_mounted_ancestor_does_not_drop_that_nodes_grant():
             "subdirs": {
                 "shared": {
                     "access.owner": "jd",
-                    "client-defaults.rclone": False,
+                    "peer-defaults.rclone": False,
                 },
             },
         },
     }
-    client = plan_index(plan_mounts(resolve(tree, "client", GRANT_HOSTS), {}))
-    assert client["top/shared"]["kind"] == "mount"
-    assert access_owner(client["top/shared"]["access"], "stortree") == "jd"
+    peer = plan_index(plan_mounts(resolve(tree, "peer", GRANT_HOSTS), {}))
+    assert peer["top/shared"]["kind"] == "mount"
+    assert access_owner(peer["top/shared"]["access"], "stortree") == "jd"
 
 
 # A grant written once, at the top of a subtree, and everything a node
@@ -1999,7 +1999,7 @@ def test_an_inherited_grant_costs_one_presentation_for_the_whole_subtree():
     # presentation shows it for every path beneath, since bindfs is
     # uniform over its subtree -- so the nodes that inherited the grant
     # unchanged stay plain directories inside that one mount.
-    plan = plan_mounts(resolve(INHERIT_TREE, "client", GRANT_HOSTS), {})
+    plan = plan_mounts(resolve(INHERIT_TREE, "peer", GRANT_HOSTS), {})
     indexed = plan_index(plan)
     for path in ("top/backups", "top/backups/nightly"):
         assert access_group(indexed[path]["access"], "stortree") == "Storage Data"
@@ -2066,12 +2066,12 @@ def test_an_empty_access_drops_an_inherited_grant_on_every_host():
     # to be *presented*, or the grant above would keep applying to a path
     # that just said it doesn't.
     owner = plan_index(plan_mounts(resolve(INHERIT_TREE, "owner", GRANT_HOSTS), {}))
-    client = plan_index(plan_mounts(resolve(INHERIT_TREE, "client", GRANT_HOSTS), {}))
-    for plan in (owner, client):
+    peer = plan_index(plan_mounts(resolve(INHERIT_TREE, "peer", GRANT_HOSTS), {}))
+    for plan in (owner, peer):
         assert access_group(plan["top/ungoverned"]["access"], "stortree") == "stortree"
         assert access_mode(plan["top/ungoverned"]["access"]) == "0751"
     assert owner["top/ungoverned"]["kind"] == "dir"
-    assert client["top/ungoverned"]["kind"] == "mount"
+    assert peer["top/ungoverned"]["kind"] == "mount"
 
 
 def test_a_grant_is_compared_against_the_nearest_presentation_above_it():
@@ -2091,8 +2091,8 @@ def test_a_grant_is_compared_against_the_nearest_presentation_above_it():
             },
         },
     }
-    client = plan_index(plan_mounts(resolve(tree, "client", GRANT_HOSTS), {}))
-    assert [client[p]["kind"] for p in ("top", "top/mid", "top/mid/leaf")] == [
+    peer = plan_index(plan_mounts(resolve(tree, "peer", GRANT_HOSTS), {}))
+    assert [peer[p]["kind"] for p in ("top", "top/mid", "top/mid/leaf")] == [
         "mount",
         "mount",
         "mount",
@@ -2143,10 +2143,10 @@ def test_an_inherited_grant_is_named_once_in_a_shares_valid_users():
     assert [g["group"] for g in share["access"]] == ["Storage Data"]
 
 
-def test_a_client_grants_principals_are_looked_up_on_that_host():
+def test_a_subtree_grants_principals_are_looked_up_on_that_host():
     # The lookup list is what `getent` is run for, and the presentation
     # unit reads the resulting uid/gid maps by name -- so a principal
-    # that reaches a host only through a client grant, and is named
+    # that reaches a host only through a subtree grant, and is named
     # nowhere else in its facts, has to be in it. Missing, the unit
     # template resolves `stortree_group_gids[<name>]` against a map that
     # never had the name and the apply fails on that host alone.
@@ -2157,12 +2157,12 @@ def test_a_client_grants_principals_are_looked_up_on_that_host():
             "subdirs": {"shared": {"access.group": "Only Here"}},
         },
     }
-    resolved = resolve(tree, "client", GRANT_HOSTS)
-    assert [g["local_path"] for g in resolved["client_grants"]] == ["top/shared"]
+    resolved = resolve(tree, "peer", GRANT_HOSTS)
+    assert [g["local_path"] for g in resolved["subtree_grants"]] == ["top/shared"]
     assert needed_groups(resolved) == ["Only Here"]
 
     tree["top"]["subdirs"]["shared"] = {"access.owner": "only-here"}
-    assert needed_users(resolve(tree, "client", GRANT_HOSTS)) == ["only-here"]
+    assert needed_users(resolve(tree, "peer", GRANT_HOSTS)) == ["only-here"]
 
 
 def test_permissions_merge_one_class_at_a_time():
@@ -2194,20 +2194,20 @@ def test_permissions_merge_one_class_at_a_time():
     assert access_mode(plan["top/reset"]["access"]) == "0771"
 
 
-def test_a_clients_permissions_narrow_that_hosts_copy_alone():
-    # The two merges meeting: a client block writes one class, keeps the
+def test_a_peers_permissions_narrow_that_hosts_copy_alone():
+    # The two merges meeting: a peer block writes one class, keeps the
     # rest of the node's grant, and says nothing about any other host.
     tree = {
         "top": {
             "host": "owner",
             "rclone.remote": "r:/",
             "access.group": "Storage Data",
-            "clients": {"client": {"access": {"permissions": {"group": "r-x"}}}},
+            "peers": {"peer": {"access": {"permissions": {"group": "r-x"}}}},
         },
     }
-    client = plan_index(plan_mounts(resolve(tree, "client", GRANT_HOSTS), {}))
-    assert access_group(client["top"]["access"], "stortree") == "Storage Data"
-    assert access_mode(client["top"]["access"]) == "0751"
+    peer = plan_index(plan_mounts(resolve(tree, "peer", GRANT_HOSTS), {}))
+    assert access_group(peer["top"]["access"], "stortree") == "Storage Data"
+    assert access_mode(peer["top"]["access"]) == "0751"
 
     owner = plan_index(plan_mounts(resolve(tree, "owner", GRANT_HOSTS), {}))
     assert access_mode(owner["top"]["access"]) == "0771"
@@ -2235,14 +2235,14 @@ def test_a_permissions_level_is_held_to_the_alphabet_it_is_read_with():
             ["h1"],
         )
 
-    # A class named in a client block is held to the same alphabet.
-    with pytest.raises(ValueError, match=r"`clients\.h2\.access\.permissions\.group`"):
+    # A class named in a peer block is held to the same alphabet.
+    with pytest.raises(ValueError, match=r"`peers\.h2\.access\.permissions\.group`"):
         resolve(
             {
                 "top": {
                     "host": "h1",
                     "access.group": "g",
-                    "clients": {"h2": {"access": {"permissions": {"group": "rwq"}}}},
+                    "peers": {"h2": {"access": {"permissions": {"group": "rwq"}}}},
                 }
             },
             "h1",
@@ -2273,20 +2273,20 @@ def test_a_permissions_level_granted_to_nobody_is_rejected():
     with pytest.raises(ValueError, match="'top/shared'"):
         resolve(nulled, "h1", ["h1"])
 
-    # A client block's level narrows that host's copy of the node's
+    # A peer block's level narrows that host's copy of the node's
     # grant (test above), so the mistake there is this same one: a level
     # over a node that grants nobody anything. Checked against the
     # merged grant, which makes it a per-host error like a share-name
     # collision (_validate_share_names()) rather than a tree-wide one --
     # it is raised on the host whose copy it describes.
-    client = {
+    tree = {
         "top": {
             "host": "h1",
-            "clients": {"h2": {"access": {"permissions": "rx"}}},
+            "peers": {"h2": {"access": {"permissions": "rx"}}},
         }
     }
     with pytest.raises(ValueError, match="`access for h2` leaves a "):
-        resolve(client, "h2", ["h1", "h2"])
+        resolve(tree, "h2", ["h1", "h2"])
 
 
 def test_a_per_user_grant_still_fans_out_rather_than_planning_one_path():
@@ -2294,7 +2294,7 @@ def test_a_per_user_grant_still_fans_out_rather_than_planning_one_path():
     # single path for a grant to land on -- it resolves through
     # _expand_per_user() into one presentation per authorized user (or
     # one shared mount plus binds), exactly as it always did, and the
-    # client-grant stage must not plan a second entry at the template.
+    # subtree-grant stage must not plan a second entry at the template.
     tree = {
         "top": {
             "host": "owner",
@@ -2307,8 +2307,8 @@ def test_a_per_user_grant_still_fans_out_rather_than_planning_one_path():
             },
         },
     }
-    resolved = resolve(tree, "client", GRANT_HOSTS)
-    assert resolved["client_grants"] == []
+    resolved = resolve(tree, "peer", GRANT_HOSTS)
+    assert resolved["subtree_grants"] == []
     planned = plan_index(plan_mounts(resolved, {}))
     assert "top/home/docs" not in planned
     assert planned["top/home/jd/docs"]["kind"] == "mount"
@@ -2403,8 +2403,8 @@ def _entry(plan, local_path):
     return next(e for e in plan if e["local_path"] == local_path)
 
 
-def test_requires_orders_a_client_mount_after_a_sibling_cache_subtree():
-    # the case the key exists for: a top-level subtree whose *client*
+def test_requires_orders_a_subtree_mount_after_a_sibling_cache_subtree():
+    # the case the key exists for: a top-level subtree whose *peer*
     # points its cache-dir into another top-level subtree's mount. No
     # nesting relationship at all, so requires_slug can't derive it.
     tree = {
@@ -2412,12 +2412,12 @@ def test_requires_orders_a_client_mount_after_a_sibling_cache_subtree():
             "host": "h1",
             "rclone.remote": "r1:/",
             "requires": [".cache"],
-            "clients": {"h2": {"rclone.args": {"cache-dir": "/srv/stortree/.cache"}}},
+            "peers": {"h2": {"rclone.args": {"cache-dir": "/srv/stortree/.cache"}}},
         },
         ".cache": {
             "host": "h2",
             "rclone.remote": "r2:/",
-            "client-defaults": {"rclone": False},
+            "peer-defaults": {"rclone": False},
         },
     }
     plan = plan_mounts(resolve(tree, "h2", ["h1", "h2"]))
@@ -2427,7 +2427,7 @@ def test_requires_orders_a_client_mount_after_a_sibling_cache_subtree():
     # and it really is the mount that isn't nested under it
     assert _entry(plan, "tree")["requires_slug"] is None
 
-    # h1 owns `tree` and never mounts .cache at all (client-defaults
+    # h1 owns `tree` and never mounts .cache at all (peer-defaults
     # rclone: false), so the same declaration resolves to nothing there
     # rather than to a unit that doesn't exist.
     plan_h1 = plan_mounts(resolve(tree, "h1", ["h1", "h2"]))
@@ -2621,8 +2621,8 @@ def test_plan_mounts_peer_sources_a_plain_samba_descendant_it_does_not_own():
     assert leaf["symlink_target"] is None
 
 
-def test_client_opt_out_beats_universal_samba_sharing():
-    # Samba sharing is universal, but `client-defaults.rclone: false`
+def test_peer_opt_out_beats_universal_samba_sharing():
+    # Samba sharing is universal, but `peer-defaults.rclone: false`
     # still stops a non-owning host from mounting anything of that
     # subtree -- so it ends up exporting the share with nothing behind
     # it. Worth pinning: the two rules pull in opposite directions and
@@ -2631,7 +2631,7 @@ def test_client_opt_out_beats_universal_samba_sharing():
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client-defaults": {"rclone": False},
+            "peer-defaults": {"rclone": False},
             "subdirs": {
                 "share": {
                     "samba": {},
@@ -2643,7 +2643,7 @@ def test_client_opt_out_beats_universal_samba_sharing():
     r = resolve(tree, "h3", ["h1", "h2", "h3"])
     assert len(r["samba_shares"]) == 1
     assert r["peer_dependencies"] == []
-    assert r["client_mounts"] == []
+    assert r["subtree_mounts"] == []
 
 
 def test_plan_mounts_rejects_two_entries_that_resolve_to_one_unit_slug():
@@ -2666,7 +2666,7 @@ def test_plan_mounts_rejects_two_entries_that_resolve_to_one_unit_slug():
     }
     resolved = {
         "server_subtrees": [duplicate, dict(duplicate, remote="other:/")],
-        "client_mounts": [],
+        "subtree_mounts": [],
         "samba_shares": [],
         "peer_dependencies": [],
     }
@@ -2690,7 +2690,7 @@ def test_slug_of_a_single_segment_path_is_that_segment():
 def test_no_resolved_path_is_ever_empty():
     # _slug(), _peer_section_name() and _peer_remote_ref() all used to
     # carry a special case for `local_path == ""` -- the one shared tree
-    # root's own client mount, back when a single root existed. Every
+    # root's own subtree mount, back when a single root existed. Every
     # path now starts at a named top-level subtree (_walk_tree()), so
     # there is no empty path left to special-case. This is the guard on
     # that: reintroduce one and the removed branches become live again,
@@ -2703,7 +2703,7 @@ def test_no_resolved_path_is_ever_empty():
     }
     for host in EXAMPLE_HOSTS:
         resolved = resolve(EXAMPLE_TREE, host, EXAMPLE_HOSTS)
-        for scope in ("server_subtrees", "client_mounts", "peer_dependencies"):
+        for scope in ("server_subtrees", "subtree_mounts", "peer_dependencies"):
             for entry in resolved[scope]:
                 assert entry.get("path") or entry.get("local_path"), (host, scope)
         for entry in plan_mounts(resolved, members):
@@ -2766,15 +2766,15 @@ def test_needed_users_covers_a_peer_dependencys_owner_grant():
     assert needed_users(resolved) == ["jd"]
 
 
-def test_filter_rclone_conf_keeps_a_client_mounts_own_direct_remote():
-    # A client mount is usually peer-sourced, but a host named under
-    # `clients:` for a subtree it doesn't own can still end up with a
+def test_filter_rclone_conf_keeps_a_subtree_mounts_own_direct_remote():
+    # A subtree mount is usually peer-sourced, but a host named under
+    # `peers:` for a subtree it doesn't own can still end up with a
     # direct third-party remote -- that section has to survive the
     # filter, or the mount starts with no credentials for it.
     conf = "[direct]\ntype = sftp\n\n[unrelated]\ntype = s3\n"
     resolved = {
         "server_subtrees": [],
-        "client_mounts": [{"local_path": "top", "remote": "direct:/", "args": {}}],
+        "subtree_mounts": [{"local_path": "top", "remote": "direct:/", "args": {}}],
         "samba_shares": [],
         "peer_dependencies": [],
     }
@@ -2794,7 +2794,7 @@ def test_filter_rclone_conf_ignores_entries_with_no_remote_at_all():
         "server_subtrees": [
             {"path": "top", "remote": None, "args": {}, "access": {}}
         ],
-        "client_mounts": [{"local_path": "top/x", "remote": None, "args": {}}],
+        "subtree_mounts": [{"local_path": "top/x", "remote": None, "args": {}}],
         "samba_shares": [{"descendants": [{"path": "top/x", "remote": None}]}],
         "peer_dependencies": [],
     }
@@ -2820,7 +2820,7 @@ def test_filter_rclone_conf_never_ships_a_samba_descendants_third_party_remote()
                 "private": {
                     "host": "h2",
                     "rclone.remote": "secret-remote:/",
-                    "client-defaults": {"rclone": False},
+                    "peer-defaults": {"rclone": False},
                 }
             },
         }
@@ -2871,7 +2871,7 @@ def test_filter_rclone_conf_rejects_two_hosts_claiming_one_peer_section():
     # peer-storage-node-alpha-tree.
     resolved = {
         "server_subtrees": [],
-        "client_mounts": [],
+        "subtree_mounts": [],
         "samba_shares": [],
         "peer_dependencies": [
             {
@@ -2908,7 +2908,7 @@ def test_filter_rclone_conf_allows_one_host_claiming_a_section_twice():
     # would fail a config that works.
     resolved = {
         "server_subtrees": [],
-        "client_mounts": [],
+        "subtree_mounts": [],
         "samba_shares": [],
         "peer_dependencies": [
             {
@@ -2941,11 +2941,11 @@ def test_an_overridden_stortree_root_reaches_every_generated_path():
     # an override produced silently wrong paths in exactly the artifacts
     # nobody watches being generated.
     # No `samba:` here: a samba node is peer-sourced by the share loop
-    # instead, which deliberately suppresses the separate client mount.
+    # instead, which deliberately suppresses the separate subtree mount.
     tree = {"tree": {"host": "h1", "rclone.remote": "r:/"}}
     resolved = resolve(tree, "h2", ["h1", "h2"], "/data/stortree")
-    (client,) = resolved["client_mounts"]
-    assert client["remote"] == "peer-h1-tree:/data/stortree/tree"
+    (mount,) = resolved["subtree_mounts"]
+    assert mount["remote"] == "peer-h1-tree:/data/stortree/tree"
 
     (entry,) = [e for e in plan_mounts(resolved, {}, "/data/stortree") if e["remote"]]
     assert entry["remote"] == "peer-h1-tree:/data/stortree/tree"
@@ -2960,10 +2960,10 @@ def test_the_path_defaults_still_apply_when_no_root_is_passed():
     # Every existing caller that passes neither keeps the documented
     # /srv/stortree and /etc/stortree, so the new arguments are additive.
     # No `samba:` here: a samba node is peer-sourced by the share loop
-    # instead, which deliberately suppresses the separate client mount.
+    # instead, which deliberately suppresses the separate subtree mount.
     tree = {"tree": {"host": "h1", "rclone.remote": "r:/"}}
     resolved = resolve(tree, "h2", ["h1", "h2"])
-    assert resolved["client_mounts"][0]["remote"] == "peer-h1-tree:/srv/stortree/tree"
+    assert resolved["subtree_mounts"][0]["remote"] == "peer-h1-tree:/srv/stortree/tree"
     out = filter_rclone_conf("", resolved)
     assert "path = /srv/stortree/tree" in out
     assert "key_file = /etc/stortree/peer_ssh_key" in out
@@ -2977,7 +2977,7 @@ def test_filter_rclone_conf_drops_a_per_user_peer_nobody_is_granted():
     conf = "[base]\ntype = sftp\n"
     resolved = {
         "server_subtrees": [],
-        "client_mounts": [],
+        "subtree_mounts": [],
         "samba_shares": [],
         "peer_dependencies": [
             {
@@ -3152,7 +3152,7 @@ def test_samba_hidden_does_not_change_who_may_connect():
     assert [g["group"] for g in share["access"]] == ["ops"]
 
 
-# -- per-host shares (a `samba:` inside a client block) --------------------
+# -- per-host shares (a `samba:` inside a peer block) --------------------
 
 
 def _appliance_tree():
@@ -3164,7 +3164,7 @@ def _appliance_tree():
             "rclone.remote": "r:/",
             "subdirs": {
                 "spool": {
-                    "clients.h2": {
+                    "peers.h2": {
                         "samba": {"name": "spool", "hidden": True},
                         "access.owner": "svc",
                     }
@@ -3174,7 +3174,7 @@ def _appliance_tree():
     }
 
 
-def test_a_client_block_samba_exports_the_node_on_that_host_alone():
+def test_a_peer_block_samba_exports_the_node_on_that_host_alone():
     tree = _appliance_tree()
     assert resolve(tree, "h1", ["h1", "h2"])["samba_shares"] == []
     (share,) = resolve(tree, "h2", ["h1", "h2"])["samba_shares"]
@@ -3210,45 +3210,45 @@ def test_a_per_host_share_peer_sources_its_content_on_that_host_only():
     ]
 
 
-def test_client_defaults_samba_exports_on_every_host_but_the_owner():
-    tree = {"a": {"host": "h1", "client-defaults": {"samba": {"name": "a"}}}}
+def test_peer_defaults_samba_exports_on_every_host_but_the_owner():
+    tree = {"a": {"host": "h1", "peer-defaults": {"samba": {"name": "a"}}}}
     hosts = ["h1", "h2", "h3"]
     assert resolve(tree, "h1", hosts)["samba_shares"] == []
     for h in ("h2", "h3"):
         assert [s["name"] for s in resolve(tree, h, hosts)["samba_shares"]] == ["a"]
 
 
-def test_the_owning_host_ignores_a_client_block_written_for_itself():
-    # `clients`/`client-defaults` describe a host holding a *copy*; the
+def test_the_owning_host_ignores_a_peer_block_written_for_itself():
+    # `peers`/`peer-defaults` describe a host holding a *copy*; the
     # owner holds the original. Same rule `rclone` and `access` follow.
-    tree = {"a": {"host": "h1", "clients.h1": {"samba": {"name": "nope"}}}}
+    tree = {"a": {"host": "h1", "peers.h1": {"samba": {"name": "nope"}}}}
     assert resolve(tree, "h1", ["h1", "h2"])["samba_shares"] == []
 
 
-def test_a_client_block_samba_renames_that_hosts_copy_of_a_universal_share():
+def test_a_peer_block_samba_renames_that_hosts_copy_of_a_universal_share():
     tree = {
-        "a": {"host": "h1", "samba": {"name": "shared"}, "clients.h2": {"samba": {"name": "local"}}}
+        "a": {"host": "h1", "samba": {"name": "shared"}, "peers.h2": {"samba": {"name": "local"}}}
     }
     hosts = ["h1", "h2"]
     assert [s["name"] for s in resolve(tree, "h1", hosts)["samba_shares"]] == ["shared"]
     assert [s["name"] for s in resolve(tree, "h2", hosts)["samba_shares"]] == ["local"]
 
 
-def test_a_client_block_samba_false_withdraws_a_universal_share_on_that_host():
-    tree = {"a": {"host": "h1", "samba": {"name": "a"}, "clients.h2": {"samba": False}}}
+def test_a_peer_block_samba_false_withdraws_a_universal_share_on_that_host():
+    tree = {"a": {"host": "h1", "samba": {"name": "a"}, "peers.h2": {"samba": False}}}
     hosts = ["h1", "h2"]
     assert [s["name"] for s in resolve(tree, "h1", hosts)["samba_shares"]] == ["a"]
     assert resolve(tree, "h2", hosts)["samba_shares"] == []
 
 
-def test_a_client_block_samba_does_not_cascade_to_descendants():
+def test_a_peer_block_samba_does_not_cascade_to_descendants():
     # `samba` marks the one node it is written on, never that node's
     # subtree -- exactly as a node's own `samba:` does. Cascading would
     # export every descendant under a single name.
     tree = {
         "a": {
             "host": "h1",
-            "client-defaults": {"samba": {"name": "outer"}},
+            "peer-defaults": {"samba": {"name": "outer"}},
             "subdirs": {"b": {}, "c": {}},
         }
     }
@@ -3256,12 +3256,12 @@ def test_a_client_block_samba_does_not_cascade_to_descendants():
     assert [s["node_path"] for s in shares] == ["a"]
 
 
-def test_within_one_node_clients_host_beats_client_defaults_for_samba():
+def test_within_one_node_peers_host_beats_peer_defaults_for_samba():
     tree = {
         "a": {
             "host": "h1",
-            "client-defaults": {"samba": {"name": "default"}},
-            "clients": {"h2": {"samba": {"name": "specific"}}},
+            "peer-defaults": {"samba": {"name": "default"}},
+            "peers": {"h2": {"samba": {"name": "specific"}}},
         }
     }
     hosts = ["h1", "h2", "h3"]
@@ -3277,7 +3277,7 @@ def test_a_per_host_share_of_a_user_subdirs_node_keeps_the_per_user_path():
         "a": {
             "host": "h1",
             "user-subdirs": {"x": {"access.group": "g"}},
-            "clients.h2": {"samba": {"name": "a"}},
+            "peers.h2": {"samba": {"name": "a"}},
         }
     }
     (share,) = resolve(tree, "h2", ["h1", "h2"])["samba_shares"]
@@ -3293,7 +3293,7 @@ def test_a_share_name_collision_confined_to_one_host_fails_every_host():
     # peers export, to know what trust to provision, and finds it there.
     tree = {
         "a": {"host": "h1", "samba": {"name": "media"}},
-        "b": {"host": "h1", "clients.h2": {"samba": {"name": "media"}}},
+        "b": {"host": "h1", "peers.h2": {"samba": {"name": "media"}}},
     }
     for host in ("h1", "h2"):
         with pytest.raises(ValueError, match="share name 'media' on 'h2'"):
@@ -3305,7 +3305,7 @@ def test_a_per_host_share_name_is_free_on_hosts_that_do_not_export_it():
     # nothing collides, and only h2 sees the second share at all.
     tree = {
         "a": {"host": "h1", "samba": {"name": "media"}},
-        "b": {"host": "h1", "clients.h2": {"samba": {"name": "spool"}}},
+        "b": {"host": "h1", "peers.h2": {"samba": {"name": "spool"}}},
     }
     hosts = ["h1", "h2"]
     assert [s["name"] for s in resolve(tree, "h1", hosts)["samba_shares"]] == ["media"]
@@ -3318,16 +3318,16 @@ def test_a_per_host_share_name_is_free_on_hosts_that_do_not_export_it():
 # -- valid users follows what this host actually enforces ------------------
 
 
-def test_a_client_side_grant_replaces_the_nodes_own_in_valid_users():
+def test_a_peer_side_grant_replaces_the_nodes_own_in_valid_users():
     # A share's `valid users` names the principals the filesystem
-    # underneath it will admit -- which is the client-side grant on a
+    # underneath it will admit -- which is the peer-side grant on a
     # host holding a copy, and the node's own on the host that owns it.
     tree = {
         "a": {
             "host": "h1",
             "samba": {"name": "a"},
             "subdirs": {
-                "d": {"access.owner": "alice", "clients.h2": {"access.owner": "bob"}}
+                "d": {"access.owner": "alice", "peers.h2": {"access.owner": "bob"}}
             },
         }
     }
@@ -3338,8 +3338,8 @@ def test_a_client_side_grant_replaces_the_nodes_own_in_valid_users():
     assert [g["owner"] for g in on_h2["access"]] == ["bob"]
 
 
-def test_valid_users_is_identical_everywhere_with_no_client_side_grant():
-    # The default is unchanged: without a client block saying otherwise,
+def test_valid_users_is_identical_everywhere_with_no_peer_side_grant():
+    # The default is unchanged: without a peer block saying otherwise,
     # every host resolves the same share with the same grant.
     tree = {"a": {"host": "h1", "access.group": "ops", "samba": {"name": "a"}}}
     hosts = ["h1", "h2", "h3"]
@@ -3359,26 +3359,26 @@ def test_a_misspelled_samba_hidden_is_rejected():
         resolve(tree, "h1", ["h1"])
 
 
-def test_a_misspelled_key_inside_a_client_block_samba_is_rejected():
-    tree = {"a": {"host": "h1", "clients.h2": {"samba": {"nmae": "x"}}}}
-    with pytest.raises(ValueError, match=r"unknown `clients.h2.samba` key 'nmae'"):
+def test_a_misspelled_key_inside_a_peer_block_samba_is_rejected():
+    tree = {"a": {"host": "h1", "peers.h2": {"samba": {"nmae": "x"}}}}
+    with pytest.raises(ValueError, match=r"unknown `peers.h2.samba` key 'nmae'"):
         resolve(tree, "h1", ["h1", "h2"])
 
 
-def test_samba_subpath_inside_a_client_block_is_rejected_by_name():
-    tree = {"a": {"host": "h1", "clients.h2": {"samba": {"subpath": "%U"}}}}
-    with pytest.raises(ValueError, match=r"sets `clients.h2.samba.subpath`"):
+def test_samba_subpath_inside_a_peer_block_is_rejected_by_name():
+    tree = {"a": {"host": "h1", "peers.h2": {"samba": {"subpath": "%U"}}}}
+    with pytest.raises(ValueError, match=r"sets `peers.h2.samba.subpath`"):
         resolve(tree, "h1", ["h1", "h2"])
 
 
-def test_a_client_block_samba_name_is_held_to_the_same_alphabet():
-    tree = {"a": {"host": "h1", "clients.h2": {"samba": {"name": ".hidden"}}}}
+def test_a_peer_block_samba_name_is_held_to_the_same_alphabet():
+    tree = {"a": {"host": "h1", "peers.h2": {"samba": {"name": ".hidden"}}}}
     with pytest.raises(ValueError, match="may contain only letters"):
         resolve(tree, "h1", ["h1", "h2"])
 
 
-def test_client_opt_out_also_withholds_peer_trust_from_the_serving_side():
-    # The mirror of test_client_opt_out_beats_universal_samba_sharing,
+def test_peer_opt_out_also_withholds_peer_trust_from_the_serving_side():
+    # The mirror of test_peer_opt_out_beats_universal_samba_sharing,
     # seen from the host that owns the data: if no peer will ever mount
     # it, this host must not list them in peer_served_by either --
     # that's what stortree_peer_trust turns into authorized_keys, and an
@@ -3388,7 +3388,7 @@ def test_client_opt_out_also_withholds_peer_trust_from_the_serving_side():
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client-defaults": {"rclone": False},
+            "peer-defaults": {"rclone": False},
             "subdirs": {
                 "share": {
                     "samba": {},
@@ -3400,7 +3400,7 @@ def test_client_opt_out_also_withholds_peer_trust_from_the_serving_side():
     assert resolve(tree, "h2", ["h1", "h2", "h3"])["peer_served_by"] == []
 
     # Without the opt-out, both other hosts are served.
-    tree["top"].pop("client-defaults")
+    tree["top"].pop("peer-defaults")
     served = resolve(tree, "h2", ["h1", "h2", "h3"])["peer_served_by"]
     assert {p["serving_host"] for p in served} == {"h1", "h3"}
 
@@ -3458,18 +3458,65 @@ def test_a_misspelled_rclone_remote_is_rejected_not_left_unmounted():
         resolve(tree, "h1", ["h1"])
 
 
-def test_a_misspelled_client_defaults_is_rejected_not_silently_ignored():
-    # Cost: `client-defaults.rclone: false` is how a subtree is kept off
+def test_a_misspelled_peer_defaults_is_rejected_not_silently_ignored():
+    # Cost: `peer-defaults.rclone: false` is how a subtree is kept off
     # every non-owning host. Misspell the block and every host in the
     # fleet peer-mounts it instead -- with the SSH trust to match.
     tree = {
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client_defaults": {"rclone": False},
+            "peer_defaults": {"rclone": False},
         }
     }
-    with pytest.raises(ValueError, match="unknown key 'client_defaults'"):
+    with pytest.raises(ValueError, match="unknown key 'peer_defaults'"):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_the_old_clients_key_names_its_replacement():
+    # `clients:`/`client-defaults:` were the old names. Same cost as the
+    # misspelling above -- a silently ignored block re-enables a subtree
+    # its author kept local -- but the fix is a rename, not a
+    # correction, so it gets a message that says so rather than the
+    # generic unknown-key one (difflib scores `clients` nowhere near
+    # `peers`, so that error wouldn't even suggest it).
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "clients": {"h2": {"rclone": False}},
+        }
+    }
+    with pytest.raises(ValueError, match="`clients`, which was renamed to `peers`"):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_the_old_client_defaults_key_names_its_replacement():
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "client-defaults": {"rclone": False},
+        }
+    }
+    with pytest.raises(
+        ValueError, match="`client-defaults`, which was renamed to `peer-defaults`"
+    ):
+        resolve(tree, "h1", ["h1", "h2"])
+
+
+def test_a_legacy_key_is_caught_at_any_depth_not_just_the_top_level():
+    # `peers`/`peer-defaults` are ordinary node keys (config-schema.md
+    # "At any depth"), so a config written against the old schema can
+    # carry the old name on a subdirectory too.
+    tree = {
+        "top": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {"inner": {"client-defaults": {"rclone": False}}},
+        }
+    }
+    with pytest.raises(ValueError, match="'top/inner' sets `client-defaults`"):
         resolve(tree, "h1", ["h1", "h2"])
 
 
@@ -3500,7 +3547,7 @@ def test_a_misspelled_subdirs_is_rejected_not_dropped():
 def test_a_misspelled_samba_key_is_rejected():
     # `name` is the only key a `samba` block still takes, and getting it
     # wrong silently exports the share under its derived path-based name
-    # instead of the one clients were told to mount.
+    # instead of the one SMB clients were told to mount.
     tree = {
         "top": {
             "host": "h1",
@@ -3512,29 +3559,29 @@ def test_a_misspelled_samba_key_is_rejected():
         resolve(tree, "h1", ["h1"])
 
 
-def test_an_unknown_key_inside_a_per_client_override_is_rejected():
+def test_an_unknown_key_inside_a_per_peer_override_is_rejected():
     tree = {
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "clients": {"h2": {"rclone": {"arguments": {"dir-cache-time": "5m"}}}},
+            "peers": {"h2": {"rclone": {"arguments": {"dir-cache-time": "5m"}}}},
         }
     }
     with pytest.raises(
-        ValueError, match=r"unknown `clients\.h2\.rclone` key 'arguments'"
+        ValueError, match=r"unknown `peers\.h2\.rclone` key 'arguments'"
     ):
         resolve(tree, "h1", ["h1", "h2"])
 
 
-def test_an_unknown_key_inside_client_defaults_is_rejected():
+def test_an_unknown_key_inside_peer_defaults_is_rejected():
     tree = {
         "top": {
             "host": "h1",
             "rclone.remote": "r1:/",
-            "client-defaults": {"rclone": False, "extra": 1},
+            "peer-defaults": {"rclone": False, "extra": 1},
         }
     }
-    with pytest.raises(ValueError, match="unknown `client-defaults` key 'extra'"):
+    with pytest.raises(ValueError, match="unknown `peer-defaults` key 'extra'"):
         resolve(tree, "h1", ["h1", "h2"])
 
 
@@ -3563,7 +3610,7 @@ def test_an_unknown_key_error_suggests_the_key_it_is_closest_to():
 
 def test_an_unknown_key_with_no_near_match_still_lists_what_is_allowed():
     tree = {"top": {"host": "h1", "rclone.remote": "r1:/", "zzzzzz": {}}}
-    with pytest.raises(ValueError, match="expected one of: access, client-defaults"):
+    with pytest.raises(ValueError, match="expected one of: access, host, peer-defaults"):
         resolve(tree, "h1", ["h1"])
 
 
@@ -4035,13 +4082,13 @@ def test_an_opted_out_host_stops_peer_mounting_content_for_shares_it_no_longer_e
     assert not any(p["owning_host"] == "h2" for p in off["peer_dependencies"])
 
 
-def test_an_opted_out_host_keeps_its_own_client_mount_of_the_tree():
+def test_an_opted_out_host_keeps_its_own_subtree_mount_of_the_tree():
     # Opting out of *exporting* the tree says nothing about wanting it
-    # locally -- h3's own client mount of `top` is unaffected.
+    # locally -- h3's own subtree mount of `top` is unaffected.
     tree = _samba_opt_out_tree()
     hosts = ["h1", "h2", "h3"]
     off = resolve(tree, "h3", hosts, samba_hosts=["h1", "h2"])
-    assert "top" in {m["local_path"] for m in off["client_mounts"]}
+    assert "top" in {m["local_path"] for m in off["subtree_mounts"]}
     assert ("h1", "top") in {
         (p["owning_host"], p["local_path"]) for p in off["peer_dependencies"]
     }

@@ -53,7 +53,7 @@
   # starts at a named top-level subtree), but an operator can still give
   # `/srv/stortree` its own dedicated filesystem -- and it used to be the
   # normal case, back when the whole tree hung off one shared root a
-  # non-owning host client-mounted whole (`local_path == ""`).
+  # non-owning host peer-mounted whole (`local_path == ""`).
   #
   # The skip matters because a mount
   # still running a unit rendered before --allow-other became

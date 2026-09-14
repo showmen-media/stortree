@@ -2,7 +2,7 @@
 # The fixed mount root on every managed host -- every path in the
 # resolved tree hangs off this one. It lives here, rather than with the
 # service account in roles/stortree_common/defaults/main.yml, because
-# stortree_resolve() below needs it (a client mount of a subtree this
+# stortree_resolve() below needs it (a subtree mount of a subtree this
 # host doesn't own resolves to a peer reference with the owning host's
 # absolute path baked in) and stortree_facts is the one role every play
 # applies -- playbooks/status.yml applies it alone, where another role's
@@ -61,7 +61,7 @@ stortree_all_hosts: "{{ groups['all'] }}"
 # be a choice instead.
 #
 # Narrow this list (in inventory or group_vars) for a host that has no
-# business serving SMB at all -- a host that is only a client of the
+# business serving SMB at all -- a host that is only a peer of the
 # tree, or one kept in the fleet purely to own a subtree others consume.
 # It is a fleet-level list rather than a per-host boolean for the same
 # reason stortree_all_hosts is: resolve() is a pure per-host function

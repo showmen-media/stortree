@@ -69,10 +69,10 @@ def test_the_shipped_example_resolves_for_every_host_in_its_fleet():
         resolved = resolve(tree, host, EXAMPLE_HOSTS)
         assert set(resolved) == {
             "server_subtrees",
-            "client_mounts",
+            "subtree_mounts",
             "samba_shares",
             "peer_dependencies",
-            "client_grants",
+            "subtree_grants",
             "peer_served_by",
         }
         # Samba sharing is universal, so every host exports the one

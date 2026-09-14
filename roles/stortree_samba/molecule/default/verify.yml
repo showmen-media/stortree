@@ -8,7 +8,7 @@
         that:
           - stortree is defined
           - stortree.server_subtrees is defined
-          - stortree.client_mounts is defined
+          - stortree.subtree_mounts is defined
 
     # -- host discovery (spec.md §4) ------------------------------------
     #

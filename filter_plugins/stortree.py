@@ -13,7 +13,7 @@ tests/test_filters.py, which checks it against what the roles actually
 pipe through). The two entry points the rest build on:
 
 - stortree_resolve(tree, hostname, all_hosts) -- everything a given host
-  must do: server subtrees it owns, its own client mount of each
+  must do: server subtrees it owns, its own subtree mount of each
   top-level subtree it doesn't own (peer-sourced from that subtree's
   owning host, not from the subtree's own third-party remote), every
   Samba share in the tree (Samba sharing is universal), and its peer
@@ -154,7 +154,7 @@ def _expand_dotted(obj):
 # discarding the rest -- which is what used to happen, and which turns
 # an ordinary typo into a silent, wrong-but-plausible resolution: an
 # `rclone.remte:` leaves the node a plain directory with no mount, a
-# `client_defaults:` quietly re-enables a subtree its author meant to
+# `peer_defaults:` quietly re-enables a subtree its author meant to
 # keep off every other host (and provisions the SSH trust to go with
 # it), a misspelled `subdirs:` drops a whole subtree, and a misspelled
 # `access.group` drops a grant and leaves the path world-readable.
@@ -168,8 +168,8 @@ _NODE_KEYS = frozenset(
         "requires",
         "subdirs",
         "user-subdirs",
-        "client-defaults",
-        "clients",
+        "peer-defaults",
+        "peers",
     }
 )
 _RCLONE_KEYS = frozenset({"remote", "args"})
@@ -182,16 +182,16 @@ _PERMISSION_CLASSES = frozenset({"owner", "group", "other"})
 # `w` and `x`, and `-` is the conventional filler for a bit not granted.
 _PERMISSION_LEVEL = re.compile(r"^[rwx-]*$")
 _SAMBA_KEYS = frozenset({"name", "hidden"})
-# A client-defaults block, or one entry of `clients`, carries `rclone`
+# A peer-defaults block, or one entry of `peers`, carries `rclone`
 # (either `false` or a `{args: ...}` mapping), `access` (the same
 # {group?, owner?, permissions?} object a node itself takes, replacing
-# the node's own grant for this client's copy -- docs/config-schema.md
-# "Client-side access") and/or `samba` (the same share settings a node
+# the node's own grant for this peer's copy -- docs/config-schema.md
+# "Peer-side access") and/or `samba` (the same share settings a node
 # itself takes, replacing the node's own export on this one host --
 # docs/config-schema.md "Per-host shares", and the only way to export a
 # node on some hosts and not others).
-_CLIENT_BLOCK_KEYS = frozenset({"rclone", "access", "samba"})
-_CLIENT_RCLONE_KEYS = frozenset({"args"})
+_PEER_BLOCK_KEYS = frozenset({"rclone", "access", "samba"})
+_PEER_RCLONE_KEYS = frozenset({"args"})
 
 # "this block didn't set the key at all", as against setting it to
 # something falsy -- `rclone: false` disables a mount, `access:` with
@@ -237,8 +237,45 @@ def _reject_samba_subpath(samba, node_path, block="samba"):
         )
 
 
+# `clients:`/`client-defaults:` were the original names for what is now
+# `peers:`/`peer-defaults:`. The mount those blocks configure was never a
+# client of the subtree's own `rclone.remote` -- it is an sftp hop into
+# the owning host's already-mounted copy (_peer_remote_ref(), spec.md
+# §1), provisioned by `stortree_peer_trust`, so the old name described a
+# client/server relationship the design deliberately doesn't have. It
+# also collided with the one thing "client" does mean here: an SMB
+# client connecting to a share.
+_RENAMED_PEER_KEYS = {
+    "clients": "peers",
+    "client-defaults": "peer-defaults",
+}
+
+
+def _reject_legacy_peer_keys(node, node_path):
+    """`clients:`/`client-defaults:` were renamed to `peers:`/
+    `peer-defaults:`.
+
+    Worth its own message rather than the generic unknown-key error for
+    the same reason `samba.subpath` is: a config that sets them isn't a
+    typo, it's a config written against the old schema, and the fix is a
+    rename rather than a correction. The generic error wouldn't even
+    suggest it -- difflib doesn't score `clients` close enough to
+    `peers` to offer it as a did-you-mean."""
+    for old in _RENAMED_PEER_KEYS:
+        if old in node:
+            new = _RENAMED_PEER_KEYS[old]
+            raise ValueError(
+                f"stortree: {node_path!r} sets `{old}`, which was renamed to "
+                f"`{new}` -- a host that mounts a subtree it doesn't own is a "
+                f"peer of the owning host (an sftp hop into that host's own "
+                f"copy), never a client of the subtree's `rclone.remote`. "
+                f"Rename the key; the block's contents are unchanged. See "
+                f'docs/config-schema.md "Peers"'
+            )
+
+
 def _require_mapping(value, block, node_path):
-    """`subdirs`/`user-subdirs`/`clients` are maps of name -> node. A
+    """`subdirs`/`user-subdirs`/`peers` are maps of name -> node. A
     list there (the shape you get from writing them as a YAML sequence)
     otherwise surfaces as a bare AttributeError from inside the walk,
     with nothing naming the node it came from."""
@@ -330,6 +367,7 @@ def _validate_node(node, node_path):
             f"stortree: {node_path!r} must be a mapping of node settings, got "
             f"{type(node).__name__} -- see docs/config-schema.md"
         )
+    _reject_legacy_peer_keys(node, node_path)
     _reject_unknown_keys(node, _NODE_KEYS, "", node_path)
     _reject_unknown_keys(node.get("rclone"), _RCLONE_KEYS, "rclone", node_path)
     _reject_unknown_keys(node.get("access"), _ACCESS_KEYS, "access", node_path)
@@ -337,26 +375,26 @@ def _validate_node(node, node_path):
     _reject_samba_subpath(node.get("samba"), node_path)
     _reject_unknown_keys(node.get("samba"), _SAMBA_KEYS, "samba", node_path)
 
-    for block in ("subdirs", "user-subdirs", "clients"):
+    for block in ("subdirs", "user-subdirs", "peers"):
         _require_mapping(node.get(block), block, node_path)
 
-    client_blocks = [("client-defaults", node.get("client-defaults"))]
-    client_blocks += [
-        (f"clients.{name}", entry)
-        for name, entry in (node.get("clients") or {}).items()
+    peer_blocks = [("peer-defaults", node.get("peer-defaults"))]
+    peer_blocks += [
+        (f"peers.{name}", entry)
+        for name, entry in (node.get("peers") or {}).items()
     ]
-    for name, entry in client_blocks:
-        _reject_unknown_keys(entry, _CLIENT_BLOCK_KEYS, name, node_path)
+    for name, entry in peer_blocks:
+        _reject_unknown_keys(entry, _PEER_BLOCK_KEYS, name, node_path)
         if isinstance(entry, dict):
             _reject_unknown_keys(
                 entry.get("rclone"),
-                _CLIENT_RCLONE_KEYS,
+                _PEER_RCLONE_KEYS,
                 f"{name}.rclone",
                 node_path,
             )
-            # A client block's `access` is the same object a node's own
+            # A peer block's `access` is the same object a node's own
             # `access` is, held to the same keys -- a typo here drops a
-            # client-side grant exactly as silently as one on the node.
+            # peer-side grant exactly as silently as one on the node.
             _reject_unknown_keys(
                 entry.get("access"),
                 _ACCESS_KEYS,
@@ -364,7 +402,7 @@ def _validate_node(node, node_path):
                 node_path,
             )
             _validate_permissions(entry.get("access"), f"{name}.access", node_path)
-            # Likewise `samba`: a client block's is the same object a
+            # Likewise `samba`: a peer block's is the same object a
             # node's own is, held to the same keys and the same
             # derived-`subpath` rule, so a typo here drops a per-host
             # share exactly as silently as one on the node.
@@ -482,7 +520,7 @@ def _dropped_access(previous):
     """What an explicitly empty `access:` resolves to, written against
     the `previous` grant it replaces -- an ancestor's, where `access`
     inherits down the tree (_walk_tree()), or the node's own, where a
-    client block replaces it for one host (_client_grant()).
+    peer block replaces it for one host (_peer_grant()).
 
     With nothing to replace it is the plain ungranted `{}` this has
     always been. Where it really does drop a grant it is `{reset: True}`
@@ -503,16 +541,16 @@ def _dropped_access(previous):
     return {"reset": True} if previous else {}
 
 
-def _client_grant(node_access, client_access, node_path, hostname):
+def _peer_grant(node_access, peer_access, node_path, hostname):
     """The grant a host actually applies to its own copy of a node: the
     node's own (which every host enforces by default, spec.md §6) with
-    whatever a `client-defaults`/`clients.<host>` block wrote for this
+    whatever a `peer-defaults`/`peers.<host>` block wrote for this
     host merged over it, key by key -- the same rule an ancestor and its
     descendant follow down the tree (_merge_access()).
 
-    So a client block naming an `owner` and nothing else hands that
+    So a peer block naming an `owner` and nothing else hands that
     host's copy to that user and leaves the node's group in place. It
-    used to replace the whole grant, on the reasoning that a client
+    used to replace the whole grant, on the reasoning that a peer
     block describes another host's copy and so states it outright; what
     that meant in practice was that overriding one key silently dropped
     the others, and a grant meant to hold fleet-wide stopped at the one
@@ -527,9 +565,9 @@ def _client_grant(node_access, client_access, node_path, hostname):
     ordinary way to narrow this host's copy of an inherited grant, and
     whether that leaves anyone granted is a question about the merge,
     not about the block."""
-    if client_access is _UNSET:
+    if peer_access is _UNSET:
         return node_access
-    own = _access_mapping(client_access)
+    own = _access_mapping(peer_access)
     if not own:
         return _dropped_access(node_access)
     merged = _merge_access(_access_raw(node_access), own)
@@ -537,8 +575,8 @@ def _client_grant(node_access, client_access, node_path, hostname):
     return _normalize_access(merged) or _dropped_access(node_access)
 
 
-# A share name is an smb.conf section header and the name a client
-# mounts (`//host/<name>`), neither of which can carry a path separator
+# A share name is an smb.conf section header and the name an SMB
+# client mounts (`//host/<name>`), neither of which can carry a path separator
 # -- so a name derived from the node path folds everything outside this
 # alphabet to `_` ("tree/home" -> "tree_home"), and an operator-set
 # `samba.name` is held to the same alphabet rather than sanitized behind
@@ -566,7 +604,7 @@ def _share_name(raw, node_path):
         raise ValueError(
             f"stortree: {node_path!r}'s `samba.name` {raw!r} may contain only "
             f"letters, digits, `-` and `_` -- it's an smb.conf section header "
-            f"and the name clients mount. See docs/config-schema.md "
+            f"and the name SMB clients mount. See docs/config-schema.md "
             f"\"Share names\""
         )
     if raw.lower() in _RESERVED_SHARE_NAMES:
@@ -589,7 +627,7 @@ def _normalize_samba(raw, node_path, per_user_parent):
     derived `subpath` below. Both are passed in rather than read off a
     raw config node, because the value can come from either of two
     places now: the node's own `samba:`, or a `samba:` inside one of its
-    `client-defaults`/`clients.<host>` blocks (_client_samba()). The
+    `peer-defaults`/`peers.<host>` blocks (_peer_samba()). The
     node's shape decides the subpath identically either way -- a
     per-host share of a per-user node is still per-user.
 
@@ -838,7 +876,7 @@ def _walk_tree(tree):
     `user-subdirs:` key, same as always). Each top-level entry is shaped
     exactly like any other node (its own `host`,
     `rclone`, nested `subdirs`/`user-subdirs`, and optionally its own
-    `client-defaults`/`clients` governing how hosts that don't own it
+    `peer-defaults`/`peers` governing how hosts that don't own it
     peer-mount it). There's no single implicit tree root any more --
     each top-level entry stands on its own, so one being nested doesn't
     make sibling entries dependent on it (this is what keeps e.g. a
@@ -846,7 +884,7 @@ def _walk_tree(tree):
     top-level subtree's mount up first, unlike when everything hung off
     one shared root).
 
-    Returns (roots, nodes, client_chains, children, own_client_blocks). `roots` is the
+    Returns (roots, nodes, peer_chains, children, own_peer_blocks). `roots` is the
     path of each top-level subtree, in config order (each is also an
     ordinary entry in `nodes`). `nodes` is a flat list of
     every node in the whole forest, top-level entries included (unlike
@@ -868,9 +906,9 @@ def _walk_tree(tree):
     inherited grant -- the two escape hatches merging needs, since with
     everything else merging there would otherwise be no way down.
 
-    A `client-defaults`/`clients` block's `access` then merges over the
-    result the same way, for the one host it describes (_client_grant(),
-    _client_policy()) -- so the two axes compose rather than one
+    A `peer-defaults`/`peers` block's `access` then merges over the
+    result the same way, for the one host it describes (_peer_grant(),
+    _peer_policy()) -- so the two axes compose rather than one
     cancelling the other, and a block naming a host-local service
     account as `owner` keeps the fleet-wide group the node granted
     instead of dropping it.
@@ -898,13 +936,13 @@ def _walk_tree(tree):
     (the `%U` placeholder, then its own name) while a `subdirs` child
     sits one, so "how many `/` deeper" doesn't tell them apart.
 
-    `client_chains` is {path: [client block, ...]} -- for every node,
-    the `client-defaults`/`clients` blocks found on it and on each of
+    `peer_chains` is {path: [peer block, ...]} -- for every node,
+    the `peer-defaults`/`peers` blocks found on it and on each of
     its ancestors, ordered shallowest-first, which is what
-    _client_policy() below resolves into one host's effective policy for
+    _peer_policy() below resolves into one host's effective policy for
     that node. A chain rather than a single block because
-    `client-defaults`/`clients` apply at any depth, not only on the
-    top-level subtree (docs/config-schema.md "Per-client mount
+    `peer-defaults`/`peers` apply at any depth, not only on the
+    top-level subtree (docs/config-schema.md "Per-peer mount
     opt-out"): a nested node's own block refines whatever its ancestors
     set for the same host, and a node that sets none of its own just
     inherits its nearest ancestor's policy unchanged -- which is exactly
@@ -913,11 +951,11 @@ def _walk_tree(tree):
     a block contribute an entry, so the common chain is short (usually
     one, often none).
 
-    `own_client_blocks` is {path: raw node} for the nodes that carry a
+    `own_peer_blocks` is {path: raw node} for the nodes that carry a
     block of their own -- the chain's last element, but identified
     rather than guessed at. `samba` is read from this and not from the
     chain, because unlike `rclone`/`access` it does not inherit
-    (_client_samba()). Kept beside the resolved nodes rather than on
+    (_peer_samba()). Kept beside the resolved nodes rather than on
     them: a node dict is returned from resolve() and serialized into
     Ansible facts, and raw config has no business travelling there.
 
@@ -928,9 +966,9 @@ def _walk_tree(tree):
     """
     roots = []
     nodes = []
-    client_chains = {}
+    peer_chains = {}
     children = {}
-    own_client_blocks = {}
+    own_peer_blocks = {}
 
     def _visit(
         node,
@@ -938,7 +976,7 @@ def _walk_tree(tree):
         host,
         per_user,
         root_path,
-        client_chain,
+        peer_chain,
         parent_path,
         inherited_access,
     ):
@@ -950,10 +988,10 @@ def _walk_tree(tree):
         children[path] = []
         if parent_path is not None:
             children[parent_path].append(path)
-        if "client-defaults" in node or "clients" in node:
-            client_chain = client_chain + [node]
-            own_client_blocks[path] = node
-        client_chains[path] = client_chain
+        if "peer-defaults" in node or "peers" in node:
+            peer_chain = peer_chain + [node]
+            own_peer_blocks[path] = node
+        peer_chains[path] = peer_chain
         h = node.get("host", host)
         r = (node.get("rclone") or {}).get("remote")
         args = (node.get("rclone") or {}).get("args") or {}
@@ -980,7 +1018,7 @@ def _walk_tree(tree):
                 # Whether this node's *own* shape is per-user (it has a
                 # `user-subdirs` key), as against `per_user` above,
                 # which says it *sits under* one. Kept by name so a
-                # client block's `samba:` can derive the same `%U`
+                # peer block's `samba:` can derive the same `%U`
                 # subpath later, without the raw config node in hand.
                 "per_user_parent": "user-subdirs" in node,
                 "root_path": root_path,
@@ -994,7 +1032,7 @@ def _walk_tree(tree):
                 h,
                 per_user,
                 root_path,
-                client_chain,
+                peer_chain,
                 path,
                 raw_access,
             )
@@ -1005,7 +1043,7 @@ def _walk_tree(tree):
                 h,
                 True,
                 root_path,
-                client_chain,
+                peer_chain,
                 path,
                 raw_access,
             )
@@ -1014,7 +1052,7 @@ def _walk_tree(tree):
         _visit(root_node or {}, [name], None, False, name, [], None, {})
         roots.append(name)
 
-    return roots, nodes, client_chains, children, own_client_blocks
+    return roots, nodes, peer_chains, children, own_peer_blocks
 
 
 def _validate_requires(nodes):
@@ -1155,7 +1193,7 @@ def _transport_covers(inner, outer):
     exact rather than a guess about what some backend means by a path.
 
     Equal `args` is the last condition and not a formality. Layer 1 is
-    the only layer that caches, so a node whose client policy asks for a
+    the only layer that caches, so a node whose peer policy asks for a
     different `vfs-cache-mode`, `cache-dir` or `bwlimit` than the mount
     above it is asking for a second mount, and gets one. Only where
     nothing distinguishes the two is there nothing to lose by dropping
@@ -1235,9 +1273,9 @@ def _dedupe(items, key):
 
 
 def _rclone_setting(container):
-    """The raw `rclone` value inside a client-defaults/clients-style
+    """The raw `rclone` value inside a peer-defaults/peers-style
     block (`container` -- e.g. a top-level subtree's own
-    `client-defaults`, or one entry of its `clients` map): `False`
+    `peer-defaults`, or one entry of its `peers` map): `False`
     (mount disabled), a `{args?}` dict (mount enabled, optionally with
     these rclone args), or `_UNSET` if `container` doesn't set `rclone`
     at all. Dot-expansion already turns the `rclone.args: {...}`
@@ -1253,22 +1291,22 @@ def _rclone_args(setting):
     return dict(setting.get("args") or {}) if isinstance(setting, dict) else {}
 
 
-def _client_policy(chain, hostname):
+def _peer_policy(chain, hostname):
     """(enabled, args, access) describing how `hostname` -- when it
     doesn't own this node -- gets its own copy of it, resolved from
-    `chain`: every `client-defaults`/`clients` block on the node and its
-    ancestors, shallowest-first (_walk_tree()'s `client_chains`).
+    `chain`: every `peer-defaults`/`peers` block on the node and its
+    ancestors, shallowest-first (_walk_tree()'s `peer_chains`).
 
     Two axes of precedence, and they compose the same way at every level
-    (docs/config-schema.md "Per-client mount opt-out"):
+    (docs/config-schema.md "Per-peer mount opt-out"):
 
-    - Within one node, an explicit `clients.<hostname>` beats that same
-      node's `client-defaults`.
+    - Within one node, an explicit `peers.<hostname>` beats that same
+      node's `peer-defaults`.
     - Across nodes, a nearer (deeper) node beats a more distant ancestor
       -- which is what lets a subdirectory refine, or reverse, whatever
       its top-level subtree set for the same host. A node with no block
       of its own contributes nothing and simply inherits, so a tree that
-      only ever writes `client-defaults`/`clients` on its top-level
+      only ever writes `peer-defaults`/`peers` on its top-level
       subtrees resolves exactly as it did when that was the only level
       read at all.
 
@@ -1277,21 +1315,21 @@ def _client_policy(chain, hostname):
     disabled (only explicitly-truthy entries mount it), a deny-list
     where it isn't (everyone mounts it but the explicitly disabled).
     "Explicitly truthy" includes an args-bearing `rclone: {args: {...}}`
-    with no boolean in sight, at any level: writing client-side mount
-    args for a node is taken to mean clients are meant to have it, the
+    with no boolean in sight, at any level: writing peer-side mount
+    args for a node is taken to mean peers are meant to have it, the
     same reading that makes the one-node allow-list idiom
-    (`client-defaults.rclone: false` plus `clients.<h>.rclone.args`)
+    (`peer-defaults.rclone: false` plus `peers.<h>.rclone.args`)
     work at all.
 
     `args` merges the other way round -- every level contributes, and
     the ones that win conflicts are the nearest and the most specific:
-    client-defaults first, then `clients.<hostname>`, shallowest node to
+    peer-defaults first, then `peers.<hostname>`, shallowest node to
     deepest.
 
     `access` accumulates like `args`, one key at a time (_merge_access())
     rather than one block at a time: every block in the chain
     contributes, nearest and most specific winning each key it sets, and
-    the result then merges over the node's own grant (_client_grant()).
+    the result then merges over the node's own grant (_peer_grant()).
     An empty `access:` anywhere in the chain drops what the blocks above
     it built, the same statement it makes on a node.
 
@@ -1302,15 +1340,15 @@ def _client_policy(chain, hostname):
     args = {}
     access = _UNSET
     for node in chain:
-        defaults = node.get("client-defaults")
-        entry = (node.get("clients") or {}).get(hostname)
+        defaults = node.get("peer-defaults")
+        entry = (node.get("peers") or {}).get(hostname)
         defaults_setting = _rclone_setting(defaults)
-        client_setting = _rclone_setting(entry)
-        effective = client_setting if client_setting is not _UNSET else defaults_setting
+        peer_setting = _rclone_setting(entry)
+        effective = peer_setting if peer_setting is not _UNSET else defaults_setting
         if effective is not _UNSET:
             enabled = effective is not False
         _deep_merge(args, _rclone_args(defaults_setting))
-        _deep_merge(args, _rclone_args(client_setting))
+        _deep_merge(args, _rclone_args(peer_setting))
         for container in (defaults, entry):
             if isinstance(container, dict) and "access" in container:
                 block = _access_mapping(container["access"])
@@ -1322,15 +1360,15 @@ def _client_policy(chain, hostname):
     return enabled, args, access
 
 
-def _client_samba(own, hostname):
-    """The raw `samba` a client block written *on this node* sets for
+def _peer_samba(own, hostname):
+    """The raw `samba` a peer block written *on this node* sets for
     `hostname`, or `_UNSET` where none does. `own` is the node's own raw
-    config where it carries a `client-defaults`/`clients` block at all
-    (_TreeIndex.own_client_blocks), else None.
+    config where it carries a `peer-defaults`/`peers` block at all
+    (_TreeIndex.own_peer_blocks), else None.
 
-    Within the node, `clients.<hostname>` beats `client-defaults` and
+    Within the node, `peers.<hostname>` beats `peer-defaults` and
     nothing merges -- the same two rules `access` follows in
-    _client_policy(), and for the same reason: a share is a single
+    _peer_policy(), and for the same reason: a share is a single
     object an operator reads off one place in the config, and half a
     share assembled from two blocks would be no more readable than half
     a grant.
@@ -1339,7 +1377,7 @@ def _client_samba(own, hostname):
     does not inherit -- a node's own `samba:` never has. It marks the
     one node it is written on for export and says nothing about that
     node's descendants. Reading it off the inherited chain
-    _client_policy() walks would export *every* descendant of a node
+    _peer_policy() walks would export *every* descendant of a node
     that carried one, all under that one name: a share-name collision by
     construction, and any per-user descendant silently shared along with
     it."""
@@ -1347,8 +1385,8 @@ def _client_samba(own, hostname):
         return _UNSET
     found = _UNSET
     for container in (
-        own.get("client-defaults"),
-        (own.get("clients") or {}).get(hostname),
+        own.get("peer-defaults"),
+        (own.get("peers") or {}).get(hostname),
     ):
         if isinstance(container, dict) and "samba" in container:
             found = container["samba"]
@@ -1357,7 +1395,7 @@ def _client_samba(own, hostname):
 
 _TreeIndex = collections.namedtuple(
     "_TreeIndex",
-    "roots nodes nodes_by_path children client_chains own_client_blocks "
+    "roots nodes nodes_by_path children peer_chains own_peer_blocks "
     "requires_by_path",
 )
 
@@ -1379,7 +1417,7 @@ def _index_tree(tree):
     (_host_samba_nodes()). What stays tree-wide is the half that is
     genuinely host-independent -- a name collision between two nodes'
     own `samba:` blocks, which no host could render."""
-    roots, nodes, client_chains, children, own_client_blocks = _walk_tree(
+    roots, nodes, peer_chains, children, own_peer_blocks = _walk_tree(
         _expand_dotted(tree)
     )
     _validate_requires(nodes)
@@ -1391,8 +1429,8 @@ def _index_tree(tree):
         nodes=nodes,
         nodes_by_path={n["path"]: n for n in nodes},
         children=children,
-        client_chains=client_chains,
-        own_client_blocks=own_client_blocks,
+        peer_chains=peer_chains,
+        own_peer_blocks=own_peer_blocks,
         requires_by_path={n["path"]: n["requires"] for n in nodes},
     )
 
@@ -1404,7 +1442,7 @@ def _host_samba_nodes(index, hostname):
     A node's own `samba:` applies on every host -- that is what "Samba
     sharing is universal" has always meant and still means for every
     config that writes nothing else. A `samba:` inside one of the node's
-    `client-defaults`/`clients.<host>` blocks replaces it for that one
+    `peer-defaults`/`peers.<host>` blocks replaces it for that one
     host: on a node with no `samba:` of its own it *adds* a share there
     and nowhere else, and on one that has a `samba:` it renames, hides,
     or (with `samba: false`) withdraws that host's copy.
@@ -1418,9 +1456,9 @@ def _host_samba_nodes(index, hostname):
     node everywhere leaves only bad options: name a principal most hosts
     cannot resolve, or export a share nobody can connect to.
 
-    The owning host is never read out of a client block, the same rule
+    The owning host is never read out of a peer block, the same rule
     `rclone` and `access` already follow (docs/config-schema.md
-    "Per-client mount opt-out", "Client-side access"): those blocks
+    "Per-peer mount opt-out", "Peer-side access"): those blocks
     describe a host holding a *copy* of the node, and the owner holds
     the original."""
     out = []
@@ -1428,7 +1466,7 @@ def _host_samba_nodes(index, hostname):
         raw = (
             _UNSET
             if n["host"] == hostname
-            else _client_samba(index.own_client_blocks.get(n["path"]), hostname)
+            else _peer_samba(index.own_peer_blocks.get(n["path"]), hostname)
         )
         samba = (
             n["samba"]
@@ -1441,11 +1479,11 @@ def _host_samba_nodes(index, hostname):
     return out
 
 
-def _client_mount_targets(index, root_path, host):
+def _subtree_mount_targets(index, root_path, host):
     """Every node under top-level subtree `root_path` that `host`
-    client-mounts in its own right, as (node, args, access) --
+    peer-mounts in its own right, as (node, args, access) --
     normally just the subtree itself, exactly as when `roots` were
-    the only level a client policy could be written at.
+    the only level a peer policy could be written at.
 
     The subtree's own node comes first and, when its policy is
     enabled, it is the only one: one peer-sftp mount of the owning
@@ -1459,15 +1497,15 @@ def _client_mount_targets(index, root_path, host):
     The descent is what a disabled ancestor makes meaningful: with
     the subtree itself opted out for this host, each of its children
     is asked the same question independently, so a single node deep
-    in an otherwise host-local subtree can be handed to a client on
-    its own (`client-defaults.rclone: false` at the top,
-    `clients.<host>.rclone` on just that node -- the allow-list
+    in an otherwise host-local subtree can be handed to a peer on
+    its own (`peer-defaults.rclone: false` at the top,
+    `peers.<host>.rclone` on just that node -- the allow-list
     idiom, one level down). Two nodes are never descended into:
     one this host already owns (it serves that subtree itself,
     rather than mounting anyone's copy of it -- same rule the
     top-level loop always applied) and a `user-subdirs` node,
     whose path is still `%U`-templated and fans out into one mount
-    per granted user rather than the single mount a client_mounts
+    per granted user rather than the single mount a subtree_mounts
     entry describes; a per-user node reaches a non-owning host
     through the Samba peer-dependency path instead, which resolves
     that fan-out (plan_mounts()).
@@ -1479,7 +1517,7 @@ def _client_mount_targets(index, root_path, host):
         node = index.nodes_by_path[path]
         if node["host"] == host or node["per_user"]:
             continue
-        enabled, args, access = _client_policy(index.client_chains[path], host)
+        enabled, args, access = _peer_policy(index.peer_chains[path], host)
         if enabled:
             targets.append((node, args, access))
             continue
@@ -1492,10 +1530,10 @@ def _samba_share_entries(index, hostname):
 
     Universal by default and per-host only where a config says so
     (_host_samba_nodes()): with nothing but node-level `samba:` blocks
-    written, every host resolves the same list, a client reaches the
+    written, every host resolves the same list, a peer reaches the
     same share whichever host it connects to, and the stanza comes out
     identical everywhere -- which is what this always did. A `samba:` in
-    a client block is what makes the list, and the stanza, differ."""
+    a peer block is what makes the list, and the stanza, differ."""
     shares = []
     for s, samba, descendants in _host_samba_nodes(index, hostname):
 
@@ -1506,8 +1544,8 @@ def _samba_share_entries(index, hostname):
         #
         # The grant taken is the one *this host* actually enforces on its
         # own copy of the descendant: the node's own where this host owns
-        # it (a client block never describes the owner), and otherwise
-        # whatever `client-defaults`/`clients.<host>` set for it -- the
+        # it (a peer block never describes the owner), and otherwise
+        # whatever `peer-defaults`/`peers.<host>` set for it -- the
         # same resolution _samba_peer_dependencies() below applies to the
         # mount itself, so `valid users` and the filesystem underneath it
         # can't disagree.
@@ -1524,11 +1562,11 @@ def _samba_share_entries(index, hostname):
             if d["host"] == hostname:
                 a = d.get("access")
             else:
-                _enabled, _args, client_access = _client_policy(
-                    index.client_chains[d["path"]], hostname
+                _enabled, _args, peer_access = _peer_policy(
+                    index.peer_chains[d["path"]], hostname
                 )
-                a = _client_grant(
-                    d.get("access"), client_access, d["path"], hostname
+                a = _peer_grant(
+                    d.get("access"), peer_access, d["path"], hostname
                 )
             # A grant that names nobody says nothing about `valid users`
             # -- and that includes an explicit drop, whose `reset` key is
@@ -1581,12 +1619,12 @@ def _samba_peer_dependencies(index, hostname):
             if d["host"] == hostname or not _has_own_content(d, index.nodes):
                 continue
             # The descendant's own chain, not just its top-level
-            # subtree's: a `client-defaults`/`clients` block written
+            # subtree's: a `peer-defaults`/`peers` block written
             # on an intermediate node -- or on this descendant
             # itself -- governs this host's copy of exactly this
-            # path, without touching its siblings (_client_policy()).
-            enabled, args, access = _client_policy(
-                index.client_chains[d["path"]], hostname
+            # path, without touching its siblings (_peer_policy()).
+            enabled, args, access = _peer_policy(
+                index.peer_chains[d["path"]], hostname
             )
             if not enabled:
                 continue
@@ -1597,13 +1635,13 @@ def _samba_peer_dependencies(index, hostname):
                     "remote_path": d["path"],
                     "samba_node": s["path"],
                     "per_user": d["per_user"],
-                    # A client-side `access` merges over the node's
-                    # own for this host's copy only (_client_grant())
+                    # A peer-side `access` merges over the node's
+                    # own for this host's copy only (_peer_grant())
                     # -- the enforcement this host actually applies to
                     # it: the presentation's `-u`/`-g`/`-p`, and the
                     # directory's own ownership and mode where it
                     # isn't a mount.
-                    "access": _client_grant(
+                    "access": _peer_grant(
                         d["access"], access, d["path"], hostname
                     ),
                     "args": args,
@@ -1616,7 +1654,7 @@ def _samba_peer_dependencies(index, hostname):
     return peers
 
 
-def _client_grant_entries(index, hostname, mounted_paths):
+def _subtree_grant_entries(index, hostname, mounted_paths):
     """Every node whose own `access` this host has to apply to content it
     mounts but doesn't own.
 
@@ -1637,24 +1675,24 @@ def _client_grant_entries(index, hostname, mounted_paths):
 
     Only nodes *inside* something this host actually mounts
     (`mounted_paths`): a grant is applied by presenting a path, and there
-    is nothing to present where a client policy opted this host out of
-    the subtree entirely (docs/config-schema.md "Per-client mount
+    is nothing to present where a peer policy opted this host out of
+    the subtree entirely (docs/config-schema.md "Per-peer mount
     opt-out"). A node this host owns is already its own server_subtrees
     entry, and a `user-subdirs` node is still %U-templated and fans out
     through _expand_per_user() rather than resolving to one path here.
 
-    A `clients.<host>.access` block merges over the node's own grant for
-    the host it names (_client_grant()) -- read here from the node's own
+    A `peers.<host>.access` block merges over the node's own grant for
+    the host it names (_peer_grant()) -- read here from the node's own
     chain, so it applies on a node that has no other reason to be
     planned. A node that does
-    (a client block with `samba:`, say) reaches the plan through
-    _samba_peer_dependencies()/_client_mount_entries() carrying the same
+    (a peer block with `samba:`, say) reaches the plan through
+    _samba_peer_dependencies()/_subtree_mount_entries() carrying the same
     grant already, and plan_mounts() keeps that entry rather than this
     one.
 
     The chain's `rclone` half is deliberately not read. `rclone: false`
     on a node underneath an enabled ancestor carves no hole out of that
-    ancestor's mount (_client_mount_targets()) -- the path is presented
+    ancestor's mount (_subtree_mount_targets()) -- the path is presented
     on this host either way, and a presented path with its grant dropped
     is the thing this function exists to prevent. What that opt-out does
     govern is the ancestor, and an ancestor this host doesn't mount puts
@@ -1665,18 +1703,18 @@ def _client_grant_entries(index, hostname, mounted_paths):
             continue
         if not any(n["path"].startswith(m + "/") for m in mounted_paths):
             continue
-        _enabled, _args, access = _client_policy(
-            index.client_chains[n["path"]], hostname
+        _enabled, _args, access = _peer_policy(
+            index.peer_chains[n["path"]], hostname
         )
-        grant = _client_grant(n["access"], access, n["path"], hostname)
+        grant = _peer_grant(n["access"], access, n["path"], hostname)
         if grant:
             grants.append({"local_path": n["path"], "access": grant})
     return grants
 
 
-def _client_mount_entries(index, hostname, samba_sourced_paths, stortree_root):
-    """`hostname`'s own client mount of each top-level subtree it doesn't
-    own, as (client_mounts, peer_dependencies).
+def _subtree_mount_entries(index, hostname, samba_sourced_paths, stortree_root):
+    """`hostname`'s own subtree mount of each top-level subtree it doesn't
+    own, as (subtree_mounts, peer_dependencies).
 
     A non-owning host reaches a subtree by peer-sftp'ing the host that
     actually owns it, rather than holding direct credentials to that
@@ -1693,38 +1731,38 @@ def _client_mount_entries(index, hostname, samba_sourced_paths, stortree_root):
     non-owning host with an empty local directory where the subtree
     should be -- and it was inconsistent with
     _samba_peer_dependencies(), which has always peered a descendant
-    regardless. `client-defaults`/`clients.<hostname>.rclone`
-    (docs/config-schema.md "Per-client mount opt-out") can suppress this
+    regardless. `peer-defaults`/`peers.<hostname>.rclone`
+    (docs/config-schema.md "Per-peer mount opt-out") can suppress this
     entirely for a subtree that has no business being visible outside
     its own owning host.
 
     `samba_sourced_paths` is what _samba_peer_dependencies() already
     claimed, and those paths are skipped here: it's the same mount, of
     the same path, from the same owning host, resolved through the same
-    client policy -- and planning it twice is a hard error downstream
+    peer policy -- and planning it twice is a hard error downstream
     (plan_mounts() sees two entries claiming one systemd unit slug).
-    Reachable without any nested client block at all, by a top-level
+    Reachable without any nested peer block at all, by a top-level
     subtree that carries `samba:` itself and has no children to delegate
     its content to (_has_own_content()); the descent in
-    _client_mount_targets() just widens the ways in. The Samba entry is
+    _subtree_mount_targets() just widens the ways in. The Samba entry is
     the one to keep: identical args, and it carries the node's own
-    `access` grant rather than only what a client block granted."""
-    client_mounts = []
+    `access` grant rather than only what a peer block granted."""
+    subtree_mounts = []
     peers = []
     for root_path in index.roots:
-        for node, args, access in _client_mount_targets(index, root_path, hostname):
+        for node, args, access in _subtree_mount_targets(index, root_path, hostname):
             path = node["path"]
             if path in samba_sourced_paths:
                 continue
-            # The node's own grant unless a client block hands this host
+            # The node's own grant unless a peer block hands this host
             # a different one -- spec.md §6's rule, and the same fallback
             # _samba_peer_dependencies() has always applied to a
             # descendant. This used to be `{}`, on the reasoning that a
             # peer mount of the owner's copy reports whatever the owner
-            # applied; it doesn't (_client_grant_entries()), so what a
+            # applied; it doesn't (_subtree_grant_entries()), so what a
             # non-owning host showed was its own uniform default and the
             # grant stopped at the host that happened to own the node.
-            access = _client_grant(node["access"], access, path, hostname)
+            access = _peer_grant(node["access"], access, path, hostname)
             peers.append(
                 {
                     "owning_host": node["host"],
@@ -1737,21 +1775,21 @@ def _client_mount_entries(index, hostname, samba_sourced_paths, stortree_root):
                     "requires": index.requires_by_path.get(path, []),
                 }
             )
-            client_remote = _peer_remote_ref(node["host"], path, path, stortree_root)
+            peer_remote = _peer_remote_ref(node["host"], path, path, stortree_root)
             # A node's `requires` applies wherever it's mounted, its
-            # non-owning clients included -- which is the case that
-            # motivated the key at all: the cache-dir a *client* points
-            # into another subtree's mount belongs to that client's own
-            # mount of this subtree, and only the client resolves both
+            # non-owning peers included -- which is the case that
+            # motivated the key at all: the cache-dir a *peer* points
+            # into another subtree's mount belongs to that peer's own
+            # mount of this subtree, and only the peer resolves both
             # ends of it.
-            client_mounts.append(
+            subtree_mounts.append(
                 {
                     "local_path": path,
-                    "remote": client_remote,
+                    "remote": peer_remote,
                     "args": args,
                     # Whatever this host's own copy is to be presented
-                    # as (docs/config-schema.md "Client-side access"):
-                    # the client policy's grant where there is one, the
+                    # as (docs/config-schema.md "Peer-side access"):
+                    # the peer policy's grant where there is one, the
                     # node's own otherwise. Applied by the presentation
                     # over this mount, not by the mount -- layer 1 is
                     # uniform and ungoverned by design (spec.md §6).
@@ -1759,17 +1797,17 @@ def _client_mount_entries(index, hostname, samba_sourced_paths, stortree_root):
                     "requires": index.requires_by_path.get(path, []),
                 }
             )
-    return client_mounts, peers
+    return subtree_mounts, peers
 
 
 def _peer_served_by_entries(index, hostname, all_hosts, samba_hosts=None):
     """What every *other* host sources from this one -- the mirror of
-    _client_mount_entries() and _samba_peer_dependencies(), asked from
+    _subtree_mount_entries() and _samba_peer_dependencies(), asked from
     the other side.
 
-    Whatever `other` would client-mount or peer-source from this host is
+    Whatever `other` would peer-mount or peer-source from this host is
     what this host has to serve it, resolved through the same
-    _client_mount_targets()/_client_policy() this host used for its own
+    _subtree_mount_targets()/_peer_policy() this host used for its own
     copy, so a nested opt-out (or opt-in) is honored identically at both
     ends and the sftp trust provisioned by stortree_peer_trust matches
     the mounts that actually get made.
@@ -1777,7 +1815,7 @@ def _peer_served_by_entries(index, hostname, all_hosts, samba_hosts=None):
     `samba_hosts` (see resolve()) applies to the samba half only, and to
     `other` rather than to this host: an `other` that exports no shares
     resolves no samba peer dependencies, so serving it would provision
-    trust for a mount it will never make. Its own client mounts are
+    trust for a mount it will never make. Its own subtree mounts are
     unaffected -- opting out of *exporting* the tree says nothing about
     wanting it locally."""
     served = []
@@ -1786,7 +1824,7 @@ def _peer_served_by_entries(index, hostname, all_hosts, samba_hosts=None):
             continue
         other_serves_samba = samba_hosts is None or other in samba_hosts
         for root_path in index.roots:
-            for node, _args, _access in _client_mount_targets(index, root_path, other):
+            for node, _args, _access in _subtree_mount_targets(index, root_path, other):
                 if node["host"] == hostname and node["remote"]:
                     served.append(
                         {
@@ -1801,8 +1839,8 @@ def _peer_served_by_entries(index, hostname, all_hosts, samba_hosts=None):
         for s, _samba, descendants in _host_samba_nodes(index, other):
             for d in descendants:
                 if d["host"] == hostname and _has_own_content(d, index.nodes):
-                    enabled, _args, _access = _client_policy(
-                        index.client_chains[d["path"]], other
+                    enabled, _args, _access = _peer_policy(
+                        index.peer_chains[d["path"]], other
                     )
                     if enabled:
                         served.append(
@@ -1837,7 +1875,7 @@ def resolve(
 
     `stortree_root` is the fleet's mount root (the role variable of the
     same name). It's needed here, rather than only where mounts are
-    rendered, because a client mount of a subtree this host doesn't own
+    rendered, because a subtree mount of a subtree this host doesn't own
     resolves to a peer `remote:path` reference with the owning host's
     absolute path already baked into it (_peer_remote_ref()).
 
@@ -1855,7 +1893,7 @@ def resolve(
     the role would leave those mounts -- an rclone process and a VFS
     cache per peer-sourced path -- running to back shares the host no
     longer exports, which is precisely the cost the opt-out exists to
-    avoid. Its own client mounts (_client_mount_entries()) are
+    avoid. Its own subtree mounts (_subtree_mount_entries()) are
     deliberately untouched: those are what the host mounts *for itself*,
     and wanting the tree locally is independent of re-exporting it.
 
@@ -1869,7 +1907,7 @@ def resolve(
 
     serves_samba = samba_hosts is None or hostname in samba_hosts
     samba_peers = _samba_peer_dependencies(index, hostname) if serves_samba else []
-    client_mounts, client_peers = _client_mount_entries(
+    subtree_mounts, subtree_peers = _subtree_mount_entries(
         index,
         hostname,
         {p["local_path"] for p in samba_peers},
@@ -1877,19 +1915,19 @@ def resolve(
     )
 
     peer_dependencies = _dedupe(
-        samba_peers + client_peers,
+        samba_peers + subtree_peers,
         lambda p: (p["owning_host"], p["local_path"]),
     )
 
     return {
         "server_subtrees": [n for n in index.nodes if n["host"] == hostname],
-        "client_mounts": client_mounts,
+        "subtree_mounts": subtree_mounts,
         "samba_shares": _samba_share_entries(index, hostname) if serves_samba else [],
         "peer_dependencies": peer_dependencies,
-        "client_grants": _client_grant_entries(
+        "subtree_grants": _subtree_grant_entries(
             index,
             hostname,
-            [m["local_path"] for m in client_mounts if m["remote"]]
+            [m["local_path"] for m in subtree_mounts if m["remote"]]
             + [p["local_path"] for p in peer_dependencies],
         ),
         "peer_served_by": _peer_served_by_entries(
@@ -2012,7 +2050,7 @@ def plan_remote_sections(
     host exports every share in the tree) shipped every host in the
     fleet the credentials for every remote referenced anywhere under a
     share, including nodes it doesn't own, doesn't peer, and had been
-    explicitly opted out of by `client-defaults.rclone: false`. Nothing
+    explicitly opted out of by `peer-defaults.rclone: false`. Nothing
     about that was visible from either derivation alone. The %U fan-out
     was duplicated the same way, a second time, with the same failure
     mode available to it -- plan_mounts() and this function had to agree
@@ -2126,7 +2164,7 @@ def _slug(path):
     would. Every resolved path has at least one segment -- a top-level
     subtree's own name (_walk_tree()) -- so there is no empty-path case
     to reserve a name for; back when one shared tree root existed, that
-    root's own client mount resolved to `local_path == ""` and mapped to
+    root's own subtree mount resolved to `local_path == ""` and mapped to
     a reserved "root" slug, which nothing can produce now. Also exposed
     directly as the `stortree_slug` filter: a per-user bind-mount unit's
     own template needs to compute its `symlink_target`'s unit slug from
@@ -2276,10 +2314,10 @@ def needed_groups(resolved):
     `access.group` too, same as a per-user one. Covers all three scopes
     a resolved `access` can turn up in: `server_subtrees` (this host's
     own nodes), `peer_dependencies` (a samba descendant sourced from a
-    peer) and `client_mounts` (this host's own copy of a subtree it
-    doesn't own -- which carries a grant only when a `client-defaults`/
-    `clients.<hostname>` block gave it one, docs/config-schema.md
-    "Client-side access") and `client_grants` (a node *inside* something
+    peer) and `subtree_mounts` (this host's own copy of a subtree it
+    doesn't own -- which carries a grant only when a `peer-defaults`/
+    `peers.<hostname>` block gave it one, docs/config-schema.md
+    "Peer-side access") and `subtree_grants` (a node *inside* something
     this host mounts, whose grant it applies with a presentation of its
     own -- the scope that made this list four rather than three, and the
     one most likely to name a group nothing else on the host does, since
@@ -2293,8 +2331,8 @@ def needed_groups(resolved):
     for entry in (
         resolved.get("server_subtrees", [])
         + resolved.get("peer_dependencies", [])
-        + resolved.get("client_mounts", [])
-        + resolved.get("client_grants", [])
+        + resolved.get("subtree_mounts", [])
+        + resolved.get("subtree_grants", [])
     ):
         g = (entry.get("access") or {}).get("group")
         if g:
@@ -2307,7 +2345,7 @@ def needed_users(resolved, group_members=None):
     `access.owner` grant -- mirrors needed_groups() above, for the
     `getent passwd` lookup user_uids_from_getent() needs to uid-own a
     remote-backed node's mount (spec.md §6) -- over the same four scopes,
-    `client_grants` included. Also covers every per-user
+    `subtree_grants` included. Also covers every per-user
     container's own owner (`_resolved_user_containers()`, group-derived
     ones included) when `group_members` is given -- stortree_secrets
     needs those numeric UIDs too, for a wrapper mount's `--uid`
@@ -2320,8 +2358,8 @@ def needed_users(resolved, group_members=None):
     for entry in (
         resolved.get("server_subtrees", [])
         + resolved.get("peer_dependencies", [])
-        + resolved.get("client_mounts", [])
-        + resolved.get("client_grants", [])
+        + resolved.get("subtree_mounts", [])
+        + resolved.get("subtree_grants", [])
     ):
         u = (entry.get("access") or {}).get("owner")
         if u:
@@ -2351,7 +2389,7 @@ def _resolved_user_containers(resolved, group_members):
     independently. Covers both `server_subtrees` (this host's own nodes)
     and `peer_dependencies` (a peer-sourced per-user descendant) -- the
     same two scopes needed_groups()/needed_users() already cover, for the
-    same reason: a client-only host with no server_subtrees of its own
+    same reason: a peer-only host with no server_subtrees of its own
     still has to own its peer-sourced per-user containers correctly."""
     containers = {}
     for n in resolved.get("server_subtrees", []) + resolved.get("peer_dependencies", []):
@@ -2453,16 +2491,16 @@ def _expand_per_user(node_path, access, remote_of, requires, group_members):
     return real_entry, symlinks
 
 
-def _plan_client_mounts(resolved):
+def _plan_subtree_mounts(resolved):
     """This host's own copy of each top-level subtree it doesn't own, one
     entry each. Never per-user, so there's no %U fan-out to resolve here
-    the way the two stages below have to. Always a mount unless the client
-    opted out (`client-defaults`/`clients.<host>.rclone: false`), in
-    which case resolve() still gives it a client_mounts entry so the
+    the way the two stages below have to. Always a mount unless the peer
+    opted out (`peer-defaults`/`peers.<host>.rclone: false`), in
+    which case resolve() still gives it a subtree_mounts entry so the
     local directory gets created, and it arrives here as `remote: None`
     and plans as a plain directory.
 
-    A client mount's `remote` was already synthesized by resolve()
+    A subtree mount's `remote` was already synthesized by resolve()
     (_peer_remote_ref()), so the provenance plan_remote_sections() needs
     -- which host that reference points at, and the path on it -- is
     joined back on from the matching peer_dependencies entry rather than
@@ -2472,7 +2510,7 @@ def _plan_client_mounts(resolved):
     entry per path."""
     peer_by_path = {p["local_path"]: p for p in resolved.get("peer_dependencies", [])}
     entries = []
-    for m in resolved.get("client_mounts", []):
+    for m in resolved.get("subtree_mounts", []):
         peer = peer_by_path.get(m["local_path"])
         entries.append(
             {
@@ -2482,7 +2520,7 @@ def _plan_client_mounts(resolved):
                 "peer": (
                     None if peer is None else _peer_provenance(peer, peer["remote_path"])
                 ),
-                # Whatever this host's own client policy granted for its
+                # Whatever this host's own peer policy granted for its
                 # copy, `{}` (the plain ungranted default) otherwise.
                 "access": m.get("access") or {},
                 "requires": m.get("requires") or [],
@@ -2491,9 +2529,9 @@ def _plan_client_mounts(resolved):
     return entries
 
 
-def _plan_client_grants(resolved):
+def _plan_subtree_grants(resolved):
     """A node's own grant, applied where this host mounts that node's
-    content without owning it (_client_grant_entries()).
+    content without owning it (_subtree_grant_entries()).
 
     Never a mount of its own and never a directory of its own: the path
     is already inside some transport, so what this plans is exactly one
@@ -2509,7 +2547,7 @@ def _plan_client_grants(resolved):
             "access": g["access"],
             "requires": [],
         }
-        for g in resolved.get("client_grants", [])
+        for g in resolved.get("subtree_grants", [])
     ]
 
 
@@ -2552,13 +2590,13 @@ def _plan_peer_dependencies(resolved, group_members, stortree_root):
 
     Such a descendant is data this host's local tree still has to contain
     (spec.md §1 "Samba sharing is universal"), sourced directly from its
-    actual owning host exactly like a client mount of a whole top-level
+    actual owning host exactly like a subtree mount of a whole top-level
     subtree is -- a mesh: each peer_dependency already names its own real
     owning host, rather than everything funnelling through one shared
     root. It uses its own `access`/`args`, never the owning host's.
 
     An entry with no `samba_node` is skipped: it's a top-level subtree's
-    own peer mount, already planned by _plan_client_mounts(). A per-user
+    own peer mount, already planned by _plan_subtree_mounts(). A per-user
     one resolves the same way a per-user server_subtrees node does,
     including the shared-mount-plus-bind-mounts case -- the owning host's
     own plan_mounts() run collapses its `group`-only node to that exact
@@ -2907,7 +2945,7 @@ def _layer_plan_entries(entries):
 
 
 def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROOT):
-    """Flatten this host's resolved client_mounts/server_subtrees/
+    """Flatten this host's resolved subtree_mounts/server_subtrees/
     peer_dependencies into one flat plan of every local path that has to
     exist (spec.md §2).
 
@@ -2947,7 +2985,7 @@ def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROO
     group_members = group_members or {}
 
     entries = (
-        _plan_client_mounts(resolved)
+        _plan_subtree_mounts(resolved)
         + _plan_server_subtrees(resolved, group_members)
         + _plan_peer_dependencies(resolved, group_members, stortree_root)
     )
@@ -2955,14 +2993,14 @@ def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROO
     # three stages above produced nothing for that path already: a
     # user-subdirs node whose own immediate child is the granted one
     # yields an entry at the container's exact path, and a node reached
-    # by a client or samba block already carries the grant that block
-    # gave it -- which is the one that wins (_client_grant_entries()).
+    # by a peer or samba block already carries the grant that block
+    # gave it -- which is the one that wins (_subtree_grant_entries()).
     # Either way the two would otherwise race to mount over each other.
     # Deliberately *not* a dedupe over the whole list -- two of the three
     # stages planning one path is a resolve()-level mistake, and
     # _check_slug_collisions() has to still see it.
     for late in (
-        _plan_client_grants(resolved),
+        _plan_subtree_grants(resolved),
         _plan_user_containers(resolved, group_members),
     ):
         planned = {e["local_path"] for e in entries}

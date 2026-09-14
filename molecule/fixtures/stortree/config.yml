@@ -18,7 +18,7 @@ tree:
   host: storage-node-alpha
   rclone.remote: storagebox:/
 
-  # storage-node-bravo's client mount below points its cache-dir into
+  # storage-node-bravo's subtree mount below points its cache-dir into
   # .bravo-cache, which is a separate top-level subtree and therefore has
   # no nesting relationship with this one -- nothing about the tree's
   # shape implies the ordering, so it's declared (docs/config-schema.md
@@ -29,13 +29,13 @@ tree:
   requires:
     - .bravo-cache
 
-  client-defaults:
+  peer-defaults:
     rclone.args:
       vfs-cache-mode: full
       vfs-cache-max-age: 100h
       dir-cache-time: 5m
 
-  clients:
+  peers:
     some-storage-gadget:
       rclone.args:
         vfs-cache-max-size: 20G
@@ -77,24 +77,24 @@ tree:
               cache-dir: /srv/stortree/.gcs-cache/media-prod
 
 # storage-node-bravo's own VFS-cache backing store -- nobody else needs
-# it mounted anywhere, so client-defaults.rclone: false keeps it off
-# every other host by default (docs/config-schema.md "Per-client mount
+# it mounted anywhere, so peer-defaults.rclone: false keeps it off
+# every other host by default (docs/config-schema.md "Per-peer mount
 # opt-out").
 .bravo-cache:
   host: storage-node-bravo
   rclone.remote: some-remote:/.stortree-cache
-  client-defaults:
+  peer-defaults:
     rclone: false
 
 # storage-node-alpha's own VFS-cache backing store -- unlike
 # .bravo-cache, genuinely local (no rclone.remote at all): media-prod's
 # own mounting host is alpha itself, so its VFS cache can just live on
 # alpha's own disk directly, no separate remote-backed mount needed.
-# client-defaults.rclone: false still matters here even without a
+# peer-defaults.rclone: false still matters here even without a
 # remote to peer-mount: without it, every other host would still get an
 # empty placeholder directory created for it (docs/config-schema.md
-# "Per-client mount opt-out").
+# "Per-peer mount opt-out").
 .gcs-cache:
   host: storage-node-alpha
-  client-defaults:
+  peer-defaults:
     rclone: false

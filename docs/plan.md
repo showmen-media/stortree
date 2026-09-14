@@ -114,12 +114,12 @@ implementation:
    else. Resolved to: `_validate_node()` in
    `filter_plugins/stortree.py` rejects any key the schema doesn't
    define, at the node level and inside `rclone:`/`access:`/`samba:`/
-   `client-defaults:`/`clients:`, naming the node and suggesting the
+   `peer-defaults:`/`peers:`, naming the node and suggesting the
    near match (docs/config-schema.md "Unknown keys are an error"). The
    argument is the failure direction: every typo tested resolved to
    something plausible and wrong, and several of them wrong in the
    direction of *more* access or *more* peer trust than was written —
-   a misspelled `client-defaults` re-enables a subtree on every host
+   a misspelled `peer-defaults` re-enables a subtree on every host
    in the fleet and provisions the SSH trust for it, a misspelled
    `access.group` drops the grant and leaves the path at its
    permissive default. Failing at `resolve()` costs a run; the
