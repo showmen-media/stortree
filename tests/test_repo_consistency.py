@@ -383,11 +383,35 @@ def test_the_samba_role_withdraws_discovery_at_the_paths_it_publishes_it():
         and task["ansible.builtin.file"].get("state") == "absent"
     }
     for path in (
-        "/etc/systemd/system/wsdd.service",
+        "/etc/systemd/system/{{ stortree_samba_wsdd_unit }}.service",
         "/etc/avahi/services/stortree-smb.service",
     ):
         assert path in published, f"nothing renders {path}"
-        assert path in withdrawn, f"nothing removes {path}"
+
+    assert "/etc/avahi/services/stortree-smb.service" in withdrawn
+
+    # The WSD announcer's unit name is not fixed -- it follows the
+    # implementation the platform packages (`wsdd` on bookworm and the
+    # Ubuntus, `wsdd2` on trixie), and stortree shadows whichever one
+    # that is. So this half cannot be a string match against one path.
+    # What has to hold instead is that the teardown sweeps *every* name
+    # the setup can render, not just today's: a host also changes
+    # implementation under an in-place release upgrade, and the one it
+    # leaves behind is a unit that is still enabled and still announcing.
+    units_var = "stortree_samba_wsdd_units"
+    assert set(role_defaults("stortree_samba")[units_var]) == {"wsdd", "wsdd2"}
+    sweeps = [
+        task
+        for task in tasks
+        if "ansible.builtin.file" in task
+        and task["ansible.builtin.file"].get("state") == "absent"
+        and units_var in str(task.get("loop", ""))
+    ]
+    assert sweeps, f"no removal task loops over {units_var}"
+    for task in sweeps:
+        assert task["ansible.builtin.file"]["path"] == (
+            "/etc/systemd/system/{{ item }}.service"
+        ), task["name"]
 
 
 def test_the_mounts_verification_covers_the_paths_the_role_creates():

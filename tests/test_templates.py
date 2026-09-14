@@ -979,13 +979,23 @@ def test_smb_conf_globals_stay_inside_the_global_section(render, resolved):
 # part of stortree that is about being found at all.
 
 # What roles/stortree_samba/tasks/main.yml has in scope by the time it
-# renders the unit: the binary path it just discovered, the workgroup
-# resolved from the role defaults, and the operator's interface list as
+# renders the unit: the implementation it settled on, the binary path it
+# just discovered for that implementation, the workgroup resolved from
+# the role defaults, and the operator's interface list as
 # defaults/main.yml leaves it.
 DISCOVERY_VARS = {
+    "stortree_samba_wsdd_flavour": "wsdd",
     "stortree_samba_wsdd_bin": "/usr/sbin/wsdd",
     "stortree_samba_workgroup": "WORKGROUP",
     "stortree_samba_wsd_interfaces": [],
+}
+
+# The other daemon, which Debian trixie packages in place of `wsdd`
+# after dropping it. Same template, an entirely different [Service]
+# block -- see the template's header.
+WSDD2_VARS = {
+    "stortree_samba_wsdd_flavour": "wsdd2",
+    "stortree_samba_wsdd_bin": "/usr/sbin/wsdd2",
 }
 
 
@@ -993,9 +1003,18 @@ def wsdd(render, **overrides):
     return render(WSDD_UNIT, **{**DISCOVERY_VARS, **overrides})
 
 
+def wsdd2(render, **overrides):
+    return wsdd(render, **{**WSDD2_VARS, **overrides})
+
+
 @pytest.fixture(scope="session")
 def wsdd_unit(render):
     return wsdd(render)
+
+
+@pytest.fixture(scope="session")
+def wsdd2_unit(render):
+    return wsdd2(render)
 
 
 def test_wsdd_unit_runs_the_binary_the_role_actually_found(render):
@@ -1046,7 +1065,11 @@ def test_wsdd_unit_quotes_the_workgroup_as_a_single_argument(render):
 def test_wsdd_unit_announces_on_every_interface_by_default(wsdd_unit):
     # wsdd's own default, and right for a host with one network: naming
     # interfaces is what a multi-homed host does, not what everyone does.
-    assert "--interface" not in wsdd_unit
+    # Asserted against ExecStart rather than the whole file: the header
+    # names both daemons' interface flags while explaining the
+    # difference between them.
+    (exec_start,) = directives(wsdd_unit, "ExecStart")
+    assert "--interface" not in exec_start
 
 
 def test_wsdd_unit_restricts_itself_to_the_interfaces_it_was_given(render):
@@ -1082,6 +1105,80 @@ def test_wsdd_unit_keeps_the_address_family_it_watches_interfaces_with(wsdd_unit
     (families,) = directives(wsdd_unit, "RestrictAddressFamilies")
     assert "AF_NETLINK" in families
     assert "AF_INET" in families
+
+
+# -- host discovery: the same unit, rendered for wsdd2 --------------------
+#
+# Debian dropped the Python `wsdd` after bookworm and packages the
+# unrelated C `wsdd2` instead, so on trixie the role installs that and
+# renders this template for it. The two daemons share no flag, no
+# binary name, no unit name and no privilege model -- which is exactly
+# why these need testing separately rather than being assumed to follow
+# from the wsdd cases above.
+
+
+def test_wsdd2_unit_announces_the_workgroup_with_its_own_flag(render):
+    # -G is wsdd2's --workgroup. Rendering wsdd's long option here would
+    # not be a wrong workgroup, it would be a daemon that refuses to
+    # start -- and the same silent absence from Explorer's Network that
+    # the whole shared-`workgroup` seam exists to prevent.
+    (exec_start,) = directives(
+        wsdd2(render, stortree_samba_workgroup="EXAMPLE"), "ExecStart"
+    )
+    assert exec_start.startswith("/usr/sbin/wsdd2 ")
+    assert '-G "EXAMPLE"' in exec_start
+    assert "--workgroup" not in exec_start
+    assert "--shortlog" not in exec_start
+
+
+def test_wsdd2_unit_quotes_the_workgroup_as_a_single_argument(render):
+    (exec_start,) = directives(
+        wsdd2(render, stortree_samba_workgroup="TWO WORDS"), "ExecStart"
+    )
+    assert '-G "TWO WORDS"' in exec_start
+
+
+def test_wsdd2_unit_announces_on_every_interface_by_default(wsdd2_unit):
+    (exec_start,) = directives(wsdd2_unit, "ExecStart")
+    assert " -i " not in exec_start
+
+
+def test_wsdd2_unit_restricts_itself_to_the_interface_it_was_given(render):
+    # One interface, because wsdd2's -i is not repeatable. The role
+    # refuses an interface list longer than one rather than silently
+    # dropping the rest -- see the assert in tasks/main.yml, which is
+    # what keeps this template from ever having to decide which one wins.
+    (exec_start,) = directives(
+        wsdd2(render, stortree_samba_wsd_interfaces=["eth0"]), "ExecStart"
+    )
+    assert exec_start.endswith("-i eth0")
+
+
+def test_wsdd2_unit_keeps_the_capabilities_it_cannot_run_without(wsdd2_unit):
+    # Where wsdd runs as `nobody` with an empty bounding set, wsdd2 binds
+    # its sockets to a named device (SO_BINDTODEVICE, CAP_NET_RAW) and
+    # reads the interface table over netlink (CAP_NET_ADMIN). Confining
+    # it the way wsdd is confined is a daemon that starts and then
+    # announces nothing.
+    (ambient,) = directives(wsdd2_unit, "AmbientCapabilities")
+    assert "CAP_NET_RAW" in ambient
+    assert "CAP_NET_ADMIN" in ambient
+    assert directives(wsdd2_unit, "User") == []
+    assert directives(wsdd2_unit, "DynamicUser") == ["yes"]
+    assert directives(wsdd2_unit, "NoNewPrivileges") == ["yes"]
+
+
+def test_wsdd2_unit_stops_announcing_when_smbd_stops(wsdd2_unit):
+    # The half of the [Unit] section that is shared between the two
+    # daemons, asserted on both so a future edit cannot quietly move it
+    # inside one branch.
+    assert directives(wsdd2_unit, "Requires") == ["smbd.service"]
+    assert "smbd.service" in directives(wsdd2_unit, "After")[0]
+
+
+def test_wsdd2_unit_documents_the_daemon_it_actually_runs(wsdd2_unit, wsdd_unit):
+    assert directives(wsdd2_unit, "Documentation") == ["man:wsdd2(8)"]
+    assert directives(wsdd_unit, "Documentation") == ["man:wsdd(8)"]
 
 
 # -- host discovery: stortree-smb.avahi.xml.j2 ----------------------------

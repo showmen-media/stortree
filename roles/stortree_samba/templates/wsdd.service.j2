@@ -3,33 +3,52 @@
 # WS-Discovery is what puts this host in a current Windows Explorer's
 # "Network" (spec.md §4, "Host discovery"). Windows has shipped with
 # SMB1 and the Computer Browser service disabled since 10/1709, so
-# nmbd's browse-list announcements no longer reach it at all; wsdd
-# answers the WSD probes that replaced them.
+# nmbd's browse-list announcements no longer reach it at all; a WSD
+# announcer answers the WSD probes that replaced them.
 #
-# Rendered to /etc/systemd/system/wsdd.service, which *shadows* the unit
-# the distro's own `wsdd` package ships -- deliberately, and it is the
+# TWO IMPLEMENTATIONS, one template. Debian and Ubuntu do not package
+# the same WSD daemon:
+#
+#   - `wsdd`, Steffen Christgau's Python daemon, on Debian bookworm and
+#     Ubuntu jammy/noble. Long options, repeatable --interface.
+#   - `wsdd2`, Andy2244's unrelated C daemon, on Debian trixie, which
+#     dropped `wsdd` entirely. Single-letter options, one -i, and it
+#     needs CAP_NET_RAW because it binds its sockets to a device.
+#
+# They share a purpose and nothing else -- not a flag, not a binary
+# name, not a unit name, not a privilege model -- so the [Service] block
+# is written twice below rather than papered over with one
+# lowest-common-denominator invocation that would announce the wrong
+# workgroup on one of them. Which one this host gets is settled by
+# `stortree_samba_wsdd_flavour` (tasks/main.yml, from what the host's
+# apt cache actually offers); `stortree_samba_wsdd_unit` follows it.
+#
+# Rendered to /etc/systemd/system/<that unit>.service, which *shadows*
+# the unit the distro's own package ships -- deliberately, and it is the
 # one thing about this file worth understanding before editing it:
 #
 #   - Debian bookworm and Ubuntu jammy package wsdd with a unit and an
 #     /etc/default/wsdd; Ubuntu noble packages the binary alone, with
-#     neither. A role that enabled `wsdd.service` would work on two of
-#     the three platforms meta/main.yml lists and silently do nothing on
-#     the newest.
-#   - stortree has to set `--workgroup` from the same value smb.conf
+#     neither; Debian trixie's wsdd2 ships a unit that its postinst
+#     enables and starts. A role that merely enabled the packaged unit
+#     would work on some platforms and silently do the wrong thing on
+#     others -- and on trixie it would leave a second announcer running
+#     with the distro's defaults beside stortree's.
+#   - stortree has to set the workgroup from the same value smb.conf
 #     gets (defaults/main.yml's `stortree_samba_workgroup`), and a host
 #     announcing itself into a different workgroup than it serves is
 #     precisely the drift that was worth closing.
 #
 # Shadowing one unit name on every platform beats a second unit name
 # plus masking the distro's -- there is never a window where two
-# announcers are running, and `systemctl status wsdd` tells an operator
-# the truth. The cost is the usual cost of a full-file override: a
-# future package's unit changes stop reaching this host. If you are
-# reading this because upstream's unit grew something you want, copy it
-# in here.
+# announcers are running, and `systemctl status <unit>` tells an
+# operator the truth. The cost is the usual cost of a full-file
+# override: a future package's unit changes stop reaching this host. If
+# you are reading this because upstream's unit grew something you want,
+# copy it in here.
 [Unit]
 Description=WS-Discovery announcer for stortree's Samba shares (managed by stortree, do not edit by hand)
-Documentation=man:wsdd(8)
+Documentation=man:{{ stortree_samba_wsdd_flavour }}(8)
 Wants=network-online.target
 After=network-online.target smbd.service
 {# Announcing a host whose smbd is not running advertises shares that
@@ -41,6 +60,51 @@ Requires=smbd.service
 
 [Service]
 Type=simple
+{% if stortree_samba_wsdd_flavour == 'wsdd2' %}
+{# wsdd2's -i takes exactly one interface name, where wsdd's --interface
+   repeats and also accepts addresses. The role asserts the list is at
+   most one entry long before it gets here (tasks/main.yml), so this
+   renders what was asked or nothing at all -- it never silently widens
+   an announcement to every interface on the host, which is the one
+   outcome an operator who named an interface was trying to avoid. #}
+{% set iface_args = ['-i', stortree_samba_wsd_interfaces[0]] if stortree_samba_wsd_interfaces else [] %}
+{# -G is wsdd2's --workgroup. Left unset it shells out to `testparm -s
+   --parameter-name=workgroup`, which would read the same smb.conf this
+   role renders and usually agree -- but only usually, and only while
+   testparm is on PATH inside this unit's sandbox. Passing it explicitly
+   makes the announcement depend on the variable rather than on a
+   subprocess. Quoted for systemd for the same reason wsdd's is below. #}
+ExecStart={{ stortree_samba_wsdd_bin }} {{ (['-G', '"' ~ (stortree_samba_workgroup | trim) ~ '"'] + iface_args) | join(' ') }}
+Restart=on-failure
+RestartSec=5
+
+{# wsdd2 cannot be confined the way wsdd is. It binds its sockets to a
+   named device (SO_BINDTODEVICE), which needs CAP_NET_RAW no matter how
+   unprivileged the account is, and it reads the interface table through
+   netlink, which is what CAP_NET_ADMIN covers -- so the capability set
+   below is Debian's own unit's, not a guess. DynamicUser gives it a
+   throwaway account with no home and no state directory, which is as
+   close to `User=nobody` as a daemon holding those two capabilities
+   gets. #}
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+{# ProtectSystem=full, not wsdd's `strict`: wsdd2 falls back to running
+   `testparm` for the NetBIOS name it announces (there is no stortree
+   variable modelling that, so this is the path it actually takes), and
+   Samba's own tooling wants somewhere under /var to be writable. #}
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+{% else %}
 {% set iface_args = [] %}
 {% for interface in stortree_samba_wsd_interfaces %}
 {% set _ = iface_args.append('--interface=' ~ interface) %}
@@ -75,6 +139,7 @@ RestrictNamespaces=yes
 {# AF_NETLINK is not optional: it is how wsdd learns which interfaces
    exist and notices one appearing later. #}
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+{% endif %}
 
 [Install]
 WantedBy=multi-user.target

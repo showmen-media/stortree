@@ -90,11 +90,60 @@ stortree_samba_discovery: true
 # WS-Discovery (WSD) -- how Windows 10/11 populates Explorer's "Network".
 # Windows has shipped with SMB1 and the Computer Browser service off
 # since 1709, so the NetBIOS announcements below reach it for name
-# resolution but never put the host in that list; wsdd is what does.
-# Installs the `wsdd` package and runs it from a unit stortree renders
-# (see wsdd.service.j2 for why the unit is stortree's rather than the
-# distro's). Listens on UDP 3702 (multicast) and TCP 5357.
+# resolution but never put the host in that list; a WSD announcer is
+# what does. Installs whichever WSD daemon this platform packages (see
+# `stortree_samba_wsd_implementation` below) and runs it from a unit
+# stortree renders (see wsdd.service.j2 for why the unit is stortree's
+# rather than the distro's). Listens on UDP 3702 (multicast) and TCP
+# 5357.
 stortree_samba_discovery_wsd: true
+
+# Which WS-Discovery daemon to run. There are two, they are unrelated
+# programs, and no platform packages both:
+#
+#   wsdd   Steffen Christgau's Python daemon. Debian bookworm, Ubuntu
+#          jammy and noble (in `universe` on the Ubuntus).
+#   wsdd2  Andy2244's C daemon. Debian trixie, which dropped `wsdd`.
+#
+# `auto` picks whichever the host's apt cache actually offers,
+# preferring `wsdd` where both are somehow available. That is a question
+# about this host's archive rather than about its release codename, so
+# it is answered by asking apt -- a codename table would need extending
+# for every future release and would still be wrong on a host whose
+# `universe` or backports configuration differs from the fleet's.
+#
+# Name one explicitly to pin it. Doing so turns "this platform has no
+# such package" from a silently different implementation into the apply
+# failing with apt's own error, which is the right trade on a fleet that
+# expects one behaviour everywhere.
+#
+# Worth knowing before pinning `wsdd2`: it takes a single `-i`, so
+# `stortree_samba_wsd_interfaces` may name at most one interface (by
+# name -- it has no equivalent of wsdd's address form), and the role
+# refuses the apply rather than quietly announcing on all of them. It
+# also needs CAP_NET_RAW, where wsdd runs as `nobody` with no
+# capabilities at all.
+stortree_samba_wsd_implementation: auto
+
+# The systemd unit stortree renders its announcer into, derived from the
+# implementation the role settled on (tasks/main.yml sets
+# `stortree_samba_wsdd_flavour`). Both packages name their unit after
+# their binary, and stortree deliberately shadows that name rather than
+# introducing one of its own -- see wsdd.service.j2's header. Not meant
+# to be set directly.
+#
+# The `default` is only for the teardown path, which reads this name on
+# hosts where the flavour was never settled because WS-Discovery is off.
+# Every unit name this role has *ever* rendered is torn down there by
+# name, not through this variable, so nothing is orphaned by a host
+# switching implementations.
+stortree_samba_wsdd_unit: "{{ stortree_samba_wsdd_flavour | default('wsdd') }}"
+
+# Every unit name a stortree-managed WSD announcer can go by. The
+# teardown path sweeps all of them, which is what lets a host move
+# between implementations (a bookworm-to-trixie upgrade, most likely)
+# without leaving the old one's unit behind, enabled and announcing.
+stortree_samba_wsdd_units: [wsdd, wsdd2]
 
 # mDNS/DNS-SD -- how macOS Finder's sidebar and GNOME Files' "Other
 # Locations" find a server. Samba can register `_smb._tcp` itself, but
@@ -130,11 +179,16 @@ stortree_samba_discovery_mdns: true
 # serving (see tasks/main.yml).
 stortree_samba_discovery_netbios: true
 
-# Which interfaces wsdd announces on, by name ("eth0", "br-lan") or
-# address. Empty means every non-loopback interface, which is wsdd's own
-# default and right for a host with one network. Name them on a host
-# where it is not -- a storage node that also holds a WireGuard tunnel
-# or a management network has no business announcing SMB down either.
+# Which interfaces the WSD announcer announces on, by name ("eth0",
+# "br-lan") or -- on `wsdd` only -- address. Empty means every
+# non-loopback interface, which is both daemons' own default and right
+# for a host with one network. Name them on a host where it is not -- a
+# storage node that also holds a WireGuard tunnel or a management
+# network has no business announcing SMB down either.
+#
+# At most one entry on a host running `wsdd2`, whose -i is not
+# repeatable; more than that fails the apply rather than widening the
+# announcement to everything (see stortree_samba_wsd_implementation).
 #
 # Avahi is not covered by this: it takes its interface policy from
 # avahi-daemon.conf, which stortree does not manage.

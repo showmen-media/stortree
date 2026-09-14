@@ -350,6 +350,84 @@ own `After=`/`PartOf=` order them correctly from then on -- and it
 cannot recur once a host is past the apply that introduced the covering
 mount.
 
+## A transport mountpoint buried under stray local directories
+
+Symptom: a `stortree-remote@` unit restart-loops with
+
+```
+Fatal error: failed to mount FUSE fs: "/srv/.stortree-remotes/<path>"
+is not empty, use --allow-non-empty to mount anyway
+```
+
+and every transport nested inside it fails alongside, usually with the
+opposite-sounding `cannot open: ... no such file or directory` for its
+own mountpoint. `findmnt` shows nothing mounted at either path.
+
+Read the two messages together: the parent will not mount because its
+mountpoint has content, and the children have no mountpoint to mount on
+because the only place theirs could exist is inside the parent's
+backend, which nothing can reach while the parent is down.
+
+Not the same failure as "A stranded mount" above, which reports
+`directory already mounted` and is about a live mount attached in the
+wrong place. This one is about a mountpoint that is not a mountpoint at
+all -- an ordinary local directory with ordinary local directories
+inside it.
+
+**Cause.** A transport's mountpoint under `stortree_remotes_root` is a
+plain local directory whenever its unit is down. Applies before this
+was guarded created every nested path regardless, so anything under a
+stopped transport landed on the underlying disk instead of on the
+backend -- and rclone refuses a non-empty mountpoint, so the mount could
+never come back. The two states hold each other up: the mount is down,
+so the strays get created; the strays exist, so the mount stays down.
+
+A current apply will not do this to you -- it reads
+`/proc/self/mountinfo` and skips every path that resolves inside a
+transport that is not currently mounted -- but it also cannot clean up
+what an older one left, because "an empty directory that should not
+exist" and "an empty directory waiting to be mounted on" are the same
+thing on disk. Clearing it is a manual step, once per affected host.
+
+**Check what is actually there** before deleting anything. Use `find
+-xdev` and `du -x`: without them both walk into any live mount nested
+under the path and report the backend's contents as if they were local,
+which turns a handful of empty directories into an alarming number.
+
+```sh
+find /srv/.stortree-remotes/<transport path> -xdev ! -type d   # files?
+du -xsh /srv/.stortree-remotes/<transport path>                # bytes?
+```
+
+Expect no files and near-zero bytes: these are directory skeletons, and
+often under names a later config change has already retired, since
+nothing ever removed them. If files *do* turn up, stop -- that is
+content written to the local disk instead of to the backend, and it
+wants copying somewhere before any of the below.
+
+**Clear it.** Stop the transport family outside in first: a nested
+transport can legitimately be mounted *inside* the mountpoint you are
+about to empty, and removing directories around a live mount is how the
+stranded-mount entry above starts.
+
+```sh
+systemctl stop 'stortree-bind@*' 'stortree-mount@*' 'stortree-remote@*'
+systemctl reset-failed
+findmnt -t fuse.rclone,fuse -no TARGET | grep /srv/     # expect nothing
+
+find /srv/.stortree-remotes/<transport path> -mindepth 1 -depth -type d -delete
+```
+
+`-depth -type d -delete` removes directories deepest-first and only
+directories, so it stops at anything that is not one rather than
+deleting it. `-mindepth 1` keeps the mountpoint itself, which the role
+expects to exist.
+
+Re-apply. The transport mounts on the now-empty mountpoint, and the
+nested transports' mountpoints get created through it -- which is a
+second apply's work, as it is for any brand-new nested entry (see "N
+path(s) ... are still missing" below).
+
 ## "N path(s) ... are still missing" at the end of a mounts run
 
 `stortree_mounts` creates directories with `ignore_errors: true`
@@ -364,6 +442,14 @@ One missing path is not automatically a bug:
 - **Expected.** You just added a nested entry, and its own parent mount
   didn't exist yet when creation was attempted. This is the documented
   two-run pattern -- run `site.yml` again and the list should be empty.
+- **Expected, and pointing at something else.** Every path inside a
+  transport is listed, because that transport is down. The role skips
+  creating anything inside a transport it cannot see mounted, rather
+  than writing it to the local disk under the mountpoint and locking
+  the mount out for good (see "A transport mountpoint buried under
+  stray local directories" above). The missing paths are a symptom: fix
+  the transport -- `systemctl status stortree-remote@<slug>` -- and
+  they are created on the next apply.
 - **Real.** The same paths are still listed after a second, back-to-back
   apply. Scroll back to the `ignore_errors`'d directory tasks in the run
   output: the actual error (a full disk, a backend rejecting the write,
@@ -424,16 +510,24 @@ stortree_samba_discovery_netbios: false
 Re-run `site.yml`. Turning a flag off is a converging change, not just a
 skipped task: the apply stops and disables whatever it previously
 started and removes what it published, so a host that was announcing
-stops. The `wsdd` and `avahi-daemon` packages stay installed, the same
-call this role makes for `samba` itself on a host that stops serving.
+stops. The WSD daemon's package and `avahi-daemon` stay installed, the
+same call this role makes for `samba` itself on a host that stops
+serving; both unit names a WSD announcer can go by (`wsdd`, `wsdd2`) are
+stopped, disabled and un-rendered, so a host that changed
+implementations is not left announcing through the one it moved off.
 
 On a multi-homed host — a storage node that also holds a WireGuard
 tunnel or a management network — name the interfaces that should carry
-the announcements rather than leaving wsdd on all of them:
+the announcements rather than leaving the announcer on all of them:
 
 ```yaml
 stortree_samba_wsd_interfaces: [eth0]
 ```
+
+Exactly one entry on a host running `wsdd2` (Debian trixie and newer),
+whose `-i` is not repeatable and takes an interface *name* only; a
+longer list fails the apply rather than quietly announcing everywhere.
+`wsdd` takes as many as you like, by name or address.
 
 Avahi takes its interface policy from `avahi-daemon.conf`, which stortree
 does not manage; set `allow-interfaces` there if the same host should not
@@ -445,18 +539,26 @@ Check the right protocol for the client that can't see it — they do not
 substitute for each other:
 
 ```bash
-systemctl status wsdd nmbd avahi-daemon      # on the host
-wsdd --discovery --no-host -v                # from a Linux box on the LAN
-avahi-browse -rt _smb._tcp                   # ...for the macOS path
+systemctl status wsdd wsdd2 nmbd avahi-daemon  # on the host; one WSD unit exists
+wsdd --discovery --no-host -v                  # from a Linux box on the LAN
+avahi-browse -rt _smb._tcp                     # ...for the macOS path
 ```
+
+Which WSD unit a host has depends on which daemon its archive packages:
+`wsdd` up to Debian bookworm and on the Ubuntus, `wsdd2` from Debian
+trixie. The apply reports the one it settled on;
+`stortree_samba_wsd_implementation` pins it if you would rather a
+platform mismatch fail than be worked around.
 
 Three things account for most of it. Discovery is link-local by design:
 WSD and mDNS multicast with a hop limit of 1 and NetBIOS broadcasts, so
 a client on another subnet or VLAN will never see the host however
 healthy the daemons are — that is the protocol, not a fault, and such a
-client needs the hostname. `wsdd` is in `universe` on Ubuntu, so the install task
-fails outright on a host with universe disabled. And on a host running
-systemd-resolved with MulticastDNS enabled, resolved and avahi-daemon
+client needs the hostname. `wsdd` is in `universe` on Ubuntu, so a host
+with universe disabled has neither daemon installable, and the apply
+says so by name rather than failing on apt's bare "no package". And on
+a host running systemd-resolved with MulticastDNS enabled, resolved and
+avahi-daemon
 both want UDP 5353 and whichever started first keeps it; stortree manages
 neither daemon's own configuration.
 

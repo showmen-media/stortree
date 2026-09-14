@@ -21,6 +21,7 @@ from filter_plugins.stortree import (
     access_mode,
     bindfs_perms,
     access_owner,
+    apt_installable,
     filter_rclone_conf,
     group_gids_from_getent,
     group_members_from_getent,
@@ -28,6 +29,7 @@ from filter_plugins.stortree import (
     metrics_listeners,
     metrics_ports,
     mount_unit_names,
+    mounted_transport_slugs,
     needed_groups,
     needed_users,
     per_user_mount_path,
@@ -4568,3 +4570,138 @@ def test_metrics_listeners_reject_an_interface_with_only_a_link_local_address():
 def test_metrics_listeners_of_nothing_is_empty():
     assert metrics_listeners([], {}) == []
     assert metrics_listeners(None, {}) == []
+
+
+# -- mounted_transport_slugs -----------------------------------------------
+#
+# The guard that keeps stortree_mounts from writing into a transport's
+# mountpoint while the transport is down -- which is unrecoverable, not
+# merely wrong: rclone refuses to mount over a directory that is not
+# empty, so the stray content a single failed mount lets Ansible create
+# is what stops that mount ever coming back.
+
+MOUNTINFO = """\
+25 30 0:22 / /proc rw,nosuid,relatime shared:5 - proc proc rw
+26 30 0:23 / /sys rw,nosuid,relatime shared:6 - sysfs sysfs rw
+40 30 0:99 / /srv/.stortree-remotes/top rw,nosuid,relatime shared:9 \
+- fuse.rclone peer-a-top:/srv/stortree/top rw,user_id=999,allow_other
+41 40 0:98 / /srv/.stortree-remotes/top/home/.mounts/_shared rw,relatime shared:10 \
+- fuse.rclone other:/media rw,user_id=999,allow_other
+"""
+
+PLAN = [
+    {"kind": "transport", "slug": "top", "local_path": "top"},
+    {
+        "kind": "transport",
+        "slug": "top-home-.mounts-_shared",
+        "local_path": "top/home/.mounts/_shared",
+    },
+    {"kind": "transport", "slug": "other", "local_path": "other"},
+    {"kind": "dir", "slug": "top-home", "local_path": "top/home"},
+]
+
+
+def test_a_transport_with_a_live_mount_on_its_mountpoint_is_reported_mounted():
+    assert mounted_transport_slugs(PLAN, MOUNTINFO, "/srv/.stortree-remotes") == [
+        "top",
+        "top-home-.mounts-_shared",
+    ]
+
+
+def test_a_transport_whose_unit_is_down_is_not_reported_mounted():
+    # `other` is planned and its mountpoint may well exist as an empty
+    # local directory -- which is exactly the state that makes this
+    # question worth asking, since existence is not the same as being
+    # mounted and only the latter means writes reach the backend.
+    assert "other" not in mounted_transport_slugs(
+        PLAN, MOUNTINFO, "/srv/.stortree-remotes"
+    )
+
+
+def test_only_transports_are_considered():
+    # A `dir` entry's path can perfectly well be a mountpoint for
+    # something else; it is never a transport of stortree's, and the
+    # callers key their skip decisions off transport slugs.
+    assert "top-home" not in mounted_transport_slugs(
+        PLAN, MOUNTINFO, "/srv/.stortree-remotes"
+    )
+
+
+def test_a_remotes_root_that_is_not_this_hosts_matches_nothing():
+    assert mounted_transport_slugs(PLAN, MOUNTINFO, "/srv/elsewhere") == []
+
+
+def test_a_trailing_slash_on_the_remotes_root_does_not_break_the_match():
+    assert mounted_transport_slugs(PLAN, MOUNTINFO, "/srv/.stortree-remotes/") == [
+        "top",
+        "top-home-.mounts-_shared",
+    ]
+
+
+def test_an_empty_mount_table_reports_nothing_mounted():
+    # A host early in its first boot, or one where every mount failed.
+    # Every nested path is then skipped, which is the safe direction:
+    # the next apply creates them once the transports are up.
+    assert mounted_transport_slugs(PLAN, "", "/srv/.stortree-remotes") == []
+
+
+def test_mountpoints_with_escaped_characters_are_matched_unescaped():
+    # The kernel writes space as \040 in mountinfo. No stortree slug
+    # contains one, but stortree_remotes_root is the operator's to
+    # choose, and a raw-vs-unescaped mismatch would read as "not
+    # mounted" -- the failure direction that quietly stops creating
+    # directories rather than the one that shouts.
+    mountinfo = (
+        "40 30 0:99 / /srv/two\\040words/top rw,relatime shared:9 "
+        "- fuse.rclone a:/b rw\n"
+    )
+    assert mounted_transport_slugs(PLAN, mountinfo, "/srv/two words") == ["top"]
+
+
+# -- apt_installable -------------------------------------------------------
+
+
+APT_POLICY = """\
+wsdd:
+  Installed: (none)
+  Candidate: (none)
+  Version table:
+wsdd2:
+  Installed: (none)
+  Candidate: 1.8.7+dfsg-1.2
+  Version table:
+     1.8.7+dfsg-1.2 500
+        500 http://deb.debian.org/debian trixie/main amd64 Packages
+"""
+
+
+def test_a_package_with_no_candidate_is_not_installable():
+    # Debian trixie: `wsdd` is still referenced in the archive, so apt
+    # prints a block for it, but there is nothing to install.
+    assert apt_installable(APT_POLICY, ["wsdd", "wsdd2"]) == ["wsdd2"]
+
+
+def test_a_package_apt_has_never_heard_of_is_not_installable():
+    # No block at all -- apt puts its note on stderr, which this never
+    # sees. Same answer as an explicit "(none)", because it means the
+    # same thing to the caller.
+    assert apt_installable("", ["wsdd", "wsdd2"]) == []
+
+
+def test_the_requested_order_is_preserved_not_apts():
+    # The caller's order is its preference order: stortree_samba takes
+    # the first installable name, and prefers `wsdd` where a host can
+    # somehow install both.
+    policy = APT_POLICY.replace("  Candidate: (none)", "  Candidate: 0.7.1-1", 1)
+    assert apt_installable(policy, ["wsdd", "wsdd2"]) == ["wsdd", "wsdd2"]
+    assert apt_installable(policy, ["wsdd2", "wsdd"]) == ["wsdd2", "wsdd"]
+
+
+def test_an_installed_package_is_still_reported_by_its_candidate():
+    policy = """\
+wsdd:
+  Installed: 0.7.0-1
+  Candidate: 0.7.0-1
+  Version table:
+"""
+    assert apt_installable(policy, ["wsdd"]) == ["wsdd"]

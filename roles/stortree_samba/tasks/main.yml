@@ -21,10 +21,16 @@
 - name: Collect service facts before stopping anything this host no longer runs
   # Only to answer "is there a unit here to stop?" below -- a host that
   # never served Samba has no smbd, one that never announced over WSD
-  # has no wsdd.service, and systemd_service would fail on either rather
-  # than cleanly doing nothing. Gathered whenever some teardown path can
-  # run, which is any of: the host is out of Samba service entirely, or
-  # one of the discovery protocols is switched off.
+  # has neither wsdd.service nor wsdd2.service, and systemd_service
+  # would fail on any of them rather than cleanly doing nothing.
+  # Gathered whenever some teardown path can run, which is any of: the
+  # host is out of Samba service entirely, or one of the discovery
+  # protocols is switched off.
+  #
+  # The one teardown that does *not* use this is retiring an announcer
+  # the host ran under the other implementation's unit name, which is
+  # reachable with every flag still on and so cannot be gated here; it
+  # asks a narrower question anyway, and asks it with its own `stat`.
   ansible.builtin.service_facts:
   when: >-
     inventory_hostname not in stortree_samba_hosts
@@ -82,18 +88,27 @@
   # whose package ships no unit of its own (Ubuntu noble) fails on a
   # unit that no longer exists. Same order as stortree_mounts' own
   # stale-unit sweep, for the same reason.
+  #
+  # Both unit names, not just the one this host would render today: the
+  # two WSD daemons are packaged under different unit names, so a host
+  # that changed implementations (an in-place bookworm-to-trixie upgrade
+  # is the realistic way) would otherwise leave the other one enabled,
+  # started and announcing with the distro's own defaults. The
+  # service-facts guard means naming a unit this host never had costs
+  # nothing.
   ansible.builtin.systemd_service:
-    name: wsdd
+    name: "{{ item }}"
     state: stopped
     enabled: false
+  loop: "{{ stortree_samba_wsdd_units }}"
   when:
     - >-
       inventory_hostname not in stortree_samba_hosts
       or not (stortree_samba_discovery and stortree_samba_discovery_wsd)
-    - "'wsdd.service' in (ansible_facts.services | default({}))"
+    - "item ~ '.service' in (ansible_facts.services | default({}))"
   tags: [samba]
 
-- name: Remove the WS-Discovery unit stortree renders
+- name: Remove the WS-Discovery units stortree renders
   # On bookworm and jammy this uncovers the distro package's own unit
   # again (wsdd.service.j2 explains the shadowing), which the task above
   # has just disabled -- so it stays down across reboots and across a
@@ -101,8 +116,9 @@
   # an admin disabled. The package itself is left installed, the same
   # call this role makes for `samba` on a host that stops serving.
   ansible.builtin.file:
-    path: /etc/systemd/system/wsdd.service
+    path: "/etc/systemd/system/{{ item }}.service"
     state: absent
+  loop: "{{ stortree_samba_wsdd_units }}"
   notify: stortree wsdd unit changed
   when: >-
     inventory_hostname not in stortree_samba_hosts
@@ -244,13 +260,122 @@
     - stortree_samba_discovery_netbios
   tags: [samba]
 
-- name: Install wsdd
-  # Present on every platform meta/main.yml lists -- bookworm 0.7.0,
-  # jammy 0.7.0 and noble 0.7.1 -- but in `universe` on the two Ubuntu
-  # releases, so a host with universe disabled fails here with apt's own
-  # "no package" error rather than silently not announcing.
+- name: Refresh the apt cache before asking it which WSD daemon exists
+  # The pick below reads `apt-cache policy`, which answers from whatever
+  # is on disk: on a host whose cache predates the release it is running
+  # -- or has never been updated at all -- it would report no candidate
+  # for either daemon and the assert below would blame the platform for
+  # a stale file. Same `cache_valid_time` as every other apt task in
+  # this role, so a run that has already refreshed does not do it twice.
   ansible.builtin.apt:
-    name: wsdd
+    update_cache: true
+    cache_valid_time: 3600
+  changed_when: false
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+  tags: [samba]
+
+- name: Ask apt which WS-Discovery daemons this platform packages
+  # `wsdd` and `wsdd2` are different programs solving the same problem,
+  # and which one exists is a property of the archive rather than of the
+  # release name: Debian shipped `wsdd` through bookworm and only
+  # `wsdd2` from trixie on, and the Ubuntus keep `wsdd` in `universe`,
+  # which a host may not have enabled. Asking apt covers every one of
+  # those without a codename table that would need editing for each new
+  # release -- and it is also the check that makes a host with `universe`
+  # disabled fail with something an operator can act on, rather than
+  # with apt's bare "no package" from an install task.
+  ansible.builtin.command:
+    cmd: apt-cache policy wsdd wsdd2
+  register: stortree_samba_wsd_policy
+  changed_when: false
+  check_mode: false
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+    - stortree_samba_wsd_implementation == 'auto'
+  tags: [samba]
+
+- name: Settle on a WS-Discovery implementation for this host
+  # `wsdd` first where both are somehow installable: it is what every
+  # platform this role supported before trixie ran, it takes the
+  # interface list this role already models in full, and it needs no
+  # capabilities. wsdd2 is the fallback, not the preference.
+  #
+  # A pinned `stortree_samba_wsd_implementation` skips the probe above
+  # and is taken at its word -- including onto a platform that does not
+  # package it, where the install below then fails with apt's own error.
+  # That is the intended behaviour of pinning: an operator who named one
+  # wants that one or a failure, not a silent substitution.
+  ansible.builtin.set_fact:
+    stortree_samba_wsdd_flavour: >-
+      {{ stortree_samba_wsd_implementation
+         if stortree_samba_wsd_implementation != 'auto'
+         else (stortree_samba_wsd_policy.stdout
+               | stortree_apt_installable(['wsdd', 'wsdd2'])
+               + ['wsdd'])
+              | first }}
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+  tags: [samba]
+
+- name: Refuse a WS-Discovery implementation this platform does not package
+  # Separated from the install below so the message names the actual
+  # problem. apt's own failure here reads "No package matching 'wsdd' is
+  # available", which says nothing about there being a second daemon
+  # that would have worked, nor about `universe` -- the two things an
+  # operator meeting this needs to know. (This is the failure a trixie
+  # host hit the first time one joined a fleet whose other nodes were on
+  # bookworm.)
+  ansible.builtin.assert:
+    that: >-
+      stortree_samba_wsd_implementation != 'auto'
+      or (stortree_samba_wsd_policy.stdout
+          | stortree_apt_installable(['wsdd', 'wsdd2'])) | length > 0
+    fail_msg: >-
+      Neither `wsdd` nor `wsdd2` is installable on this host, so there is
+      no WS-Discovery daemon to run. On Ubuntu, `wsdd` lives in
+      `universe` -- enable it. On Debian it is `wsdd` up to bookworm and
+      `wsdd2` from trixie; if neither resolves, the apt cache is
+      reaching neither `main` nor this release. Set
+      stortree_samba_discovery_wsd to false to leave WS-Discovery off on
+      this host in the meantime -- mDNS and NetBIOS announcements are
+      unaffected.
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+  tags: [samba]
+
+- name: Refuse an interface list wsdd2 cannot express
+  # wsdd2's -i is a single interface *name*; wsdd's --interface repeats
+  # and also takes addresses. Dropping the extras would leave the host
+  # announcing on every interface -- the exact opposite of what naming
+  # one asks for, and invisible in the rendered unit -- so this fails
+  # instead.
+  ansible.builtin.assert:
+    that: stortree_samba_wsd_interfaces | length <= 1
+    fail_msg: >-
+      stortree_samba_wsd_interfaces names
+      {{ stortree_samba_wsd_interfaces | length }} interfaces, and this
+      host runs wsdd2, whose -i takes exactly one. Narrow it to a single
+      interface name for this host (host_vars), or leave it empty to
+      announce on all of them.
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+    - stortree_samba_wsdd_flavour == 'wsdd2'
+  tags: [samba]
+
+- name: Install the WS-Discovery daemon
+  ansible.builtin.apt:
+    name: "{{ stortree_samba_wsdd_flavour }}"
     state: present
     install_recommends: false
     update_cache: true
@@ -261,16 +386,16 @@
     - stortree_samba_discovery_wsd
   tags: [samba]
 
-- name: Find the wsdd binary this platform installed
-  # /usr/sbin/wsdd on bookworm and jammy, /usr/bin/wsdd on noble. The
-  # unit has to name an absolute path, so the difference has to be
-  # resolved here rather than assumed -- a wrong path is a unit that
-  # fails at every start with status=203/EXEC.
+- name: Find the WS-Discovery binary this platform installed
+  # /usr/sbin/wsdd on bookworm and jammy, /usr/bin/wsdd on noble,
+  # /usr/sbin/wsdd2 on trixie. The unit has to name an absolute path, so
+  # the difference has to be resolved here rather than assumed -- a
+  # wrong path is a unit that fails at every start with status=203/EXEC.
   ansible.builtin.find:
     paths:
       - /usr/bin
       - /usr/sbin
-    patterns: wsdd
+    patterns: "{{ stortree_samba_wsdd_flavour }}"
     file_type: any
   register: stortree_samba_wsdd_found
   changed_when: false
@@ -288,10 +413,12 @@
   ansible.builtin.assert:
     that: stortree_samba_wsdd_found.files | length > 0
     fail_msg: >-
-      The wsdd package is installed but no wsdd binary was found in
-      /usr/bin or /usr/sbin (it is /usr/sbin/wsdd on bookworm and jammy,
-      /usr/bin/wsdd on noble). Set stortree_samba_discovery_wsd to false
-      to leave WS-Discovery off on this host in the meantime.
+      The {{ stortree_samba_wsdd_flavour }} package is installed but no
+      {{ stortree_samba_wsdd_flavour }} binary was found in /usr/bin or
+      /usr/sbin (it is /usr/sbin/wsdd on bookworm and jammy,
+      /usr/bin/wsdd on noble, /usr/sbin/wsdd2 on trixie). Set
+      stortree_samba_discovery_wsd to false to leave WS-Discovery off on
+      this host in the meantime.
   when:
     - inventory_hostname in stortree_samba_hosts
     - stortree_samba_discovery
@@ -312,15 +439,87 @@
     - stortree_samba_discovery_wsd
   tags: [samba]
 
+- name: Retire the announcer this host used to run under another name
+  # The teardown at the top of this file only fires when WS-Discovery is
+  # switched *off*. A host that keeps it on but changes implementation
+  # never reaches it -- and that is the likely case, not a contrived
+  # one: an in-place Debian bookworm-to-trixie upgrade takes `wsdd` away
+  # and offers `wsdd2` instead, with `stortree_samba_discovery_wsd`
+  # untouched throughout. Without this the host would come out of that
+  # upgrade with stortree's old wsdd.service still enabled (now with no
+  # binary behind it, so failing on every boot) next to the new one.
+  #
+  # The presence of stortree's own render at the other unit's path is
+  # the whole test, and a narrower one than the service facts the
+  # teardown at the top of this file uses: a render there means this
+  # role put it there, which means systemd knows that unit and it is
+  # safe to stop. Absent, there is nothing of stortree's to retire --
+  # any unit of that name left is the distro package's own, in
+  # /lib/systemd/system, which this role never started and must not stop.
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ item }}.service"
+  loop: >-
+    {{ stortree_samba_wsdd_units | reject('equalto', stortree_samba_wsdd_unit)
+       | list }}
+  register: stortree_samba_wsdd_superseded
+  changed_when: false
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+  tags: [samba]
+
+- name: Stop the announcer this host used to run under another name
+  # Stopped before its file is removed, the same order as the teardown
+  # at the top of this file and for the same reason.
+  ansible.builtin.systemd_service:
+    name: "{{ item.item }}"
+    state: stopped
+    enabled: false
+  loop: "{{ stortree_samba_wsdd_superseded.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('') }}"
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+    - item.stat.exists | default(false)
+  tags: [samba]
+
+- name: Remove the render behind an announcer this host no longer runs
+  # Removing it uncovers the distro package's own unit, which lives in
+  # /lib/systemd/system -- the same relationship the teardown path at
+  # the top of this file has, and the reason a `systemctl disable` has
+  # to have come first: deb-systemd-helper will not re-enable a unit an
+  # admin disabled, so it stays down across reboots and upgrades.
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item.item }}.service"
+    state: absent
+  loop: "{{ stortree_samba_wsdd_superseded.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('') }}"
+  notify: stortree wsdd unit changed
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+    - item.stat.exists | default(false)
+  tags: [samba]
+
 - name: Render the WS-Discovery unit
-  # Shadows the distro package's own unit where it ships one; see the
-  # template's header for why that is the arrangement rather than a
-  # second unit name plus a mask. No `validate:` equivalent exists for a
-  # systemd unit, so the guard on this one's correctness is the render
-  # test in tests/test_templates.py.
+  # Shadows the distro package's own unit where it ships one -- under
+  # that package's own unit name, which is why the destination follows
+  # the flavour rather than being fixed at wsdd.service. Rendering
+  # stortree's announcer as `wsdd.service` on a trixie host would leave
+  # the packaged `wsdd2.service` enabled and running beside it: two
+  # announcers, one of them stortree's and one of them the distro's
+  # defaults. See the template's header for why shadowing is the
+  # arrangement rather than a second unit name plus a mask. No
+  # `validate:` equivalent exists for a systemd unit, so the guard on
+  # this one's correctness is the render test in tests/test_templates.py.
   ansible.builtin.template:
     src: wsdd.service.j2
-    dest: /etc/systemd/system/wsdd.service
+    dest: "/etc/systemd/system/{{ stortree_samba_wsdd_unit }}.service"
     owner: root
     group: root
     mode: "0644"
@@ -338,7 +537,7 @@
   # between an announcer that comes up now and one that comes up at the
   # next reboot. Same self-healing reason as smbd's own task above.
   ansible.builtin.systemd_service:
-    name: wsdd
+    name: "{{ stortree_samba_wsdd_unit }}"
     enabled: true
     state: started
     daemon_reload: true

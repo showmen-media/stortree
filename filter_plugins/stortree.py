@@ -3352,6 +3352,33 @@ def samba_write_tokens(access_list, include_self=False):
     return list(dict.fromkeys(tokens))
 
 
+def apt_installable(policy_stdout, names):
+    """Which of `names` `apt-cache policy` reported an installation
+    candidate for, in the order given.
+
+    `apt-cache policy a b` prints one block per name, and a name apt has
+    never heard of either gets a block whose `Candidate:` reads "(none)"
+    or -- if nothing in the archive so much as references it -- no block
+    at all and a note on stderr. Both mean the same thing here, so both
+    resolve to "not installable" rather than to two different errors.
+
+    stortree_samba uses this to pick a WS-Discovery implementation:
+    Debian dropped the Python `wsdd` after bookworm and ships the
+    unrelated C `wsdd2` instead, so "which package does this platform
+    have" is a question about the host's apt cache, not about its
+    release codename -- a codename table would have to be extended for
+    every future release, and would still be wrong on a host whose
+    `universe`/backports configuration differs from the fleet's."""
+    blocks = {}
+    current = None
+    for line in policy_stdout.splitlines():
+        if line and not line[0].isspace():
+            current = line.rstrip(":").strip()
+        elif current and line.strip().startswith("Candidate:"):
+            blocks[current] = line.split(":", 1)[1].strip()
+    return [n for n in names if blocks.get(n, "(none)") != "(none)"]
+
+
 # Which unit family renders each kind of plan entry. A `dir` has no
 # unit at all. Kept as one mapping because three separate places read it
 # -- the render tasks, the stale-unit sweep, and status.yml -- and a
@@ -3451,6 +3478,76 @@ def path_masked(path, masked_paths):
     previous run -- showed this needed to walk the whole ancestor chain,
     not just check one level)."""
     return any(path == m or path.startswith(m + "/") for m in masked_paths)
+
+
+def _mountinfo_unescape(field):
+    """One /proc/self/mountinfo field with its octal escapes resolved.
+
+    The kernel escapes space, tab, newline and backslash as \\040, \\011,
+    \\012 and \\134 in the paths it prints there. None of them appear in a
+    stortree path -- slugs are built from config.yml keys -- but the
+    field is a path the *operator* chose (stortree_remotes_root) and
+    comparing a raw escape against a real path is a silent miss, not an
+    error, so it is worth the three lines."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _mountinfo_targets(mountinfo):
+    """Every path currently mounted on, from the text of a host's
+    /proc/self/mountinfo.
+
+    Deliberately not `ansible_facts.mounts`: Ansible's own mount-fact
+    gathering drops any mount whose device string neither starts with
+    "/" nor contains ":/", which silently loses some of this fleet's own
+    rclone mounts (see stortree_mounts' probe task for the case that hit
+    production). It is also not a `stat` -- reading mountinfo touches no
+    filesystem at all, so a hung or half-dead FUSE mount elsewhere in
+    the tree cannot block the answer, which matters because the callers
+    below run on hosts where exactly that is the thing being diagnosed.
+
+    Field 5 (index 4) is the mount point; the fields before it are fixed
+    in number, so this needs no fragile scan for the "-" separator that
+    precedes the variable-length tail."""
+    return {
+        _mountinfo_unescape(fields[4])
+        for fields in (line.split() for line in mountinfo.splitlines())
+        if len(fields) > 4
+    }
+
+
+def mounted_transport_slugs(plan, mountinfo, remotes_root):
+    """The slugs of `plan`'s transports that have something mounted on
+    their own mountpoint right now (`mountinfo` being the text of this
+    host's /proc/self/mountinfo).
+
+    stortree_mounts uses this to decide whether a path that resolves
+    *inside* a transport may be created yet, and getting that wrong is
+    not a missed directory -- it is an unrecoverable one. A transport's
+    mountpoint under the remotes root is an ordinary local directory
+    while the mount is down, so `file: state: directory` on anything
+    beneath it writes to the underlying disk instead of to the backend,
+    and rclone then refuses to ever mount there again ("is not empty,
+    use --allow-non-empty to mount anyway"). The transport being down is
+    what caused the stray directories, and the stray directories are
+    what keep it down: without this check one failed mount is permanent.
+    What buries it deeper is that the strays outlive the config they
+    came from -- the production host this was found on had a mountpoint
+    held shut by two dozen empty directories under names (`mp-fam`) that
+    a later rename (`_mp-fam`) had already retired, so nothing in the
+    current plan even referred to them any more.
+
+    The masked-path check next door does not cover this. It asks whether
+    root can *reach* a path -- which a plain empty directory under a
+    stopped mount answers "yes" to, cheerfully and wrongly. This asks
+    the different question of whether what is at that path is the
+    backend or the bare disk."""
+    mounted = _mountinfo_targets(mountinfo)
+    return [
+        entry["slug"]
+        for entry in plan
+        if entry["kind"] == "transport"
+        and f"{remotes_root.rstrip('/')}/{entry['local_path']}" in mounted
+    ]
 
 
 # -- metrics endpoints (monitoring, layered over the plan) ----------------
@@ -3652,6 +3749,8 @@ class FilterModule(object):
             "stortree_slug": _slug,
             "stortree_stale_units": stale_unit_names,
             "stortree_path_masked": path_masked,
+            "stortree_mounted_transports": mounted_transport_slugs,
+            "stortree_apt_installable": apt_installable,
             "stortree_ownership_mismatch": ownership_mismatch,
             "stortree_samba_access_tokens": samba_access_tokens,
             "stortree_samba_write_tokens": samba_write_tokens,

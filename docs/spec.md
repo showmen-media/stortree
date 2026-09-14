@@ -527,7 +527,7 @@ clients, and none of them reaches all three:
 
 | Protocol | Reaches | On this host |
 | --- | --- | --- |
-| WS-Discovery | Windows 10/11 Explorer's "Network" | `wsdd`, from a unit stortree renders |
+| WS-Discovery | Windows 10/11 Explorer's "Network" | `wsdd` or `wsdd2`, from a unit stortree renders |
 | mDNS / DNS-SD | macOS Finder, GNOME Files | a static Avahi service file |
 | NetBIOS | old Windows, `smbclient -L`, name lookups | `nmbd`, from the `samba` package |
 
@@ -553,23 +553,38 @@ host removed from `stortree_samba_hosts` kept announcing itself for
 shares it no longer exported, and the smb.conf handler reloaded `smbd`
 without reloading the daemon that actually announces the `workgroup`.
 
-Two implementation notes that are load-bearing rather than incidental:
+Three implementation notes that are load-bearing rather than incidental:
 
-- **The workgroup has one definition.** `smb.conf`'s `[global]` and
-  wsdd's `--workgroup` are two readers of
+- **The workgroup has one definition.** `smb.conf`'s `[global]` and the
+  announcer's own workgroup flag are two readers of
   `stortree_samba_global_defaults` (merged with `stortree_samba_globals`
   into `stortree_samba_workgroup`), because a host serving one workgroup
   while announcing itself into another is discoverable only by people
   looking in the wrong place, and nothing about it looks broken. The
   seam has a test (`tests/test_templates.py`).
-- **The wsdd unit is stortree's, and shadows the distro's.** Debian
-  bookworm and Ubuntu jammy package `wsdd` with a unit and an
-  `/etc/default/wsdd`; Ubuntu noble packages the binary alone. The role
-  renders `/etc/systemd/system/wsdd.service` on all three, which
-  overrides the packaged unit where there is one — one unit name
-  everywhere, no window in which two announcers run, and `--workgroup`
-  set from the value above. The binary's path differs too
-  (`/usr/sbin/wsdd` vs `/usr/bin/wsdd`) and is discovered per host.
+- **There are two WSD daemons, and which one a host runs is a property
+  of its archive.** `wsdd` (Steffen Christgau's Python daemon) on Debian
+  bookworm and Ubuntu jammy/noble; `wsdd2` (Andy2244's unrelated C
+  daemon) on Debian trixie, which dropped `wsdd`. They share no flag, no
+  binary name, no unit name and no privilege model, so the role asks
+  `apt-cache policy` which of the two is installable rather than mapping
+  release codenames, and renders the one template for whichever it gets
+  (`stortree_samba_wsd_implementation` pins it instead). `wsdd2` takes a
+  single `-i`, so an interface list longer than one entry fails the
+  apply rather than silently announcing on all of them.
+- **The announcer's unit is stortree's, and shadows the distro's.**
+  Debian bookworm and Ubuntu jammy package `wsdd` with a unit and an
+  `/etc/default/wsdd`; Ubuntu noble packages the binary alone; trixie's
+  `wsdd2` ships a unit its own postinst enables and starts. The role
+  renders `/etc/systemd/system/<that package's unit name>.service`,
+  which overrides the packaged unit where there is one — no window in
+  which two announcers run, and the workgroup set from the value above.
+  A fixed unit name would instead leave trixie's packaged
+  `wsdd2.service` running beside stortree's. The binary's path differs
+  too (`/usr/sbin/wsdd` vs `/usr/bin/wsdd` vs `/usr/sbin/wsdd2`) and is
+  discovered per host — as is the unit a host previously ran under the
+  other implementation's name, which is stopped and removed so an
+  in-place release upgrade cannot leave two.
 
 Samba can register `_smb._tcp` over mDNS itself, but only when built
 against Avahi, which the Debian and Ubuntu packages are not — `smbd`

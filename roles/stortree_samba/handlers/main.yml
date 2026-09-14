@@ -36,7 +36,7 @@
   # changed" are the same event. Skipped on the path where the unit was
   # removed rather than re-rendered -- there is nothing there to restart.
   ansible.builtin.systemd_service:
-    name: wsdd
+    name: "{{ stortree_samba_wsdd_unit }}"
     state: restarted
   when:
     - inventory_hostname in stortree_samba_hosts

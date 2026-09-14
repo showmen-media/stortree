@@ -14,7 +14,12 @@
 #      used to be a mount is a plain empty directory by the time
 #      anything tries to bind onto it
 #   4. probe which resolved mountpoints are active but unreachable
-#      ("masked"), and skip those paths for the rest of the run
+#      ("masked"), and skip those paths for the rest of the run; read
+#      /proc/self/mountinfo for which transports are actually mounted,
+#      and skip everything that resolves inside one that is not  ----
+#      writing into a transport's mountpoint while its mount is down
+#      leaves content on the local disk that rclone then refuses to
+#      mount over, so a mount that failed once could never come back
 #   5. create directories: parents, mountpoints/plain dirs, per-user
 #      staging dirs, bind mountpoints and their parents  ---- every one
 #      of these is `ignore_errors: true`; see below for why that is
@@ -596,6 +601,57 @@
          | map(attribute='local_path') | list }}
   tags: [mounts]
 
+- name: Read this host's mount table
+  # /proc/self/mountinfo rather than `ansible_facts.mounts` (which drops
+  # some of this fleet's own rclone mounts outright -- the probe task
+  # above has the detail) and rather than a `stat` or `mountpoint` per
+  # path: this is a single read of one kernel-generated file that
+  # touches no filesystem, so it cannot itself hang on the very mount
+  # whose health is in question. The apply that prompted this task
+  # opened with fifteen "Timeout exceeded when getting mount info"
+  # warnings, which is exactly that failure mode.
+  ansible.builtin.slurp:
+    src: /proc/self/mountinfo
+  register: stortree_mountinfo
+  tags: [mounts]
+
+- name: Note which transports are actually mounted right now
+  # The gate on creating anything *inside* a transport, below. A
+  # transport's mountpoint is an ordinary local directory whenever its
+  # unit is down, so creating a nested path then writes to the
+  # underlying disk rather than to the backend -- and rclone refuses for
+  # good to mount over a directory that is not empty ("is not empty, use
+  # --allow-non-empty to mount anyway"). That makes the two failures
+  # feed each other: the mount being down is what lets the stray
+  # directories be created, and the stray directories are what stop it
+  # ever coming back. One transient failure -- an unreachable peer, a
+  # backend that was down at the wrong moment -- becomes permanent.
+  #
+  # It costs nothing to create them and there is nothing to notice
+  # afterwards, which is why this ran for a long time before anyone
+  # looked: the strays are empty directories, and they outlive the
+  # config that named them. The production host this was found on had
+  # its transport held shut by two dozen empty directories under names a
+  # later rename had retired (`mp-fam`, where the plan now says
+  # `_mp-fam`) -- nothing in the current plan referred to them, and
+  # nothing in the tree was missing except the entire mount.
+  #
+  # The masked-path check a few tasks up does not catch this and is not
+  # meant to: it asks whether root can *reach* a path, and a plain empty
+  # directory under a stopped mount answers yes. This asks whether what
+  # is at that path is the backend or the bare disk.
+  #
+  # Skipping is always safe, and always recoverable: a path that is not
+  # created today is created by the next apply once its transport is up
+  # -- the same deliberate "two-run" convergence this file's header
+  # describes for any brand-new nested entry.
+  ansible.builtin.set_fact:
+    stortree_transports_mounted: >-
+      {{ stortree_mounts_plan
+         | stortree_mounted_transports(stortree_mountinfo.content | b64decode,
+                                       stortree_remotes_root) }}
+  tags: [mounts]
+
 - name: Ensure the remotes root exists
   # Layer 1 lives here: the raw, ungoverned view of every backend this
   # host mounts, outside stortree_root and never part of the visible
@@ -612,9 +668,20 @@
   tags: [mounts]
 
 - name: Ensure every transport mountpoint exists under the remotes root
-  # Real local directories, created a level at a time by the plan's own
-  # shallowest-first order so a nested transport's mountpoint is made
-  # before the transport above it is asked to serve it.
+  # Real local directories -- but only a *top-level* transport's is
+  # local. A nested transport's mountpoint lives inside the transport
+  # above it, which means it is a directory on that transport's backend
+  # and can only be created through the running mount, so it waits for
+  # one (`requires_transport`, and the mounted-transports fact above).
+  #
+  # Creating it anyway while the parent is down is precisely what
+  # poisons the parent's mountpoint and locks it out permanently: the
+  # directory lands on the local disk underneath, and rclone will not
+  # mount over it afterwards. That is how the failure this guard exists
+  # for actually presented -- the two nested `_mp-fam`/`_psychias-media`
+  # mounts on a peer host each reported "no such file or directory" for
+  # their own mountpoint, while the parent they live in reported "is not
+  # empty" for content a previous apply had written there.
   ansible.builtin.file:
     path: "{{ stortree_remotes_root ~ '/' ~ item.local_path }}"
     state: directory
@@ -625,7 +692,11 @@
     {{ stortree_mounts_plan | selectattr('kind', 'equalto', 'transport') | list }}
   loop_control:
     label: "{{ item.local_path }}"
-  when: not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
+  when:
+    - not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
+    - >-
+      item.requires_transport is none
+      or item.requires_transport in stortree_transports_mounted
   ignore_errors: true
   tags: [mounts]
 
@@ -647,6 +718,13 @@
   # Transport mountpoints are excluded -- the task above already made
   # them, and touching them again would be writing at the mount's own
   # root rather than into it.
+  #
+  # And nothing here runs at all until the transport it resolves inside
+  # is actually mounted. "On the backend" is only true while the mount
+  # is up; with it down, every path below writes to the local disk under
+  # the mountpoint instead, which is both the wrong place for the
+  # content and a mountpoint rclone will never mount over again. See the
+  # mounted-transports fact above.
   ansible.builtin.file:
     path: "{{ stortree_remotes_root ~ '/' ~ item.local_path }}"
     state: directory
@@ -662,6 +740,7 @@
   when:
     - item.local_path not in stortree_transport_paths
     - not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
+    - item.transport_slug in stortree_transports_mounted
   ignore_errors: true
   tags: [mounts]
 
