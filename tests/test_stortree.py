@@ -1106,23 +1106,32 @@ def test_filter_rclone_conf_group_only_peer_section_collapses_to_one():
 def test_needed_groups_covers_server_subtrees_and_peer_dependencies():
     # gadget owns nothing (no server_subtrees at all) -- every group it
     # needs getent'd for comes from peer_dependencies alone, since that's
-    # the only place its per-user access grants show up
+    # the only place its per-user access grants show up. Plus `home`'s own
+    # `userdir-groups`, which is in no grant anywhere: gadget holds that
+    # path through its mount of `tree` and serves the share, so it has to
+    # resolve the household's home directories like every other host.
     r = resolve(EXAMPLE_TREE, "some-storage-gadget", EXAMPLE_HOSTS)
     assert needed_groups(r) == [
         "Media Production",
         "Michael Whitfield Family",
         "Whitfield Family & Friends",
+        "Whitfield Household",
     ]
 
     # bravo owns some per-user pieces itself (server_subtrees: mw-fam,
     # whitfield-media) and peer depends on the rest (alpha's sys-configs,
     # a user-only grant with no group; and media-prod, group-granted) --
-    # same combined group set as gadget's, just split across both sources
+    # same combined group set as gadget's, just split across both sources,
+    # and one more on top: the example gives bravo alone a
+    # `peers.storage-node-bravo.userdir-groups`, which adds to `home`'s
+    # own list rather than replacing it.
     r = resolve(EXAMPLE_TREE, "storage-node-bravo", EXAMPLE_HOSTS)
     assert needed_groups(r) == [
+        "Bravo Operators",
         "Media Production",
         "Michael Whitfield Family",
         "Whitfield Family & Friends",
+        "Whitfield Household",
     ]
 
 
@@ -3861,6 +3870,297 @@ def test_writing_samba_subpath_is_rejected_even_where_it_matched_the_derivation(
     }
     with pytest.raises(ValueError, match="no longer written"):
         resolve(tree, "h1", ["h1"])
+
+
+# -- `userdir-groups` ------------------------------------------------------
+#
+# Who has a per-user directory under a node used to be answerable only
+# from underneath it: whoever an `access` grant on some descendant
+# happened to name. `userdir-groups` lets the node say so itself, which
+# is a second source for the same set rather than a replacement -- the
+# grants beneath it still contribute exactly as they did.
+
+
+def test_userdir_groups_makes_a_container_for_every_member():
+    tree = {
+        "tree": {
+            "host": "h1",
+            "subdirs": {"home": {"userdir-groups": ["Fam"], "user-subdirs": {}}},
+        }
+    }
+    plan = plan_index(
+        plan_mounts(resolve(tree, "h1", ["h1"]), {"Fam": ["ann", "bo"]})
+    )
+    assert "tree/home/ann" in plan and "tree/home/bo" in plan
+    # An ordinary home directory: the plain `owner` grant every container
+    # gets, private to that user plus the traversal bit.
+    assert plan["tree/home/ann"]["access"]["owner"] == "ann"
+    assert access_mode(plan["tree/home/ann"]["access"]) == "0701"
+
+
+def test_userdir_groups_adds_to_the_grants_beneath_it():
+    # Both sources feed one set. `cat` is a member of neither group but
+    # owns something nested, and still gets the one container they always
+    # did; `ann` is in the named group and gets one with nothing granted
+    # inside it at all, which is what the key exists for.
+    tree = {
+        "tree": {
+            "host": "h1",
+            "subdirs": {
+                "home": {
+                    "userdir-groups": ["Fam"],
+                    "user-subdirs": {"notes": {"access.owner": "cat"}},
+                }
+            },
+        }
+    }
+    plan = plan_index(plan_mounts(resolve(tree, "h1", ["h1"]), {"Fam": ["ann"]}))
+    assert "tree/home/ann" in plan
+    assert "tree/home/cat" in plan
+    assert "tree/home/cat/notes" in plan
+    assert "tree/home/ann/notes" not in plan
+
+
+def test_a_user_in_both_sources_gets_one_container():
+    tree = {
+        "tree": {
+            "host": "h1",
+            "subdirs": {
+                "home": {
+                    "userdir-groups": ["Fam"],
+                    "user-subdirs": {"notes": {"access.owner": "ann"}},
+                }
+            },
+        }
+    }
+    plan = plan_mounts(resolve(tree, "h1", ["h1"]), {"Fam": ["ann"]})
+    assert [e["local_path"] for e in plan].count("tree/home/ann") == 1
+
+
+def test_userdir_groups_needs_no_user_subdirs():
+    # The config a `user-subdirs` node could never express: per-user
+    # folders with nothing shared inside them. Home directories.
+    tree = {"tree": {"host": "h1", "samba": {}, "userdir-groups": ["Fam"]}}
+    resolved = resolve(tree, "h1", ["h1"])
+    (share,) = resolved["samba_shares"]
+    assert share["subpath"] == PER_USER_PLACEHOLDER
+    plan = plan_index(plan_mounts(resolved, {"Fam": ["ann"]}))
+    assert "tree/ann" in plan
+
+
+@pytest.mark.parametrize("block", [[], None], ids=["empty", "bare"])
+def test_an_empty_userdir_groups_block_is_still_a_per_user_share(block):
+    # Presence, not contents -- the same reading `user-subdirs` gets.
+    # Emptying the list says nobody is in it yet, not that the node
+    # stopped being per-user, and reading it the other way would widen
+    # the share from one user's folder to the directory holding
+    # everyone's.
+    tree = {"tree": {"host": "h1", "samba": {}, "userdir-groups": block}}
+    (share,) = resolve(tree, "h1", ["h1"])["samba_shares"]
+    assert share["subpath"] == PER_USER_PLACEHOLDER
+
+
+def test_a_group_with_no_members_makes_no_directories():
+    # Membership is host-local identity, not config: an empty group is an
+    # ordinary state, resolved at apply time and not an error here.
+    tree = {"tree": {"host": "h1", "userdir-groups": ["Fam"]}}
+    plan = plan_index(plan_mounts(resolve(tree, "h1", ["h1"]), {"Fam": []}))
+    assert [p for p in plan if p.startswith("tree/")] == []
+
+
+def test_needed_groups_covers_userdir_groups():
+    # Without this the `getent group` lookup never asks about the group,
+    # membership resolves empty, and the directories are silently unmade.
+    tree = {"tree": {"host": "h1", "userdir-groups": ["Fam"]}}
+    assert needed_groups(resolve(tree, "h1", ["h1"])) == ["Fam"]
+
+
+def test_needed_users_covers_userdir_group_members():
+    # The containers need their owners' numeric UIDs, same as any other.
+    tree = {"tree": {"host": "h1", "userdir-groups": ["Fam"]}}
+    resolved = resolve(tree, "h1", ["h1"])
+    assert needed_users(resolved, {"Fam": ["ann", "bo"]}) == ["ann", "bo"]
+
+
+def test_userdir_groups_reaches_the_worked_examples_home_share():
+    # End-to-end on the shipped example. `pat` is in the household and is
+    # named by no grant anywhere in the tree -- exactly the home
+    # directory that could not exist before the key -- while `jd` and
+    # `mw` keep the folders their grants always gave them. Bravo alone
+    # also serves its own operators', added by its peer block rather than
+    # substituted for the list `home` itself wrote.
+    group_members = {
+        "Whitfield Household": ["jd", "mw", "pat"],
+        "Whitfield Family & Friends": ["jd", "mw"],
+        "Michael Whitfield Family": ["mw"],
+        "Media Production": ["jd"],
+        "Bravo Operators": ["ops"],
+    }
+    homes = {
+        host: {
+            e["local_path"]
+            for e in plan_mounts(
+                resolve(EXAMPLE_TREE, host, EXAMPLE_HOSTS), group_members
+            )
+            if e["local_path"].count("/") == 2
+            and e["local_path"].startswith("tree/home/")
+        }
+        for host in EXAMPLE_HOSTS
+    }
+    for host in ("storage-node-alpha", "some-storage-gadget"):
+        # The synthetic `.mounts` segment a group-only grant's one real
+        # shared mount lives under is a level deeper, so this set is
+        # home directories and nothing else.
+        assert homes[host] == {
+            "tree/home/jd",
+            "tree/home/mw",
+            "tree/home/pat",
+        }
+    assert homes["storage-node-bravo"] == homes["storage-node-alpha"] | {
+        "tree/home/ops"
+    }
+
+
+def test_a_peer_block_adds_userdir_groups_rather_than_replacing_them():
+    # The one peer-block key that composes additively: `rclone`,
+    # `access` and `samba` each describe one host's copy and replace what
+    # the node said, while this one says who the node is *for*, and a
+    # host serving one more group still serves the node's own.
+    tree = {
+        "tree": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "home": {
+                    "userdir-groups": ["Fam"],
+                    "peers": {"h2": {"userdir-groups": ["Extra"]}},
+                    "user-subdirs": {},
+                }
+            },
+        }
+    }
+    members = {"Fam": ["ann"], "Extra": ["zed"]}
+    hosts = ["h1", "h2"]
+
+    (parent,) = resolve(tree, "h2", hosts)["userdir_parents"]
+    assert parent == {"local_path": "tree/home", "groups": ["Fam", "Extra"]}
+    plan = plan_index(plan_mounts(resolve(tree, "h2", hosts), members))
+    assert "tree/home/ann" in plan and "tree/home/zed" in plan
+
+    # And the owner reads no peer block at all -- those describe a host
+    # holding a copy, and the owner holds the original.
+    (parent,) = resolve(tree, "h1", hosts)["userdir_parents"]
+    assert parent == {"local_path": "tree/home", "groups": ["Fam"]}
+    plan = plan_index(plan_mounts(resolve(tree, "h1", hosts), members))
+    assert "tree/home/ann" in plan and "tree/home/zed" not in plan
+
+
+def test_a_peer_added_group_reaches_a_host_that_owns_a_node_underneath():
+    # No mount to inherit the owner's folders from: h2 reaches this node
+    # only by owning something under it, so it has to create the whole
+    # set itself.
+    tree = {
+        "tree": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "peer-defaults": {"rclone": False},
+            "subdirs": {
+                "home": {
+                    "userdir-groups": ["Fam"],
+                    "peers": {"h2": {"userdir-groups": ["Extra"]}},
+                    "user-subdirs": {"media": {"host": "h2", "access.owner": "cat"}},
+                }
+            },
+        }
+    }
+    plan = plan_index(
+        plan_mounts(
+            resolve(tree, "h2", ["h1", "h2"]), {"Fam": ["ann"], "Extra": ["zed"]}
+        )
+    )
+    for user in ("ann", "zed", "cat"):
+        assert f"tree/home/{user}" in plan
+
+
+def test_a_host_that_holds_nothing_at_the_node_plans_no_user_directories():
+    # `peers.<h>.userdir-groups` on a subtree that same host is opted out
+    # of would otherwise leave it a stray local tree of empty home
+    # directories backing nothing.
+    tree = {
+        "tree": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "peer-defaults": {"rclone": False},
+            "subdirs": {
+                "home": {
+                    "userdir-groups": ["Fam"],
+                    "peers": {"h2": {"userdir-groups": ["Extra"]}},
+                    "user-subdirs": {},
+                }
+            },
+        }
+    }
+    resolved = resolve(tree, "h2", ["h1", "h2"])
+    assert resolved["userdir_parents"] == []
+    assert plan_mounts(resolved, {"Fam": ["ann"], "Extra": ["zed"]}) == []
+
+
+def test_a_group_named_twice_is_named_once():
+    # Deduped at every level a name can be repeated: within one list,
+    # between a peer block's two halves, and between a peer block and the
+    # node's own list. Nothing downstream breaks on a repeat -- the
+    # containers dedupe by path too -- but `userdir_parents` is read by
+    # `needed_groups()` and by a person auditing who has a folder where,
+    # and a name listed twice tells neither of them anything new.
+    tree = {
+        "tree": {
+            "host": "h1",
+            "rclone.remote": "r1:/",
+            "subdirs": {
+                "home": {
+                    "userdir-groups": ["Fam", "Fam", "Staff"],
+                    "peer-defaults": {"userdir-groups": ["Staff", "Extra"]},
+                    "peers": {"h2": {"userdir-groups": ["Extra", "Fam"]}},
+                    "user-subdirs": {},
+                }
+            },
+        }
+    }
+    hosts = ["h1", "h2"]
+    (own,) = resolve(tree, "h1", hosts)["userdir_parents"]
+    assert own["groups"] == ["Fam", "Staff"]
+    (peer,) = resolve(tree, "h2", hosts)["userdir_parents"]
+    assert peer["groups"] == ["Fam", "Staff", "Extra"]
+
+
+def test_a_peer_block_userdir_groups_needs_a_per_user_node():
+    # It adds to a per-user level the node already declares; it cannot
+    # create one for a single host. The share path is derived from the
+    # node's shape and has to be the same everywhere, so a node that were
+    # per-user on one host and not on another would answer to one name
+    # while serving every user's folder to every user on all the rest.
+    tree = {"tree": {"host": "h1", "peers": {"h2": {"userdir-groups": ["Extra"]}}}}
+    with pytest.raises(ValueError) as excinfo:
+        resolve(tree, "h1", ["h1", "h2"])
+    message = str(excinfo.value)
+    assert "peers.h2.userdir-groups" in message
+    assert "does not create one for a single host" in message
+
+
+def test_userdir_groups_rejects_a_malformed_value():
+    with pytest.raises(ValueError, match="must be a list of group names"):
+        resolve({"tree": {"host": "h1", "userdir-groups": "Fam"}}, "h1", ["h1"])
+    with pytest.raises(ValueError, match="non-empty group name"):
+        resolve({"tree": {"host": "h1", "userdir-groups": [7]}}, "h1", ["h1"])
+    with pytest.raises(ValueError, match="non-empty group name"):
+        resolve({"tree": {"host": "h1", "userdir-groups": [""]}}, "h1", ["h1"])
+
+
+def test_a_misspelled_userdir_groups_is_rejected_rather_than_ignored():
+    # Silently ignored, it is a node whose home directories simply never
+    # appear, with nothing at apply time saying why.
+    with pytest.raises(ValueError, match="userdir-groups"):
+        resolve({"tree": {"host": "h1", "userdir-group": ["Fam"]}}, "h1", ["h1"])
 
 
 # -- the two passes over a finished plan -----------------------------------

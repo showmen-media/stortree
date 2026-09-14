@@ -44,6 +44,10 @@ its own, shaped exactly like any other node below it:
                                # host (and adding one where the node has none); see
                                # "Per-host shares" below. Does not inherit — it marks
                                # this node only, never its descendants
+    userdir-groups: [...]      # optional — extra groups whose members get a per-user
+                               # directory here on every non-owning host. The one peer
+                               # key that *adds* rather than replaces; see
+                               # "`userdir-groups`" below
 
   peers:
     <hostname>:
@@ -57,6 +61,9 @@ its own, shaped exactly like any other node below it:
       samba: {...}             # optional per-peer override of peer-defaults.samba;
                                # `samba: false` withdraws the share on this host alone.
                                # See "Per-host shares" below
+      userdir-groups: [...]    # optional — added to peer-defaults.userdir-groups and to
+                               # the node's own list for this host, never replacing
+                               # either; see "`userdir-groups`" below
 
   requires: [<path>, ...]      # optional — other subtrees whose mounts must be up
                                # before this one starts; tree-relative paths, a bare
@@ -76,9 +83,10 @@ its own, shaped exactly like any other node below it:
                                # — every participating host exposes this node
                                # as a share, not just its resolved owner; see
                                # "Samba sharing is universal" below. The share
-                               # path is derived: a node with `user-subdirs`
-                               # gets Samba's per-user `%U`, one without serves
-                               # the node itself
+                               # path is derived: a node that declares a per-user
+                               # level (`user-subdirs` or `userdir-groups`) gets
+                               # Samba's per-user `%U`, one without serves the
+                               # node itself
     name: "<share-name>"      # optional — the share's name in smb.conf, i.e. what
                                # SMB clients mount as //<host>/<name>; defaults to the
                                # node's path with everything outside [A-Za-z0-9_-]
@@ -92,6 +100,10 @@ its own, shaped exactly like any other node below it:
   subdirs: {...}               # recurse — this and everything under it works exactly the
                                # same as it does at the top level, just nested
   user-subdirs: {...}          # recurse — see note below
+  userdir-groups: [<group>, ...]  # optional — the groups whose members get a per-user
+                               # directory under this node. Declares the per-user level
+                               # in its own right, so it needs no `user-subdirs` beside
+                               # it; see "`userdir-groups`" below
 ```
 
 ### Example
@@ -112,7 +124,10 @@ host's own remote-backed mount is exactly the kind of collision
 top-level subtrees exist to avoid (see "Top-level subtrees" below), and
 each sets `peer-defaults.rclone: false` since nothing but its own
 owning host ever needs it mounted (or, for `.gcs-cache`, created at all)
-anywhere else:
+anywhere else. `home` shows both halves of the `userdir-groups` key
+("`userdir-groups`" below): the household whose members get a home
+directory on every host regardless of what is granted inside it, and the
+one group `storage-node-bravo` alone adds on top of that list:
 
 ```yaml
 tree:
@@ -142,6 +157,12 @@ tree:
     backups: {}
     home:
       samba:
+      userdir-groups:
+        - "Whitfield Household"
+      peers:
+        storage-node-bravo:
+          userdir-groups:
+            - "Bravo Operators"
       user-subdirs:
         whitfield-media:
           access:
@@ -264,7 +285,9 @@ though the resolved filesystem still puts them all under the one fixed
 A host that holds a copy of a subtree it doesn't own is a **peer** of the
 subtree's owning host, and `peers:`/`peer-defaults:` are where its copy
 is configured — mount args, an `access` grant of its own, a `samba:`
-block of its own.
+block of its own, and extra `userdir-groups` to serve home directories
+for (the one key of the four that adds to what the node said rather than
+replacing it — see "Adding groups on one host" below).
 
 The name is the mechanism. A non-owning host never mounts the subtree's
 `rclone.remote` itself and never holds credentials for it: it makes an
@@ -623,9 +646,11 @@ Same map-of-`name -> node` shape, but they resolve differently:
   has `user-subdirs` (see "Samba sharing is universal"), so an SMB
   client lands in its own per-user folder rather than in the directory
   holding everyone's.
-  `access` on each descendant still applies per the usual rules, so
-  `sys-configs` (`access.owner: jd`) only shows up inside `jd`'s own
-  per-user folder, not everyone else's — an `owner` grant always pins
+  Which users get a folder is answered from two places: the groups the
+  node names in `userdir-groups` (below), and the grants on the
+  descendants themselves. `access` on each descendant still applies per
+  the usual rules, so `sys-configs` (`access.owner: jd`) only shows up
+  inside `jd`'s own per-user folder, not everyone else's — an `owner` grant always pins
   a single folder like this, whether or not the node also carries a
   `group`; only a `group`-only grant (`mw-fam`, `media-prod`) expands
   into one folder per member. See "Access" below for how that grant then
@@ -659,6 +684,112 @@ Same map-of-`name -> node` shape, but they resolve differently:
   §6 ("The two layers") for the mechanism, and its own note there
   on what this means for a sibling like `mw-fam`'s bind mount, which
   has to wait for that presentation too.
+
+### `userdir-groups`
+
+A list of group names, on a node, saying whose per-user directories live
+under it:
+
+```yaml
+home:
+  samba:
+  userdir-groups:
+    - "Michael Whitfield Family & Friends"
+  user-subdirs:
+    mw-fam:
+      access.group: "Michael Whitfield Family"
+      rclone.remote: some-remote:/fam
+```
+
+Every member of every group named gets a folder — `home/jd`, owned
+outright by `jd` and private to them, exactly the container a
+`user-subdirs` descendant's grant already implies for its own users
+("`subdirs` vs `user-subdirs`" above).
+
+**It adds a source, it doesn't replace one.** The grants underneath
+still resolve to folders exactly as they did: `mw-fam` above puts one in
+each family member's home whether or not the group is also listed here,
+and a descendant with `access.owner: jd` still pins one to `jd` alone. A
+user who is named both ways gets the one folder either way would have
+made. What the key changes is that the answer no longer has to come from
+underneath.
+
+Without it, membership is emergent — a home directory exists because
+something happened to be granted inside it, and stops existing when that
+grant is commented out. That is backwards for the thing the docs already
+describe a per-user folder as: "an ordinary home directory, not just a
+passthrough to whatever's granted beneath it". `%U` earns each connecting
+user a standing entry in the share's `valid users` ("The share path"
+below) precisely so their own folder doesn't depend on any descendant
+carrying a grant; this is the config half of the same statement.
+
+**Groups only.** An individual is named with `access.owner` on something
+beneath, which already pins exactly one folder to exactly one person. A
+second way to name one person would only be a second place to look when
+asking who has a folder here. Group membership is the part that lives in
+LDAP rather than in this file (spec.md §5), which is what the key is for
+— and why a group with no members yet, or none this host can resolve,
+makes no directories and is not an error.
+
+**It declares the per-user level by itself.** `user-subdirs` is optional
+beside it, and leaving it out is a real configuration rather than an
+incomplete one: per-user folders with no shared substructure inside them.
+Home directories and nothing else. The share path is derived from either
+key's presence, so such a node is still exported at `<node>/%U` ("The
+share path" below).
+
+Presence, not contents, exactly as `user-subdirs` is read: `userdir-groups:
+[]` and a bare `userdir-groups:` say nobody is in the list yet, never
+that the node stopped being per-user.
+
+#### Adding groups on one host
+
+A `peer-defaults`/`peers.<hostname>` block may carry a `userdir-groups`
+of its own, and it is the one peer key that **adds** to what the node
+said rather than replacing it:
+
+```yaml
+home:
+  userdir-groups: ["Michael Whitfield Family"]
+  peers:
+    storage-node-bravo:
+      userdir-groups: ["Michael Whitfield Family & Friends"]   # bravo serves both
+```
+
+`rclone`, `access` and `samba` in a peer block each describe one host's
+*copy* of a node — how it mounts it, what it enforces on it, whether it
+exports it — and a copy is one thing, so the nearest and most specific
+block wins outright ("Per-peer mount opt-out", "Peer-side access",
+"Per-host shares"). This key describes something else: who the node is
+for. A host that serves one more department's home directories does not
+thereby stop serving everyone else's, and reading it the way the other
+three are read would mean it could only ever do both by restating the
+owner's whole list — two lines meant to agree, drifting apart later. So
+the node's own list is the floor everywhere, `peer-defaults` adds to it
+on every non-owning host, and `peers.<hostname>` adds to that.
+
+Three limits, all of them the same rules the other peer keys follow:
+
+- **The owning host reads no peer block.** Those blocks describe a host
+  holding a copy; the owner holds the original.
+- **It doesn't inherit.** Like `samba`, it marks the one node it is
+  written on and says nothing about that node's descendants — which have
+  their own per-user level, or none.
+- **It can't create a per-user level for one host.** A peer block's
+  `userdir-groups` is an error on a node that has neither `user-subdirs`
+  nor a `userdir-groups` of its own. The share path is derived from the
+  node's shape and is the same on every host, so a node that were
+  per-user on one host and not on another would answer to one share name
+  while serving `<node>/%U` on the host that added the groups and
+  `<node>` — every user's folder, to every user — on all the rest. Give
+  the node its own `userdir-groups` (an empty list is enough) and add to
+  it in the peer block.
+
+A host only creates these directories where it actually holds the path:
+it mounts the node or an ancestor of it, or it owns a node somewhere
+beneath it. A `peers.<h>.userdir-groups` written on a subtree that same
+host is opted out of ("Per-peer mount opt-out") would otherwise leave it
+a stray local tree of empty home directories backing nothing.
 
 ### Access
 
@@ -990,15 +1121,16 @@ exactly as for a universal share, on the hosts that actually export it.
 
 Where a share points is derived from the node, not written:
 
-- a node with a `user-subdirs` key is exported at `<node>/%U` — Samba
+- a node that declares a per-user level — a `user-subdirs` key, a
+  `userdir-groups` key, or both — is exported at `<node>/%U`; Samba
   expands `%U` to the connecting username, so each user lands in their
   own folder;
-- a node without one is exported at `<node>` itself.
+- a node with neither is exported at `<node>` itself.
 
 There is no key for this. The node's shape already answers the question:
-`user-subdirs` means the node's immediate children *are* per-user
-folders, so a share of that node that didn't descend into one would be
-exposing every user's folder to every other user — over SMB, with
+either key means the node's immediate children *are* per-user folders,
+so a share of that node that didn't descend into one would be exposing
+every user's folder to every other user — over SMB, with
 nothing at apply time saying so. That was previously reachable two ways,
 by omitting the old `samba.subpath` key or by misspelling it, and is now
 unreachable.
@@ -1008,7 +1140,10 @@ It's the key's *presence* that decides, exactly as with `samba:` itself.
 yet, but they still say the node has a per-user level — reading them as
 "not per-user" would mean emptying a node's `user-subdirs` silently
 widens its share from one user's own folder to the directory holding
-everyone's.
+everyone's. An empty or bare `userdir-groups:` is read the same way, and
+a node that writes only `userdir-groups` has no shared substructure to
+declare at all — its per-user folders are plain home directories
+("`userdir-groups`" above).
 
 `%U` also earns each connecting user a standing entry in the share's
 `valid users`, so their access to their own folder doesn't depend on any

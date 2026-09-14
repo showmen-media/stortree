@@ -168,6 +168,7 @@ _NODE_KEYS = frozenset(
         "requires",
         "subdirs",
         "user-subdirs",
+        "userdir-groups",
         "peer-defaults",
         "peers",
     }
@@ -190,7 +191,13 @@ _SAMBA_KEYS = frozenset({"name", "hidden"})
 # itself takes, replacing the node's own export on this one host --
 # docs/config-schema.md "Per-host shares", and the only way to export a
 # node on some hosts and not others).
-_PEER_BLOCK_KEYS = frozenset({"rclone", "access", "samba"})
+#
+# `userdir-groups` is the fourth, and the one that composes differently:
+# where the other three describe one host's copy of a node and replace
+# what the node itself said, this one *adds* to the node's own list
+# rather than replacing it (_peer_userdir_groups(),
+# docs/config-schema.md "`userdir-groups`").
+_PEER_BLOCK_KEYS = frozenset({"rclone", "access", "samba", "userdir-groups"})
 _PEER_RCLONE_KEYS = frozenset({"args"})
 
 # "this block didn't set the key at all", as against setting it to
@@ -231,8 +238,9 @@ def _reject_samba_subpath(samba, node_path, block="samba"):
         raise ValueError(
             f"stortree: {node_path!r} sets `{block}.subpath`, which is no longer "
             f"written in config.yml -- it is derived from the node: one with a "
-            f"`user-subdirs` key gets the per-user {PER_USER_PLACEHOLDER!r} "
-            f"path, one without serves the node itself. Delete the line. See "
+            f"per-user level (a `user-subdirs` or `userdir-groups` key) gets "
+            f"the per-user {PER_USER_PLACEHOLDER!r} path, one without serves the "
+            f"node itself. Delete the line. See "
             f'docs/config-schema.md "Samba sharing is universal"'
         )
 
@@ -374,6 +382,10 @@ def _validate_node(node, node_path):
     _validate_permissions(node.get("access"), "access", node_path)
     _reject_samba_subpath(node.get("samba"), node_path)
     _reject_unknown_keys(node.get("samba"), _SAMBA_KEYS, "samba", node_path)
+    _normalize_userdir_groups(node.get("userdir-groups"), node_path)
+    # Whether the node declares a per-user level *in its own right*,
+    # which is what a peer block below is allowed to add groups to.
+    per_user_shaped = "user-subdirs" in node or "userdir-groups" in node
 
     for block in ("subdirs", "user-subdirs", "peers"):
         _require_mapping(node.get(block), block, node_path)
@@ -413,6 +425,31 @@ def _validate_node(node, node_path):
                 f"{name}.samba",
                 node_path,
             )
+            _normalize_userdir_groups(
+                entry.get("userdir-groups"),
+                node_path,
+                f"{name}.userdir-groups",
+            )
+            # A peer block adds groups to a per-user level the node
+            # already has; it cannot bring one into being for one host.
+            # The share path is derived from the node's shape and has to
+            # be the same everywhere (_normalize_samba()): a node that
+            # were per-user on one host and not on another would answer
+            # to one share name while serving `<node>/%U` on the host
+            # that added the groups and `<node>` -- every user's folder,
+            # to every user -- on all the rest.
+            if "userdir-groups" in entry and not per_user_shaped:
+                raise ValueError(
+                    f"stortree: {node_path!r} sets `{name}.userdir-groups` on "
+                    f"a node that has neither `user-subdirs` nor a "
+                    f"`userdir-groups` of its own -- a peer block adds groups "
+                    f"to a per-user level the node already declares, it does "
+                    f"not create one for a single host (the share path is "
+                    f"derived from the node and is the same on every host). "
+                    f"Give the node its own `userdir-groups` -- an empty list "
+                    f"is enough -- and add to it here. See "
+                    'docs/config-schema.md "`userdir-groups`"'
+                )
 
 
 def _access_mapping(raw):
@@ -623,8 +660,9 @@ def _normalize_samba(raw, node_path, per_user_parent):
 
     `raw` is the value as written -- `_UNSET` where the block didn't set
     the key at all -- and `per_user_parent` is whether the *node* it
-    belongs to has a `user-subdirs` key, which is what decides the
-    derived `subpath` below. Both are passed in rather than read off a
+    belongs to declares a per-user level (a `user-subdirs` or a
+    `userdir-groups` key), which is what decides the derived `subpath`
+    below. Both are passed in rather than read off a
     raw config node, because the value can come from either of two
     places now: the node's own `samba:`, or a `samba:` inside one of its
     `peer-defaults`/`peers.<host>` blocks (_peer_samba()). The
@@ -683,9 +721,62 @@ def _normalize_samba(raw, node_path, per_user_parent):
     # per-user -- both say the per-user level exists and currently
     # declares no substructure. Reading them as "not per-user" would
     # make emptying a node's `user-subdirs` silently widen its share
-    # from one user's folder to the directory holding everyone's.
+    # from one user's folder to the directory holding everyone's. A
+    # `userdir-groups` with no `user-subdirs` beside it is read the same
+    # way, and is the case where that substructure is not "not declared
+    # yet" but genuinely absent: per-user folders with nothing shared
+    # inside them, which is what a home directory is.
     samba["subpath"] = PER_USER_PLACEHOLDER if per_user_parent else None
     return samba
+
+
+def _normalize_userdir_groups(raw, node_path, block="userdir-groups"):
+    """Normalize a `userdir-groups` value into a list of group names --
+    the groups whose members get a per-user directory under this node
+    (docs/config-schema.md "`userdir-groups`").
+
+    This is the node saying who its per-user level is *for*. Without it
+    the membership of a `user-subdirs` node is emergent: whoever happens
+    to be named by an `access` grant on something nested beneath it
+    (access_grant_usernames()), so a home directory exists only as a
+    side effect of a share being granted inside it, and stops existing
+    when that share is commented out. Those grants still contribute --
+    this adds a source, it does not replace one -- but a node can now
+    name its users outright, and a person with a home and nothing shared
+    in it is finally something the config can say.
+
+    Groups only, deliberately: an individual gets a directory through
+    `access.owner` on something beneath, and a second way to name one
+    person would be a second place to look when asking who has a folder
+    here. A group is the thing this key exists to resolve, because
+    membership lives in LDAP rather than in config.yml -- which is also
+    why the list is not checked against anything here: a group with no
+    members, or none this host can resolve, yields no directories and is
+    not an error (needed_groups(), spec.md §5).
+
+    A bare `userdir-groups:` parses as None and normalizes to the empty
+    list. It still declares the node per-user, exactly as a bare
+    `user-subdirs:` does (_normalize_samba()): the key's presence is the
+    shape, and its contents are who is in it today."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"stortree: {node_path!r}'s `{block}` must be a list of group "
+            f"names, got {type(raw).__name__} -- see docs/config-schema.md "
+            '"`userdir-groups`"'
+        )
+    groups = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(
+                f"stortree: {node_path!r}'s `{block}` entries must each be a "
+                f"non-empty group name, got {item!r} -- see "
+                'docs/config-schema.md "`userdir-groups`"'
+            )
+        if item not in groups:
+            groups.append(item)
+    return groups
 
 
 def _normalize_requires(raw, node_path):
@@ -1003,9 +1094,17 @@ def _walk_tree(tree):
             raw_access = _merge_access(inherited_access, own) if own else {}
         _reject_ungranted_permissions(raw_access, "access", path)
         access = _normalize_access(raw_access) or _dropped_access(inherited_access)
-        samba = _normalize_samba(
-            node.get("samba", _UNSET), path, "user-subdirs" in node
+        userdir_groups = _normalize_userdir_groups(
+            node.get("userdir-groups"), path
         )
+        # Either key declares the per-user level, so either one settles
+        # the derived share subpath. `userdir-groups` without
+        # `user-subdirs` is a node whose per-user folders have no shared
+        # substructure inside them -- ordinary home directories, which
+        # is a config this could not express before
+        # (docs/config-schema.md "`userdir-groups`").
+        per_user_parent = "user-subdirs" in node or "userdir-groups" in node
+        samba = _normalize_samba(node.get("samba", _UNSET), path, per_user_parent)
         nodes.append(
             {
                 "path": path,
@@ -1015,12 +1114,20 @@ def _walk_tree(tree):
                 "access": access,
                 "samba": samba,
                 "per_user": per_user,
-                # Whether this node's *own* shape is per-user (it has a
-                # `user-subdirs` key), as against `per_user` above,
-                # which says it *sits under* one. Kept by name so a
-                # peer block's `samba:` can derive the same `%U`
-                # subpath later, without the raw config node in hand.
-                "per_user_parent": "user-subdirs" in node,
+                # Whether this node's *own* shape is per-user (it has
+                # a `user-subdirs` or `userdir-groups` key), as against
+                # `per_user` above, which says it *sits under* one. Kept
+                # by name so a peer block's `samba:` can derive the same
+                # `%U` subpath later, without the raw config node in
+                # hand.
+                "per_user_parent": per_user_parent,
+                # The groups this node itself names as having a per-user
+                # directory under it, before any peer block adds to them
+                # (_userdir_parent_entries()). Empty for every node that
+                # doesn't write the key, which is every node that
+                # resolved its per-user membership from the grants
+                # beneath it and still does.
+                "userdir_groups": userdir_groups,
                 "root_path": root_path,
                 "requires": _normalize_requires(node.get("requires"), path),
             }
@@ -1393,6 +1500,52 @@ def _peer_samba(own, hostname):
     return found
 
 
+def _peer_userdir_groups(own, hostname, node_path):
+    """The extra groups a peer block written *on this node* gives
+    `hostname` per-user directories for. `own` is the node's own raw
+    config where it carries a `peer-defaults`/`peers` block at all
+    (_TreeIndex.own_peer_blocks), else None.
+
+    The one peer-block key that adds rather than replaces. `rclone`,
+    `access` and `samba` each describe one host's *copy* of a node --
+    how it mounts it, what it enforces on it, whether it exports it --
+    and a copy is a single thing, so the nearest, most specific block
+    wins outright (_peer_policy(), _peer_samba()). `userdir-groups`
+    describes something else: who the node is for. A host that serves an
+    extra department's home directories does not thereby stop serving
+    everyone else's, and reading this key the way the others are read
+    would mean it could only ever do both by restating the owner's whole
+    list -- two lines meant to agree, drifting apart later. So the
+    node's own list is the floor everywhere, `peer-defaults` adds to it
+    on every non-owning host, and `peers.<hostname>` adds to that.
+
+    Read off the node's own block rather than the inherited chain, for
+    the reason `samba` is (above): the key does not inherit. It marks
+    the one node it is written on as per-user and says nothing about
+    that node's descendants, which have their own per-user level or
+    none.
+
+    Never consulted on the host that owns the node: a peer block
+    describes a host holding a copy, and the owner holds the original
+    (docs/config-schema.md "Per-peer mount opt-out", "Peer-side
+    access")."""
+    groups = []
+    if not own:
+        return groups
+    for container in (
+        own.get("peer-defaults"),
+        (own.get("peers") or {}).get(hostname),
+    ):
+        if not isinstance(container, dict):
+            continue
+        for group in _normalize_userdir_groups(
+            container.get("userdir-groups"), node_path
+        ):
+            if group not in groups:
+                groups.append(group)
+    return groups
+
+
 _TreeIndex = collections.namedtuple(
     "_TreeIndex",
     "roots nodes nodes_by_path children peer_chains own_peer_blocks "
@@ -1712,6 +1865,81 @@ def _subtree_grant_entries(index, hostname, mounted_paths):
     return grants
 
 
+def _materializes(index, hostname, path, mounted_paths):
+    """Whether `hostname` has a real directory at `path` to create
+    per-user folders in -- it mounts the path or an ancestor of it
+    (`mounted_paths`, the same list _subtree_grant_entries() gates on),
+    or it owns a node somewhere beneath it and therefore builds the
+    path down to it.
+
+    A host with neither has no business holding this node's per-user
+    directories: a `peers.<h>.userdir-groups` written on a subtree that
+    same host opted out of (docs/config-schema.md "Per-peer mount
+    opt-out") would otherwise leave it a stray local tree of empty home
+    directories backing nothing at all."""
+    if any(path == m or path.startswith(m + "/") for m in mounted_paths):
+        return True
+    prefix = path + "/"
+    return any(
+        n["host"] == hostname and n["path"].startswith(prefix)
+        for n in index.nodes
+    )
+
+
+def _userdir_parent_entries(index, hostname, mounted_paths):
+    """Every node `hostname` creates per-user directories under by the
+    node's own say-so, as {local_path, groups} (docs/config-schema.md
+    "`userdir-groups`").
+
+    The scope that answers "who has a folder here" from the node
+    itself. The other answer -- whoever an `access` grant beneath the
+    node names -- is unchanged and still resolved where it always was
+    (_resolved_user_containers()'s `%U` half); this is a second source
+    for the same set, not a replacement, and the two are simply unioned
+    (a user named by both gets the one directory either would have
+    made).
+
+    `groups` is the node's own list on the host that owns it, and
+    whatever a peer block on that node *adds* on every other host
+    (_peer_userdir_groups()) -- gated by _materializes(), so a host only
+    plans directories inside a path it actually has.
+
+    A node whose groups resolve to nobody yields no entry and no
+    directories, which is also what an empty `user-subdirs` has always
+    done. The list is host-local identity: a group that exists in LDAP
+    but has no members yet is a perfectly ordinary state, not a config
+    error, and the only thing that can tell the difference is the host
+    doing the `getent` (needed_groups(), spec.md §5)."""
+    entries = []
+    for n in index.nodes:
+        if not n["per_user_parent"]:
+            continue
+        path = n["path"]
+        groups = list(n["userdir_groups"])
+        if n["host"] != hostname:
+            if not _materializes(index, hostname, path, mounted_paths):
+                continue
+            # Added to the node's own list, not substituted for it: a
+            # peer that serves one more group's home directories serves
+            # the node's own groups too. Planning the whole set on every
+            # host that holds the path is also what makes the addition
+            # survive how the host got there -- the owner's own folders
+            # arrive ready-made inside a peer mount of the subtree, but
+            # a host that reaches this node by owning something *under*
+            # it has no mount to inherit them from and has to create
+            # them itself. Creating one that already exists is a no-op,
+            # and already what a container resolved on both the owner
+            # and a peer does today (_resolved_user_containers()).
+            for group in _peer_userdir_groups(
+                index.own_peer_blocks.get(path), hostname, path
+            ):
+                if group not in groups:
+                    groups.append(group)
+        if groups:
+            entries.append({"local_path": path, "groups": groups})
+    return entries
+
+
 def _subtree_mount_entries(index, hostname, samba_sourced_paths, stortree_root):
     """`hostname`'s own subtree mount of each top-level subtree it doesn't
     own, as (subtree_mounts, peer_dependencies).
@@ -1919,17 +2147,21 @@ def resolve(
         lambda p: (p["owning_host"], p["local_path"]),
     )
 
+    # Every path this host holds a real mount of -- what a node *inside*
+    # one of them has to be judged against, both for the grant it
+    # applies there (_subtree_grant_entries()) and for the per-user
+    # directories it creates there (_userdir_parent_entries()).
+    mounted_paths = [m["local_path"] for m in subtree_mounts if m["remote"]] + [
+        p["local_path"] for p in peer_dependencies
+    ]
+
     return {
         "server_subtrees": [n for n in index.nodes if n["host"] == hostname],
         "subtree_mounts": subtree_mounts,
         "samba_shares": _samba_share_entries(index, hostname) if serves_samba else [],
         "peer_dependencies": peer_dependencies,
-        "subtree_grants": _subtree_grant_entries(
-            index,
-            hostname,
-            [m["local_path"] for m in subtree_mounts if m["remote"]]
-            + [p["local_path"] for p in peer_dependencies],
-        ),
+        "subtree_grants": _subtree_grant_entries(index, hostname, mounted_paths),
+        "userdir_parents": _userdir_parent_entries(index, hostname, mounted_paths),
         "peer_served_by": _peer_served_by_entries(
             index, hostname, all_hosts, samba_hosts
         ),
@@ -2305,7 +2537,8 @@ def per_user_mount_path(path, access):
 
 def needed_groups(resolved):
     """Every group name this host's resolved facts reference in an
-    `access` grant -- the set `getent group` needs to be run against
+    `access` grant, plus every group a node names in `userdir-groups`
+    -- the set `getent group` needs to be run against
     before `group_members_from_getent()`'s result can feed
     `plan_mounts()`/`filter_rclone_conf()`'s own %U expansion, and before
     `group_gids_from_getent()`'s result can gid-own a remote-backed
@@ -2319,9 +2552,10 @@ def needed_groups(resolved):
     `peers.<hostname>` block gave it one, docs/config-schema.md
     "Peer-side access") and `subtree_grants` (a node *inside* something
     this host mounts, whose grant it applies with a presentation of its
-    own -- the scope that made this list four rather than three, and the
-    one most likely to name a group nothing else on the host does, since
-    the mount above it carries whatever grant was written higher up).
+    own -- the one most likely to name a group nothing else on the host
+    does, since the mount above it carries whatever grant was written
+    higher up). A fifth, `userdir_parents`, is read after the loop
+    rather than in it: its groups are not inside an `access` grant.
     All computed once, together, by
     `stortree_facts` so every later role (`stortree_mounts`,
     `stortree_secrets`) shares one lookup and one consistent
@@ -2337,6 +2571,15 @@ def needed_groups(resolved):
         g = (entry.get("access") or {}).get("group")
         if g:
             groups.add(g)
+    # `userdir_parents` is the fifth scope, and the only one whose
+    # groups are not inside an `access` grant at all: a node's
+    # `userdir-groups` names a group purely to resolve its membership
+    # into per-user directories (_resolved_user_containers()), never to
+    # gid-own anything. Missing it would leave that lookup empty and the
+    # directories silently unmade -- exactly the "one scope the others
+    # cover" failure this function exists to keep out.
+    for parent in resolved.get("userdir_parents", []):
+        groups.update(parent["groups"])
     return sorted(groups)
 
 
@@ -2344,8 +2587,8 @@ def needed_users(resolved, group_members=None):
     """Every username this host's resolved facts reference in an
     `access.owner` grant -- mirrors needed_groups() above, for the
     `getent passwd` lookup user_uids_from_getent() needs to uid-own a
-    remote-backed node's mount (spec.md §6) -- over the same four scopes,
-    `subtree_grants` included. Also covers every per-user
+    remote-backed node's mount (spec.md §6) -- over the same four
+    `access`-bearing scopes, `subtree_grants` included. Also covers every per-user
     container's own owner (`_resolved_user_containers()`, group-derived
     ones included) when `group_members` is given -- stortree_secrets
     needs those numeric UIDs too, for a wrapper mount's `--uid`
@@ -2403,6 +2646,20 @@ def _resolved_user_containers(resolved, group_members):
         for user in access_grant_usernames(access, group_members):
             local_path = f"{prefix}/{user}" if prefix else user
             containers[local_path] = user
+    # The other source: a node that names its own groups rather than
+    # leaving its membership to whatever is granted beneath it
+    # (`userdir_parents`, _userdir_parent_entries()). Its path has no
+    # `%U` in it -- the per-user folders *are* its immediate children --
+    # so the prefix is the path itself. Deduped into the same map by
+    # local_path, so a user who is both a member here and the resolved
+    # owner of something nested below still gets exactly one container,
+    # owned by them either way.
+    for parent in resolved.get("userdir_parents", []):
+        prefix = parent["local_path"].rstrip("/")
+        for group in parent["groups"]:
+            for user in access_grant_usernames({"group": group}, group_members):
+                local_path = f"{prefix}/{user}" if prefix else user
+                containers[local_path] = user
     return containers
 
 

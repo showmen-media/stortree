@@ -48,10 +48,31 @@ tree:
   subdirs:
     backups: {}
     home:
-      # `user-subdirs` below is what makes this a per-user share: the
-      # Samba path picks up %U automatically, so each connecting user
-      # lands in their own folder rather than seeing everyone's.
+      # `userdir-groups`/`user-subdirs` below are what make this a
+      # per-user share: either key says the node's immediate children
+      # are per-user folders, so the Samba path picks up %U
+      # automatically and each connecting user lands in their own rather
+      # than seeing everyone's.
       samba:
+      # Who actually has one of those folders. Without this the answer
+      # would be emergent -- whoever the grants below happen to name --
+      # so a household member granted none of the four shares would have
+      # no home directory at all, and jd's would disappear the day
+      # sys-configs did. Both sources still feed one set: these members,
+      # plus everyone the grants below resolve to (docs/config-schema.md
+      # "`userdir-groups`").
+      userdir-groups:
+        - "Whitfield Household"
+      peers:
+        # The one peer-block key that *adds* rather than replaces:
+        # storage-node-bravo serves the household's home directories
+        # exactly as every other host does, and its own operators' as
+        # well -- a group that means something on that one host and is
+        # deliberately not in the fleet-wide list above
+        # (docs/config-schema.md "Adding groups on one host").
+        storage-node-bravo:
+          userdir-groups:
+            - "Bravo Operators"
       user-subdirs:
         whitfield-media:
           access:

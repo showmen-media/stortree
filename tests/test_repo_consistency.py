@@ -73,6 +73,7 @@ def test_the_shipped_example_resolves_for_every_host_in_its_fleet():
             "samba_shares",
             "peer_dependencies",
             "subtree_grants",
+            "userdir_parents",
             "peer_served_by",
         }
         # Samba sharing is universal, so every host exports the one

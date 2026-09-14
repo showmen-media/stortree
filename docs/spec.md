@@ -817,7 +817,11 @@ up in — `server_subtrees`' own nodes, `peer_dependencies`' (a
 peer-sourced descendant's grant expands the exact same way, §2/§3),
 `subtree_mounts`' and `subtree_grants`' (a node inside something this host
 mounts, presented by this host under a grant that may be named nowhere
-else in its facts) — and, unlike the old per-user-only scoping, they
+else in its facts) — plus `userdir_parents`, the one scope whose groups
+are not in an `access` grant at all (a node's own `userdir-groups`,
+config-schema.md, names a group purely to resolve its membership into
+per-user directories, never to gid-own anything) — and, unlike the old
+per-user-only scoping, they
 cover every node with a grant, not just per-user ones, since a plain
 shared node's own `access.group`/`access.owner` still needs its id
 resolved to own its mount; the `stortree_secrets` role — first among
@@ -832,10 +836,22 @@ server_subtrees of its own — like `some-storage-gadget` in the worked
 example — never resolved the groups its peer-sourced per-user shares
 actually needed).
 
+A node can also name its users outright, rather than leaving them to be
+whatever its descendants' grants happen to resolve to: `userdir-groups`
+(config-schema.md) lists groups whose members get a folder under it,
+which `resolve()` projects per host into `userdir_parents` — the node's
+own list on the host that owns it, plus whatever a `peer-defaults`/
+`peers.<host>` block on that node *adds* on every other host, gated to
+hosts that actually hold the path. It is a second source for the same
+set, not a replacement: both feed one deduped map of containers below,
+and a node that writes no `userdir-groups` resolves exactly as it always
+did.
+
 The per-user folder `access_grant_usernames()` says a `user-subdirs`
 node needs — `home/jd`, say — is itself owned by that one real user, not
-`stortree`: `_plan_user_containers()` derives, from the same
-`server_subtrees`/`peer_dependencies` facts, every `<prefix>/<username>`
+`stortree`: `_plan_user_containers()` derives, from the
+`server_subtrees`/`peer_dependencies`/`userdir_parents` facts, every
+`<prefix>/<username>`
 container any resolved grant anywhere under that prefix implies (deduped
 by path — several sibling descendants resolving to the same user all
 agree on one container, not one each). This is a real,
