@@ -344,6 +344,51 @@ def test_stortree_samba_hosts_is_defined_once_and_gates_both_ends():
         assert "stortree_samba_hosts" in str(task["when"]), task["name"]
 
 
+def test_the_test_harness_carries_the_samba_globals_the_role_defines():
+    # smb.conf.j2 reads the built-in half of its [global] block from a
+    # role default rather than a literal of its own, so that
+    # wsdd.service.j2 can announce the workgroup smb.conf actually
+    # serves. That makes the dict a variable a real play supplies, which
+    # in turn makes tests/conftest.py carry a copy of it -- and a stale
+    # copy would have every smb.conf render test asserting against a
+    # [global] block no host is given.
+    from conftest import COMMON_VARS
+
+    assert (
+        COMMON_VARS["stortree_samba_global_defaults"]
+        == role_defaults("stortree_samba")["stortree_samba_global_defaults"]
+    )
+
+
+def test_the_samba_role_withdraws_discovery_at_the_paths_it_publishes_it():
+    # Each discovery protocol's teardown is the negation of its setup,
+    # which only converges anything if both halves name the same file.
+    # They are two tasks far apart in one file, and getting this wrong
+    # leaves a host advertising itself after being told to stop --
+    # silently, since the apply that was supposed to withdraw it reports
+    # success either way.
+    tasks = yaml.safe_load(
+        (REPO_ROOT / "roles/stortree_samba/tasks/main.yml").read_text()
+    )
+    published = {
+        task["ansible.builtin.template"]["dest"]
+        for task in tasks
+        if "ansible.builtin.template" in task
+    }
+    withdrawn = {
+        task["ansible.builtin.file"]["path"]
+        for task in tasks
+        if "ansible.builtin.file" in task
+        and task["ansible.builtin.file"].get("state") == "absent"
+    }
+    for path in (
+        "/etc/systemd/system/wsdd.service",
+        "/etc/avahi/services/stortree-smb.service",
+    ):
+        assert path in published, f"nothing renders {path}"
+        assert path in withdrawn, f"nothing removes {path}"
+
+
 def test_the_mounts_verification_covers_the_paths_the_role_creates():
     # The re-stat at the end of stortree_mounts only closes the
     # ignore_errors gap for paths it actually looks at. Both sources the

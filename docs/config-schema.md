@@ -85,7 +85,10 @@ its own, shaped exactly like any other node below it:
                                # folded to `_` (`tree/home` → `tree_home`)
     hidden: true               # optional — keep the share out of the host's browse
                                # list (`browseable = no`). Not access control; the
-                               # share stays mountable by its exact name
+                               # share stays mountable by its exact name. Nor is it
+                               # host discovery (spec.md §4): this hides one share
+                               # from a client already talking to the host, and says
+                               # nothing about whether the host itself is found
   subdirs: {...}               # recurse — this and everything under it works exactly the
                                # same as it does at the top level, just nested
   user-subdirs: {...}          # recurse — see note below

@@ -1,0 +1,80 @@
+# Managed by stortree (roles/stortree_samba) -- do not edit by hand.
+#
+# WS-Discovery is what puts this host in a current Windows Explorer's
+# "Network" (spec.md §4, "Host discovery"). Windows has shipped with
+# SMB1 and the Computer Browser service disabled since 10/1709, so
+# nmbd's browse-list announcements no longer reach it at all; wsdd
+# answers the WSD probes that replaced them.
+#
+# Rendered to /etc/systemd/system/wsdd.service, which *shadows* the unit
+# the distro's own `wsdd` package ships -- deliberately, and it is the
+# one thing about this file worth understanding before editing it:
+#
+#   - Debian bookworm and Ubuntu jammy package wsdd with a unit and an
+#     /etc/default/wsdd; Ubuntu noble packages the binary alone, with
+#     neither. A role that enabled `wsdd.service` would work on two of
+#     the three platforms meta/main.yml lists and silently do nothing on
+#     the newest.
+#   - stortree has to set `--workgroup` from the same value smb.conf
+#     gets (defaults/main.yml's `stortree_samba_workgroup`), and a host
+#     announcing itself into a different workgroup than it serves is
+#     precisely the drift that was worth closing.
+#
+# Shadowing one unit name on every platform beats a second unit name
+# plus masking the distro's -- there is never a window where two
+# announcers are running, and `systemctl status wsdd` tells an operator
+# the truth. The cost is the usual cost of a full-file override: a
+# future package's unit changes stop reaching this host. If you are
+# reading this because upstream's unit grew something you want, copy it
+# in here.
+[Unit]
+Description=WS-Discovery announcer for stortree's Samba shares (managed by stortree, do not edit by hand)
+Documentation=man:wsdd(8)
+Wants=network-online.target
+After=network-online.target smbd.service
+{# Announcing a host whose smbd is not running advertises shares that
+   cannot be mounted, which is worse than not appearing: a person finds
+   the host, clicks it, and gets an error instead of looking elsewhere.
+   Requires= also propagates smbd's stop, so taking Samba down on a host
+   takes its advertisement down with it. #}
+Requires=smbd.service
+
+[Service]
+Type=simple
+{% set iface_args = [] %}
+{% for interface in stortree_samba_wsd_interfaces %}
+{% set _ = iface_args.append('--interface=' ~ interface) %}
+{% endfor %}
+{# --shortlog because journald already stamps every line with a time and
+   the unit name. The workgroup is quoted for systemd rather than left
+   bare: a legal NetBIOS workgroup has no spaces in it, but nothing
+   upstream of `stortree_samba_globals` enforces that, and an unquoted
+   one would silently split into two arguments. #}
+ExecStart={{ stortree_samba_wsdd_bin }} {{ (['--shortlog', '--workgroup', '"' ~ (stortree_samba_workgroup | trim) ~ '"'] + iface_args) | join(' ') }}
+Restart=on-failure
+RestartSec=5
+
+{# wsdd needs no privilege it cannot have as `nobody`: both ports it
+   binds are above 1024, and everything else it does is reading its own
+   interface list. Everything below is the ordinary consequence of that
+   -- a network-facing daemon parsing unauthenticated multicast from the
+   local segment is exactly the kind of process worth confining. #}
+User=nobody
+Group=nogroup
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+{# AF_NETLINK is not optional: it is how wsdd learns which interfaces
+   exist and notices one appearing later. #}
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

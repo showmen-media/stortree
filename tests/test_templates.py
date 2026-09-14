@@ -18,7 +18,10 @@ stand-ins -- so a change to a resolved entry's shape shows up here as a
 failing render rather than at apply time.
 """
 
+import xml.etree.ElementTree as ET
+
 import pytest
+import yaml
 
 from conftest import EXAMPLE_HOSTS, REPO_ROOT
 from filter_plugins.stortree import metrics_listeners, metrics_ports
@@ -29,6 +32,8 @@ BIND_UNIT = "stortree-bind@.service.j2"
 METRICS_TARGETS = "metrics-targets.json.j2"
 SMB_CONF = "smb.conf.j2"
 SSSD_CONF = "sssd.conf.j2"
+WSDD_UNIT = "wsdd.service.j2"
+AVAHI_SERVICE = "stortree-smb.avahi.xml.j2"
 
 ALPHA, BRAVO, GADGET = EXAMPLE_HOSTS
 
@@ -964,3 +969,156 @@ def test_smb_conf_globals_stay_inside_the_global_section(render, resolved):
     assert "[global]" in out
     global_block = out.split("[global]", 1)[1].split("\n[", 1)[0]
     assert "workgroup = EXAMPLE" in global_block
+
+
+# -- host discovery: wsdd.service.j2 --------------------------------------
+#
+# What puts the *host* on the network, as opposed to what decides which
+# of its shares a client then sees (`browseable`, above) or who may open
+# them (`valid users`, above that). These two templates are the only
+# part of stortree that is about being found at all.
+
+# What roles/stortree_samba/tasks/main.yml has in scope by the time it
+# renders the unit: the binary path it just discovered, the workgroup
+# resolved from the role defaults, and the operator's interface list as
+# defaults/main.yml leaves it.
+DISCOVERY_VARS = {
+    "stortree_samba_wsdd_bin": "/usr/sbin/wsdd",
+    "stortree_samba_workgroup": "WORKGROUP",
+    "stortree_samba_wsd_interfaces": [],
+}
+
+
+def wsdd(render, **overrides):
+    return render(WSDD_UNIT, **{**DISCOVERY_VARS, **overrides})
+
+
+@pytest.fixture(scope="session")
+def wsdd_unit(render):
+    return wsdd(render)
+
+
+def test_wsdd_unit_runs_the_binary_the_role_actually_found(render):
+    # noble installs /usr/bin/wsdd where bookworm and jammy install
+    # /usr/sbin/wsdd. The role discovers which; a unit that assumed
+    # either would fail every start on the other platform with
+    # status=203/EXEC and no host in anyone's Network.
+    (exec_start,) = directives(
+        wsdd(render, stortree_samba_wsdd_bin="/usr/bin/wsdd"), "ExecStart"
+    )
+    assert exec_start.startswith("/usr/bin/wsdd ")
+
+
+def test_wsdd_unit_announces_the_workgroup_smb_conf_serves(render, jinja_env, resolved):
+    # The seam the shared `stortree_samba_global_defaults` exists to
+    # close: [global]'s workgroup and the announcer's --workgroup are
+    # two readers of one dict, and drift between them is silent in the
+    # worst way -- a host serving EXAMPLE while announcing itself into
+    # WORKGROUP is discoverable by nobody who is looking in the right
+    # place. Renders the defaults file's own expression rather than
+    # restating it, so this fails if that expression stops following an
+    # override.
+    defaults = yaml.safe_load(
+        (REPO_ROOT / "roles/stortree_samba/defaults/main.yml").read_text()
+    )
+    overrides = {"workgroup": "EXAMPLE"}
+    workgroup = jinja_env.from_string(defaults["stortree_samba_workgroup"]).render(
+        stortree_samba_global_defaults=defaults["stortree_samba_global_defaults"],
+        stortree_samba_globals=overrides,
+    )
+    conf = render(SMB_CONF, stortree=resolved[GADGET], stortree_samba_globals=overrides)
+    (exec_start,) = directives(wsdd(render, stortree_samba_workgroup=workgroup), "ExecStart")
+    assert "workgroup = EXAMPLE" in conf
+    assert '--workgroup "EXAMPLE"' in exec_start
+
+
+def test_wsdd_unit_quotes_the_workgroup_as_a_single_argument(render):
+    # A legal NetBIOS workgroup has no space in it, but nothing upstream
+    # of `stortree_samba_globals` enforces that, and systemd splits an
+    # unquoted argument on whitespace -- which would announce the host
+    # into "TWO" and pass "WORDS" as a flag.
+    (exec_start,) = directives(
+        wsdd(render, stortree_samba_workgroup="TWO WORDS"), "ExecStart"
+    )
+    assert '--workgroup "TWO WORDS"' in exec_start
+
+
+def test_wsdd_unit_announces_on_every_interface_by_default(wsdd_unit):
+    # wsdd's own default, and right for a host with one network: naming
+    # interfaces is what a multi-homed host does, not what everyone does.
+    assert "--interface" not in wsdd_unit
+
+
+def test_wsdd_unit_restricts_itself_to_the_interfaces_it_was_given(render):
+    (exec_start,) = directives(
+        wsdd(render, stortree_samba_wsd_interfaces=["eth0", "wg0"]), "ExecStart"
+    )
+    assert "--interface=eth0" in exec_start
+    assert "--interface=wg0" in exec_start
+
+
+def test_wsdd_unit_stops_announcing_when_smbd_stops(wsdd_unit):
+    # A host that appears in Explorer's Network and then errors when
+    # clicked is worse than one that never appeared -- the person stops
+    # looking elsewhere. Requires= propagates smbd's stop; After= keeps
+    # the ordering.
+    assert directives(wsdd_unit, "Requires") == ["smbd.service"]
+    assert "smbd.service" in directives(wsdd_unit, "After")[0]
+
+
+def test_wsdd_unit_runs_the_announcer_unprivileged(wsdd_unit):
+    # It parses unauthenticated multicast from the local segment, and
+    # both ports it binds are above 1024, so there is no privilege to
+    # trade away for it.
+    assert directives(wsdd_unit, "User") == ["nobody"]
+    assert directives(wsdd_unit, "CapabilityBoundingSet") == [""]
+    assert directives(wsdd_unit, "NoNewPrivileges") == ["yes"]
+
+
+def test_wsdd_unit_keeps_the_address_family_it_watches_interfaces_with(wsdd_unit):
+    # AF_NETLINK is not hardening slack: it is how wsdd learns which
+    # interfaces exist and notices one appearing later. Dropping it
+    # makes an announcer that works until the network changes.
+    (families,) = directives(wsdd_unit, "RestrictAddressFamilies")
+    assert "AF_NETLINK" in families
+    assert "AF_INET" in families
+
+
+# -- host discovery: stortree-smb.avahi.xml.j2 ----------------------------
+
+
+@pytest.fixture(scope="session")
+def avahi_service(render):
+    return render(AVAHI_SERVICE, stortree_samba_mdns_model="RackMac")
+
+
+def test_avahi_service_file_is_well_formed_xml(avahi_service):
+    # Avahi rejects a malformed service file with a syslog line and
+    # nothing else, so a typo here is a host that silently never reaches
+    # a Finder sidebar. Nothing else in this repo renders XML.
+    ET.fromstring(avahi_service)
+
+
+def test_avahi_service_advertises_smb_on_the_port_samba_serves(avahi_service):
+    root = ET.fromstring(avahi_service)
+    published = {s.findtext("type"): s.findtext("port") for s in root.findall("service")}
+    assert published["_smb._tcp"] == "445"
+
+
+def test_avahi_service_publishes_under_the_hosts_own_name(avahi_service):
+    # %h is Avahi's substitution, not Jinja's, and it only happens
+    # because of replace-wildcards -- without the attribute every host on
+    # the network advertises itself as a literal "%h".
+    name = ET.fromstring(avahi_service).find("name")
+    assert name.text == "%h"
+    assert name.get("replace-wildcards") == "yes"
+
+
+def test_avahi_service_omits_the_device_info_record_when_no_model_is_set(render):
+    # The model is cosmetic (it picks the icon macOS draws), so a fleet
+    # that wants no opinion about it publishes the SMB record alone
+    # rather than an empty device-info one.
+    out = render(AVAHI_SERVICE, stortree_samba_mdns_model=None)
+    ET.fromstring(out)
+    assert "_device-info._tcp" not in out
+    assert "_smb._tcp" in out

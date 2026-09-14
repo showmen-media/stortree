@@ -62,3 +62,17 @@ stortree_metrics_bind:
 # "Changing Samba's [global] settings".
 # stortree_samba_globals:
 #   workgroup: EXAMPLE
+
+# Every host announces itself on its local network by default, over
+# WS-Discovery (Windows Explorer's "Network"), mDNS (macOS Finder, GNOME
+# Files) and NetBIOS. Silence one protocol, or all three at once; see
+# docs/runbook.md "Turning host discovery off (or back on)".
+# stortree_samba_discovery: true
+# stortree_samba_discovery_wsd: true
+# stortree_samba_discovery_mdns: true
+# stortree_samba_discovery_netbios: true
+
+# Which interfaces wsdd announces on. Empty means all of them, which is
+# right for a host with one network and wrong for a host that also
+# carries a tunnel or a management LAN.
+# stortree_samba_wsd_interfaces: [eth0]

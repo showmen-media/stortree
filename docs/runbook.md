@@ -405,6 +405,65 @@ will *not* catch an override that is valid but defeats the access model
 -- `security` and `passdb backend` are load-bearing (see
 `smb.conf.j2`'s own comment).
 
+## Turning host discovery off (or back on)
+
+Every host announces itself on its local network by default, over all
+three of WS-Discovery (Windows Explorer's "Network"), mDNS (macOS
+Finder, GNOME Files) and NetBIOS. Discovery is per host, so ordinary
+Ansible precedence applies:
+
+```yaml
+# host_vars/storage-node-bravo.yml -- silence this host entirely
+stortree_samba_discovery: false
+
+# ...or group_vars/all.yml -- keep mDNS, drop the other two fleet-wide
+stortree_samba_discovery_wsd: false
+stortree_samba_discovery_netbios: false
+```
+
+Re-run `site.yml`. Turning a flag off is a converging change, not just a
+skipped task: the apply stops and disables whatever it previously
+started and removes what it published, so a host that was announcing
+stops. The `wsdd` and `avahi-daemon` packages stay installed, the same
+call this role makes for `samba` itself on a host that stops serving.
+
+On a multi-homed host — a storage node that also holds a WireGuard
+tunnel or a management network — name the interfaces that should carry
+the announcements rather than leaving wsdd on all of them:
+
+```yaml
+stortree_samba_wsd_interfaces: [eth0]
+```
+
+Avahi takes its interface policy from `avahi-daemon.conf`, which stortree
+does not manage; set `allow-interfaces` there if the same host should not
+publish mDNS everywhere either.
+
+### A host that still doesn't appear
+
+Check the right protocol for the client that can't see it — they do not
+substitute for each other:
+
+```bash
+systemctl status wsdd nmbd avahi-daemon      # on the host
+wsdd --discovery --no-host -v                # from a Linux box on the LAN
+avahi-browse -rt _smb._tcp                   # ...for the macOS path
+```
+
+Three things account for most of it. Discovery is link-local by design:
+WSD and mDNS multicast with a hop limit of 1 and NetBIOS broadcasts, so
+a client on another subnet or VLAN will never see the host however
+healthy the daemons are — that is the protocol, not a fault, and such a
+client needs the hostname. `wsdd` is in `universe` on Ubuntu, so the install task
+fails outright on a host with universe disabled. And on a host running
+systemd-resolved with MulticastDNS enabled, resolved and avahi-daemon
+both want UDP 5353 and whichever started first keeps it; stortree manages
+neither daemon's own configuration.
+
+Nothing here affects who can read what. A host nobody can find is still
+mountable by anyone who types `\\host\share`, and `valid users` is still
+the thing that says no.
+
 ## Taking a host out of Samba service
 
 Narrow `stortree_samba_hosts` (defaults to the whole fleet) and re-run
@@ -412,7 +471,9 @@ Narrow `stortree_samba_hosts` (defaults to the whole fleet) and re-run
 content that existed only to back them, and has its `smbd` stopped and
 disabled; the package and `/etc/samba/smb.conf` are deliberately left in
 place for you to remove by hand if the host is done with Samba for good.
-Its own client mounts of the tree are unaffected. See
+It also stops announcing itself, on all three protocols above: a host
+that exports nothing has nothing to be found for. Its own client mounts
+of the tree are unaffected. See
 [config-schema.md](config-schema.md) "What universality costs" for why
 this is a fleet-level list rather than a per-host flag.
 

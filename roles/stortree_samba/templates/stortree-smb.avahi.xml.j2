@@ -1,0 +1,45 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  Managed by stortree (roles/stortree_samba) — do not edit by hand.
+
+  Publishes this host's SMB service over mDNS/DNS-SD, which is how macOS
+  Finder's sidebar and GNOME Files' "Other Locations" find a server
+  (spec.md §4, "Host discovery").
+
+  Samba can register _smb._tcp itself, but only when built against
+  Avahi, and Debian's and Ubuntu's packages are not: smbd links no
+  libavahi-client there, which is also what makes smb.conf's own
+  `mdns name` parameter inert on these platforms. A static service file
+  is how the record gets published instead, and it says nothing smbd
+  would not have said — the port is Samba's, and it advertises only that
+  this host serves SMB. Which shares a client then sees, and which of
+  those it may open, are still decided by `browseable` and `valid users`
+  in /etc/samba/smb.conf.
+
+  Note the em dashes: an XML comment may not contain a double hyphen, so
+  this one file cannot be written in the same ASCII style as every other
+  comment in the repo.
+
+  `replace-wildcards` is what turns %h into this host's name. That is
+  Avahi's own substitution, not a Jinja one.
+-->
+<service-group>
+  <name replace-wildcards="yes">%h</name>
+
+  <service>
+    <type>_smb._tcp</type>
+    <port>445</port>
+  </service>
+{% if stortree_samba_mdns_model %}
+
+  {#- Cosmetic, and only macOS reads it: Finder picks the icon it draws
+      for the host from this model string. Port 0 is the convention for
+      a record that describes the host rather than a service on it. #}
+  <service>
+    <type>_device-info._tcp</type>
+    <port>0</port>
+    <txt-record>model={{ stortree_samba_mdns_model }}</txt-record>
+  </service>
+{% endif %}
+</service-group>

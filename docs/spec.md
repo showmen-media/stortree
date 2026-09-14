@@ -46,7 +46,7 @@ roles/
   stortree_peer_trust/     # cross-host keypairs + authorized_keys for peer deps (§1, §7)
   stortree_secrets/        # filtered per-host rclone.conf rendering (§3)
   stortree_mounts/         # rclone mount systemd units + ownership/mode from access (§2, §6)
-  stortree_samba/          # smb.conf + testparm + reload (§4)
+  stortree_samba/          # smb.conf + testparm + reload, host discovery (§4)
   stortree_pam_smbpass/    # PAM stacking (§5)
   stortree_sshd/           # optional sshd_config.d fragment (§6)
 playbooks/
@@ -518,6 +518,71 @@ other end has opted out of making. It is a fleet-level list rather than
 a per-host flag precisely so both ends reach that conclusion from the
 same input, without the `hostvars` cross-referencing §1 rules out. See
 config-schema.md "What universality costs" for the operator-facing view.
+
+**Host discovery.** Exporting a share makes it reachable; it does not
+make it findable. A client that has never been told this host's name has
+to learn it from somewhere, and the three protocols that do that are
+mutually exclusive in practice — each reaches a different family of
+clients, and none of them reaches all three:
+
+| Protocol | Reaches | On this host |
+| --- | --- | --- |
+| WS-Discovery | Windows 10/11 Explorer's "Network" | `wsdd`, from a unit stortree renders |
+| mDNS / DNS-SD | macOS Finder, GNOME Files | a static Avahi service file |
+| NetBIOS | old Windows, `smbclient -L`, name lookups | `nmbd`, from the `samba` package |
+
+All three are on by default (`stortree_samba_discovery` and the three
+`stortree_samba_discovery_*` flags in
+`roles/stortree_samba/defaults/main.yml`), gated on
+`stortree_samba_hosts` first: a host that exports nothing announces
+nothing, never the other way round. They are per-host settings rather
+than a fleet-wide list, because unlike `stortree_samba_hosts` nothing
+another host resolves depends on whether this one announces itself.
+
+Each is a separate flag because each has a separate cost. WSD installs a
+package and runs a daemon parsing unauthenticated multicast (UDP 3702,
+TCP 5357), confined accordingly in the rendered unit. mDNS installs
+`avahi-daemon` (UDP 5353), which on a host already running
+systemd-resolved with MulticastDNS enabled is a contended port. NetBIOS
+(UDP 137/138) costs nothing new, because it was already running:
+Debian's and Ubuntu's `samba` postinst enables and starts `nmbd`
+alongside `smbd`, and its unit declines to start only on an AD DC or
+under `disable netbios = yes`, neither of which stortree sets. Bringing
+it under the role closed two gaps that came from leaving it alone — a
+host removed from `stortree_samba_hosts` kept announcing itself for
+shares it no longer exported, and the smb.conf handler reloaded `smbd`
+without reloading the daemon that actually announces the `workgroup`.
+
+Two implementation notes that are load-bearing rather than incidental:
+
+- **The workgroup has one definition.** `smb.conf`'s `[global]` and
+  wsdd's `--workgroup` are two readers of
+  `stortree_samba_global_defaults` (merged with `stortree_samba_globals`
+  into `stortree_samba_workgroup`), because a host serving one workgroup
+  while announcing itself into another is discoverable only by people
+  looking in the wrong place, and nothing about it looks broken. The
+  seam has a test (`tests/test_templates.py`).
+- **The wsdd unit is stortree's, and shadows the distro's.** Debian
+  bookworm and Ubuntu jammy package `wsdd` with a unit and an
+  `/etc/default/wsdd`; Ubuntu noble packages the binary alone. The role
+  renders `/etc/systemd/system/wsdd.service` on all three, which
+  overrides the packaged unit where there is one — one unit name
+  everywhere, no window in which two announcers run, and `--workgroup`
+  set from the value above. The binary's path differs too
+  (`/usr/sbin/wsdd` vs `/usr/bin/wsdd`) and is discovered per host.
+
+Samba can register `_smb._tcp` over mDNS itself, but only when built
+against Avahi, which the Debian and Ubuntu packages are not — `smbd`
+links no `libavahi-client` there, which also makes `smb.conf`'s own
+`mdns name` parameter inert. Hence a static service file rather than a
+directive.
+
+None of this is access control, and none of it is share visibility.
+`samba.hidden` (config-schema.md) keeps one share out of the list a host
+returns to a client already talking to it; discovery is about whether
+the client finds the host at all. `valid users` and the underlying Unix
+mode remain the only things deciding who may read what, and an
+undiscoverable host is still mountable by anyone who types its name.
 
 ### 5. Identity & authentication (LDAP + SSSD)
 

@@ -9,13 +9,29 @@
 # content purely to back shares it no longer exports (see resolve()'s
 # docstring in filter_plugins/stortree.py -- that mount, not the
 # smb.conf stanza, is what universality actually costs).
+#
+# The discovery tasks in the second half are gated on that same list and
+# then on `stortree_samba_discovery*` (defaults/main.yml) on top of it:
+# a host that exports nothing has nothing to announce, so "not serving"
+# always implies "not announcing", never the other way round. Each
+# protocol's teardown path is written as the negation of its setup path
+# rather than only running on an excluded host, so turning a flag off
+# converges a host that previously had it on.
 
-- name: Collect service facts on a host excluded from stortree_samba_hosts
-  # Only to answer "is there an smbd here to stop?" below -- a host that
-  # never served Samba has no such unit, and systemd_service would fail
-  # on it rather than cleanly doing nothing.
+- name: Collect service facts before stopping anything this host no longer runs
+  # Only to answer "is there a unit here to stop?" below -- a host that
+  # never served Samba has no smbd, one that never announced over WSD
+  # has no wsdd.service, and systemd_service would fail on either rather
+  # than cleanly doing nothing. Gathered whenever some teardown path can
+  # run, which is any of: the host is out of Samba service entirely, or
+  # one of the discovery protocols is switched off.
   ansible.builtin.service_facts:
-  when: inventory_hostname not in stortree_samba_hosts
+  when: >-
+    inventory_hostname not in stortree_samba_hosts
+    or not stortree_samba_discovery
+    or not stortree_samba_discovery_wsd
+    or not stortree_samba_discovery_mdns
+    or not stortree_samba_discovery_netbios
   tags: [samba]
 
 - name: Stop and disable smbd on a host excluded from stortree_samba_hosts
@@ -37,6 +53,74 @@
   when:
     - inventory_hostname not in stortree_samba_hosts
     - "'smbd.service' in (ansible_facts.services | default({}))"
+  tags: [samba]
+
+- name: Stop and disable nmbd where this host must not announce over NetBIOS
+  # The unmanaged half of Samba, until now: the `samba` package's own
+  # postinst enables *and starts* nmbd next to smbd, and its
+  # ExecCondition (`is-configured nmb`) only declines on an AD DC or
+  # under `disable netbios = yes`, neither of which stortree sets. So
+  # every host this role ever touched has been announcing itself into
+  # the workgroup whether or not anything asked it to -- including,
+  # before this task existed, hosts dropped from stortree_samba_hosts,
+  # which kept answering name queries for shares they had stopped
+  # exporting.
+  ansible.builtin.systemd_service:
+    name: nmbd
+    state: stopped
+    enabled: false
+  when:
+    - >-
+      inventory_hostname not in stortree_samba_hosts
+      or not (stortree_samba_discovery and stortree_samba_discovery_netbios)
+    - "'nmbd.service' in (ansible_facts.services | default({}))"
+  tags: [samba]
+
+- name: Stop and disable the WS-Discovery announcer where this host must not run one
+  # Before the unit file is removed below, not after: once the render is
+  # gone and systemd has reloaded, `systemctl stop wsdd` on a platform
+  # whose package ships no unit of its own (Ubuntu noble) fails on a
+  # unit that no longer exists. Same order as stortree_mounts' own
+  # stale-unit sweep, for the same reason.
+  ansible.builtin.systemd_service:
+    name: wsdd
+    state: stopped
+    enabled: false
+  when:
+    - >-
+      inventory_hostname not in stortree_samba_hosts
+      or not (stortree_samba_discovery and stortree_samba_discovery_wsd)
+    - "'wsdd.service' in (ansible_facts.services | default({}))"
+  tags: [samba]
+
+- name: Remove the WS-Discovery unit stortree renders
+  # On bookworm and jammy this uncovers the distro package's own unit
+  # again (wsdd.service.j2 explains the shadowing), which the task above
+  # has just disabled -- so it stays down across reboots and across a
+  # package upgrade, since deb-systemd-helper does not re-enable a unit
+  # an admin disabled. The package itself is left installed, the same
+  # call this role makes for `samba` on a host that stops serving.
+  ansible.builtin.file:
+    path: /etc/systemd/system/wsdd.service
+    state: absent
+  notify: stortree wsdd unit changed
+  when: >-
+    inventory_hostname not in stortree_samba_hosts
+    or not (stortree_samba_discovery and stortree_samba_discovery_wsd)
+  tags: [samba]
+
+- name: Withdraw this host's mDNS advertisement
+  # Removing the file is the whole of it: avahi-daemon is left running,
+  # because unlike wsdd it is a general-purpose daemon this host may
+  # publish other things through, and because a host that has stopped
+  # advertising SMB has not necessarily stopped advertising.
+  ansible.builtin.file:
+    path: /etc/avahi/services/stortree-smb.service
+    state: absent
+  notify: stortree mdns advertisement changed
+  when: >-
+    inventory_hostname not in stortree_samba_hosts
+    or not (stortree_samba_discovery and stortree_samba_discovery_mdns)
   tags: [samba]
 
 - name: Install samba
@@ -140,4 +224,169 @@
     enabled: true
     state: started
   when: inventory_hostname in stortree_samba_hosts
+  tags: [samba]
+
+# -- host discovery -------------------------------------------------------
+
+- name: Ensure nmbd is enabled and running
+  # A no-op on a host that already had it, which is every host this role
+  # has ever run on (see the stop task above for why). What changes is
+  # that the state is now stortree's rather than the package's: the
+  # smb.conf handler reloads nmbd alongside smbd, so a `workgroup`
+  # change reaches the announcements and not just the shares.
+  ansible.builtin.systemd_service:
+    name: nmbd
+    enabled: true
+    state: started
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_netbios
+  tags: [samba]
+
+- name: Install wsdd
+  # Present on every platform meta/main.yml lists -- bookworm 0.7.0,
+  # jammy 0.7.0 and noble 0.7.1 -- but in `universe` on the two Ubuntu
+  # releases, so a host with universe disabled fails here with apt's own
+  # "no package" error rather than silently not announcing.
+  ansible.builtin.apt:
+    name: wsdd
+    state: present
+    install_recommends: false
+    update_cache: true
+    cache_valid_time: 3600
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+  tags: [samba]
+
+- name: Find the wsdd binary this platform installed
+  # /usr/sbin/wsdd on bookworm and jammy, /usr/bin/wsdd on noble. The
+  # unit has to name an absolute path, so the difference has to be
+  # resolved here rather than assumed -- a wrong path is a unit that
+  # fails at every start with status=203/EXEC.
+  ansible.builtin.find:
+    paths:
+      - /usr/bin
+      - /usr/sbin
+    patterns: wsdd
+    file_type: any
+  register: stortree_samba_wsdd_found
+  changed_when: false
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+  tags: [samba]
+
+- name: Refuse to render a WS-Discovery unit with no binary to run
+  # Its own task, ahead of the set_fact below, so the failure reads as
+  # the thing that is actually wrong: taking `first` of an empty find
+  # inside that set_fact fails too, but as a Jinja error about a
+  # sequence, which is a worse thing to meet in a log.
+  ansible.builtin.assert:
+    that: stortree_samba_wsdd_found.files | length > 0
+    fail_msg: >-
+      The wsdd package is installed but no wsdd binary was found in
+      /usr/bin or /usr/sbin (it is /usr/sbin/wsdd on bookworm and jammy,
+      /usr/bin/wsdd on noble). Set stortree_samba_discovery_wsd to false
+      to leave WS-Discovery off on this host in the meantime.
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+  tags: [samba]
+
+- name: Settle on the wsdd binary path
+  # `| sort | first` rather than "whichever the find happened to return
+  # first": on a merged-/usr host both paths can name the same file, and
+  # a unit whose ExecStart flips between two spellings of one binary
+  # would re-render and restart the announcer on alternate applies.
+  ansible.builtin.set_fact:
+    stortree_samba_wsdd_bin: >-
+      {{ stortree_samba_wsdd_found.files | map(attribute='path') | sort | first }}
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+  tags: [samba]
+
+- name: Render the WS-Discovery unit
+  # Shadows the distro package's own unit where it ships one; see the
+  # template's header for why that is the arrangement rather than a
+  # second unit name plus a mask. No `validate:` equivalent exists for a
+  # systemd unit, so the guard on this one's correctness is the render
+  # test in tests/test_templates.py.
+  ansible.builtin.template:
+    src: wsdd.service.j2
+    dest: /etc/systemd/system/wsdd.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: stortree wsdd unit changed
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+  tags: [samba]
+
+- name: Ensure the WS-Discovery announcer is enabled and running
+  # `daemon_reload` here rather than a flushed handler before it: on a
+  # first apply the unit file has only just been written, and enabling
+  # or starting a unit systemd has not read yet is the difference
+  # between an announcer that comes up now and one that comes up at the
+  # next reboot. Same self-healing reason as smbd's own task above.
+  ansible.builtin.systemd_service:
+    name: wsdd
+    enabled: true
+    state: started
+    daemon_reload: true
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+  tags: [samba]
+
+- name: Install avahi-daemon
+  # Recommends deliberately left out: the weightiest of them is
+  # libnss-mdns, which rewires this host's *own* name resolution to
+  # resolve .local through mDNS. Publishing a record and resolving other
+  # people's are different things, and only the first is what this role
+  # was asked for.
+  ansible.builtin.apt:
+    name: avahi-daemon
+    state: present
+    install_recommends: false
+    update_cache: true
+    cache_valid_time: 3600
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_mdns
+  tags: [samba]
+
+- name: Publish this host's SMB service over mDNS
+  ansible.builtin.template:
+    src: stortree-smb.avahi.xml.j2
+    dest: /etc/avahi/services/stortree-smb.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: stortree mdns advertisement changed
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_mdns
+  tags: [samba]
+
+- name: Ensure avahi-daemon is enabled and running
+  ansible.builtin.systemd_service:
+    name: avahi-daemon
+    enabled: true
+    state: started
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_mdns
   tags: [samba]

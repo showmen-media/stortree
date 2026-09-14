@@ -9,3 +9,69 @@
           - stortree is defined
           - stortree.server_subtrees is defined
           - stortree.client_mounts is defined
+
+    # -- host discovery (spec.md §4) ------------------------------------
+    #
+    # On by default, so a converge that changed none of the discovery
+    # flags should leave all three announcers up. Checked here rather
+    # than only in the render tests because the half these can't cover
+    # is the half that needs a real host: a unit whose ExecStart names a
+    # binary this platform doesn't have starts cleanly in no test and
+    # fails at 203/EXEC here.
+
+    - name: Collect service state
+      ansible.builtin.service_facts:
+
+    - name: Every announcer this host was told to run is running
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.services[item].state == "running"
+        fail_msg: "{{ item }} is not running"
+      loop:
+        - smbd.service
+        - nmbd.service
+        - wsdd.service
+        - avahi-daemon.service
+
+    - name: Read back the WS-Discovery unit and the mDNS advertisement
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      register: stortree_samba_discovery_files
+      loop:
+        - /etc/systemd/system/wsdd.service
+        - /etc/avahi/services/stortree-smb.service
+
+    - name: The announcer runs a binary that exists on this platform
+      ansible.builtin.stat:
+        path: >-
+          {{ (stortree_samba_discovery_files.results[0].content | b64decode)
+             | regex_search('^ExecStart=(\S+)', '\1', multiline=True) | first }}
+      register: stortree_samba_wsdd_stat
+
+    - name: ...and it is executable
+      ansible.builtin.assert:
+        that:
+          - stortree_samba_wsdd_stat.stat.exists
+          - stortree_samba_wsdd_stat.stat.executable
+
+    - name: The workgroup announced is the workgroup served
+      # The one piece of this that no render test can prove, because it
+      # is about two files on a host rather than two templates: what
+      # testparm reports as the live workgroup, against what the unit
+      # actually passes to wsdd.
+      ansible.builtin.command: testparm -s --parameter-name=workgroup
+      register: stortree_samba_live_workgroup
+      changed_when: false
+
+    - name: The unit announces it verbatim
+      ansible.builtin.assert:
+        that:
+          - >-
+            '--workgroup "' ~ stortree_samba_live_workgroup.stdout | trim ~ '"'
+            in (stortree_samba_discovery_files.results[0].content | b64decode)
+
+    - name: The mDNS advertisement names Samba's port
+      ansible.builtin.assert:
+        that:
+          - "'_smb._tcp' in (stortree_samba_discovery_files.results[1].content | b64decode)"
+          - "'<port>445</port>' in (stortree_samba_discovery_files.results[1].content | b64decode)"

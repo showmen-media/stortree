@@ -4,3 +4,57 @@
     name: smbd
     state: reloaded
   listen: stortree smb.conf changed
+
+- name: Reload nmbd
+  # nmbd reads the same smb.conf, and `workgroup` is the directive an
+  # operator is most likely to change in it -- but nmbd is the process
+  # that announces the workgroup, so reloading only smbd left the host
+  # serving one workgroup and announcing another until something
+  # restarted it. Guarded rather than unconditional: with NetBIOS
+  # switched off the unit is stopped and disabled a few tasks earlier,
+  # and reloading a stopped service fails.
+  ansible.builtin.systemd_service:
+    name: nmbd
+    state: reloaded
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_netbios
+  listen: stortree smb.conf changed
+
+- name: Reload systemd
+  # Defined before the restart below because handlers fire in the order
+  # this file lists them, not the order they were notified: systemd has
+  # to have read the new (or vanished) unit before anything acts on it.
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  listen: stortree wsdd unit changed
+
+- name: Restart the WS-Discovery announcer
+  # The unit carries the workgroup and the interface list in its own
+  # ExecStart, so "the unit file changed" and "what this host announces
+  # changed" are the same event. Skipped on the path where the unit was
+  # removed rather than re-rendered -- there is nothing there to restart.
+  ansible.builtin.systemd_service:
+    name: wsdd
+    state: restarted
+  when:
+    - inventory_hostname in stortree_samba_hosts
+    - stortree_samba_discovery
+    - stortree_samba_discovery_wsd
+  listen: stortree wsdd unit changed
+
+- name: Reload avahi-daemon
+  # Avahi does pick up changes to /etc/avahi/services on its own, but
+  # not promptly enough to rely on inside an apply that reports success.
+  # The second half of the guard is the withdrawal path: the
+  # advertisement was just removed and the flags say mDNS is off, so the
+  # only question left is whether this host has an avahi-daemon to tell.
+  ansible.builtin.systemd_service:
+    name: avahi-daemon
+    state: reloaded
+  when: >-
+    (inventory_hostname in stortree_samba_hosts
+     and stortree_samba_discovery and stortree_samba_discovery_mdns)
+    or 'avahi-daemon.service' in (ansible_facts.services | default({}))
+  listen: stortree mdns advertisement changed

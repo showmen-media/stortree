@@ -1,12 +1,45 @@
 ---
+# The `[global]` directives stortree sets itself, before
+# `stortree_samba_globals` below merges over them.
+#
+# They live here rather than as a literal inside smb.conf.j2 because
+# that template is no longer the only thing that needs them: the
+# WS-Discovery unit (wsdd.service.j2) announces this host into a
+# workgroup, and a workgroup read from a second copy of this dict would
+# eventually announce a different one than clients connect to. One
+# definition, two readers -- and a drift guard over the seam in
+# tests/test_templates.py.
+#
+# `security` and `passdb backend` are load-bearing for the access model
+# (spec.md §4/§5) -- see smb.conf.j2's own comment before overriding
+# either; `testparm` will happily accept a value that quietly breaks it.
+# `server min protocol` matches what Samba >= 4.11 already defaults to,
+# pinned so the posture is visible in the rendered file rather than
+# implied by the distro's version.
+#
+# `server string` is the description a browsing client shows beside the
+# host, and Samba's own default for it says nothing about *which* host
+# this is. `%h` is the hostname -- which, on a fleet whose hosts are
+# deliberately named and sited apart, is the entire answer a person
+# browsing needs. Override it for something longer ("%h (Reykjavik)").
+stortree_samba_global_defaults:
+  workgroup: WORKGROUP
+  security: user
+  map to guest: never
+  nt acl support: "yes"
+  inherit permissions: "yes"
+  passdb backend: tdbsam
+  server min protocol: SMB2_02
+  server string: "%h"
+
 # Extra "key = value" pairs merged into the rendered smb.conf's [global]
 # block (smb.conf.j2), for directives stortree doesn't model itself. A
-# key of the same name as one of stortree's own built-in globals
-# overrides that value rather than duplicating it; any other key is
-# appended as a new directive. Same escape-hatch shape as ldap.yml's
-# `extra:` for sssd.conf, and there for the same reason -- no fleet's
-# Samba settings are fully predictable from the tree, and without this
-# the only way to change one is to fork the template.
+# key of the same name as one of the built-in globals above overrides
+# that value rather than duplicating it; any other key is appended as a
+# new directive. Same escape-hatch shape as ldap.yml's `extra:` for
+# sssd.conf, and there for the same reason -- no fleet's Samba settings
+# are fully predictable from the tree, and without this the only way to
+# change one is to fork the template.
 #
 # `workgroup` is the common case: stortree defaults it to WORKGROUP,
 # which is right for no site in particular.
@@ -18,8 +51,98 @@
 #
 # Overrides are validated by `testparm -s` before the file is written
 # (the role's `validate:`), so a misspelled directive fails the apply
-# rather than reaching the host. Note that `security` and `passdb
-# backend` are load-bearing for the access model (see smb.conf.j2's own
-# comment) -- testparm will happily accept a value that quietly breaks
-# it.
+# rather than reaching the host.
 stortree_samba_globals: {}
+
+# The workgroup this host actually presents, resolved once from the two
+# variables above so that smb.conf and every announcer that names a
+# workgroup agree by construction. Read by wsdd.service.j2; not meant to
+# be set directly -- set `stortree_samba_globals.workgroup` and this
+# follows it.
+stortree_samba_workgroup: >-
+  {{ (stortree_samba_global_defaults | combine(stortree_samba_globals))['workgroup'] }}
+
+# -- host discovery -------------------------------------------------------
+#
+# Whether this host announces its *existence* on the local network, so a
+# person finds it by browsing rather than by being told its name. This is
+# a separate question from `samba.hidden` in config.yml, which is about
+# whether one share appears in the list a host returns once a client is
+# already talking to it (docs/config-schema.md). Nothing here touches
+# share visibility, and nothing here is access control: `valid users`
+# and the underlying Unix mode remain the only things deciding who may
+# read what.
+#
+# On by default, because a share nobody can find is a share nobody uses,
+# and because the alternative -- handing every user a hostname to type --
+# is exactly the friction the Samba layer exists to remove. Set this
+# false to silence all three protocols below at once; an apply then
+# stops and disables whatever it previously started, on the same
+# converge-back path a host removed from `stortree_samba_hosts` takes.
+#
+# Per-host, unlike `stortree_samba_hosts`: whether this host announces
+# itself changes nothing about what any *other* host resolves, so it
+# needs none of the fleet-wide agreement that list exists to guarantee
+# (see roles/stortree_facts/defaults/main.yml). Set it in group_vars or
+# host_vars by ordinary Ansible precedence.
+stortree_samba_discovery: true
+
+# WS-Discovery (WSD) -- how Windows 10/11 populates Explorer's "Network".
+# Windows has shipped with SMB1 and the Computer Browser service off
+# since 1709, so the NetBIOS announcements below reach it for name
+# resolution but never put the host in that list; wsdd is what does.
+# Installs the `wsdd` package and runs it from a unit stortree renders
+# (see wsdd.service.j2 for why the unit is stortree's rather than the
+# distro's). Listens on UDP 3702 (multicast) and TCP 5357.
+stortree_samba_discovery_wsd: true
+
+# mDNS/DNS-SD -- how macOS Finder's sidebar and GNOME Files' "Other
+# Locations" find a server. Samba can register `_smb._tcp` itself, but
+# only when built against Avahi, and the Debian/Ubuntu packages are not
+# (`smbd` links no libavahi-client, which also makes smb.conf's `mdns
+# name` inert there), so this publishes a static Avahi service file
+# instead. Installs `avahi-daemon`; listens on UDP 5353.
+#
+# Worth knowing before enabling on a host that also runs
+# systemd-resolved with MulticastDNS on: both want to bind 5353, and
+# whichever starts first keeps it. stortree manages neither daemon's own
+# configuration -- if the host resolves `.local` names through resolved
+# today, check that it still does after this lands.
+stortree_samba_discovery_mdns: true
+
+# NetBIOS -- `nmbd`, which answers name queries on UDP 137 and announces
+# into the workgroup browse list on UDP 138. This reaches old Windows
+# clients, Linux `smbclient -L`, and anything that still resolves names
+# the NetBIOS way; it does not reach a current Windows Explorer.
+#
+# It defaults on because it is already what these hosts do: the `samba`
+# package's own postinst enables and starts `nmbd` alongside `smbd`, and
+# its unit only declines to start on an AD DC or under `disable netbios
+# = yes`, neither of which stortree sets. Managing it explicitly changes
+# nothing on a host that was already running it -- it closes the two
+# gaps that came from *not* managing it: a host dropped from
+# `stortree_samba_hosts` kept announcing itself for shares it no longer
+# exported, and a `workgroup` change reached smb.conf's reload but never
+# nmbd's.
+#
+# Turning it off stops and disables the unit; the package stays, on the
+# same reasoning that leaves `samba` itself in place when a host stops
+# serving (see tasks/main.yml).
+stortree_samba_discovery_netbios: true
+
+# Which interfaces wsdd announces on, by name ("eth0", "br-lan") or
+# address. Empty means every non-loopback interface, which is wsdd's own
+# default and right for a host with one network. Name them on a host
+# where it is not -- a storage node that also holds a WireGuard tunnel
+# or a management network has no business announcing SMB down either.
+#
+# Avahi is not covered by this: it takes its interface policy from
+# avahi-daemon.conf, which stortree does not manage.
+stortree_samba_wsd_interfaces: []
+
+# The `_device-info._tcp` model string published alongside the mDNS
+# record. Purely cosmetic and purely for macOS, which picks the icon
+# Finder draws for the host from it -- "RackMac" gets a server, the
+# absent record gets a generic box. Set to null to publish no
+# device-info record at all.
+stortree_samba_mdns_model: RackMac

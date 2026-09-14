@@ -56,6 +56,22 @@ COMMON_VARS = {
     "stortree_rclone_bin": "/usr/bin/rclone",
     "stortree_uid": 900,
     "stortree_gid": 900,
+    # roles/stortree_samba/defaults/main.yml. smb.conf.j2 reads the
+    # built-in half of its [global] block from this rather than carrying
+    # it as a literal, so that wsdd.service.j2 can announce the same
+    # workgroup smb.conf serves -- which makes it a variable a real play
+    # has in scope, and so one these renders need too. Kept in step with
+    # the role default by a guard in tests/test_repo_consistency.py.
+    "stortree_samba_global_defaults": {
+        "workgroup": "WORKGROUP",
+        "security": "user",
+        "map to guest": "never",
+        "nt acl support": "yes",
+        "inherit permissions": "yes",
+        "passdb backend": "tdbsam",
+        "server min protocol": "SMB2_02",
+        "server string": "%h",
+    },
     "stortree_user_uids": {"jd": 10001, "mw": 10002},
     "stortree_group_gids": {
         "Whitfield Family & Friends": 20001,
