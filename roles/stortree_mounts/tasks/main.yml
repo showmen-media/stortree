@@ -6,7 +6,9 @@
 # map first, so the sequence is readable without reading the rationale;
 # the rationale then follows, and the individual tasks carry the rest.
 #
-#   1. install rclone/fuse, allow non-mounting users through FUSE
+#   1. install the mount stack -- rclone from apt or from the pinned
+#      upstream release, per stortree_rclone_install -- and allow
+#      non-mounting users through FUSE
 #   2. compute the flat mount plan + per-user container ownership
 #   3. sweep stale units  ---- before any path creation, so a path that
 #      used to be a mount is a plain empty directory by the time
@@ -20,7 +22,9 @@
 #   6. chown plain-local per-user containers to their one real user
 #   7. render units: mounts, per-user wrapper mounts, per-user binds
 #      (in that order -- a wrapper has to exist before what nests in it)
-#   8. restart units whose file actually changed, then enable+start all
+#   8. restart units whose file actually changed -- plus the transports,
+#      if step 1 replaced the rclone binary under them -- then
+#      enable+start all
 #   9. re-stat every path step 5 was supposed to create, and report
 #      (or, under `stortree_mounts_strict`, fail on) whatever is still
 #      missing  ---- the counterweight to step 5's ignore_errors
@@ -173,21 +177,124 @@
 # and the schema doesn't let you write anything broader than that
 # (_normalize_access() rejects a list).
 
-- name: Install rclone, bindfs and fuse
+- name: Refuse an rclone source this role cannot install
+  # Fail by name, here, rather than three tasks later on a 404 or on a
+  # silently skipped install that leaves the units pointing at a binary
+  # nobody put there. An unmapped architecture is the same class of
+  # problem: stortree_rclone_arch_map is extendable precisely so this
+  # says which key to add.
+  ansible.builtin.assert:
+    that:
+      - stortree_rclone_install in ["apt", "upstream"]
+      - >-
+        stortree_rclone_install != "upstream"
+        or ansible_facts["architecture"] in stortree_rclone_arch_map
+    fail_msg: >-
+      stortree_rclone_install must be apt or upstream
+      (is {{ stortree_rclone_install }});
+      and an upstream install needs this host's architecture
+      ({{ ansible_facts["architecture"] }}) in stortree_rclone_arch_map.
+    quiet: true
+  tags: [mounts]
+
+- name: Install the packaged part of the mount stack
   # bindfs is the presentation layer for per-user containers
   # (stortree-user-mount@.service.j2): it re-presents an already-mounted
   # local path under a forced owner, which is all a container needs and
   # which rclone was doing at ~47MB of resident memory per wrapper
   # against bindfs's ~1.6MB. See docs/layered-mounts.md "Why bindfs for
   # layer 2".
+  #
+  # rclone comes from apt only when stortree_rclone_install says so
+  # (that default's own comment has the reasoning); `upstream` swaps it
+  # for unzip, which the unarchive task below needs on the target, and
+  # installs the pinned binary itself.
+  #
+  # An apt rclone already on an `upstream` host is deliberately left
+  # installed rather than removed. Nothing points at it once the units
+  # render stortree_rclone_bin, an unused 40MB binary is harmless, and
+  # `state: absent` here would turn a typo'd stortree_rclone_install --
+  # or a download that failed on one host -- into a host with no rclone
+  # at all rather than a host still running the distro's.
   ansible.builtin.apt:
-    name:
-      - rclone
-      - bindfs
-      - fuse
+    name: >-
+      {{ ['bindfs', 'fuse']
+         + (['unzip'] if stortree_rclone_install == 'upstream' else ['rclone']) }}
     state: present
     update_cache: true
     cache_valid_time: 3600
+  tags: [mounts]
+
+- name: Create the directory the upstream rclone release is staged in
+  ansible.builtin.file:
+    path: "{{ stortree_rclone_download_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: stortree_rclone_install == "upstream"
+  tags: [mounts]
+
+- name: Download the pinned upstream rclone release
+  # get_url verifies `checksum:` against a dest that already exists and
+  # skips the transfer when it matches, so this re-downloads only when
+  # stortree_rclone_version moves -- which is also why the staging
+  # directory is kept rather than cleaned up.
+  #
+  # A mismatch fails the task and leaves the running mounts alone: the
+  # copy below never happens, so nothing under the live transports is
+  # replaced by a file that wasn't what upstream published.
+  ansible.builtin.get_url:
+    url: >-
+      {{ stortree_rclone_base_url }}/v{{ stortree_rclone_version }}/{{
+         stortree_rclone_archive }}
+    dest: "{{ stortree_rclone_download_dir }}/{{ stortree_rclone_archive }}"
+    checksum: "{{ stortree_rclone_checksums[stortree_rclone_goarch] }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: stortree_rclone_install == "upstream"
+  tags: [mounts]
+
+- name: Unpack the pinned upstream rclone release
+  ansible.builtin.unarchive:
+    src: >-
+      {{ stortree_rclone_download_dir }}/{{ stortree_rclone_archive }}
+    dest: "{{ stortree_rclone_download_dir }}"
+    remote_src: true
+    creates: "{{ stortree_rclone_unpacked }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: stortree_rclone_install == "upstream"
+  tags: [mounts]
+
+- name: Install the upstream rclone binary
+  # `copy` rather than a second unarchive target, because copy compares
+  # checksums and so reports `changed` only when the binary on disk
+  # actually differs from the one just unpacked. That result is what the
+  # restart step at the end of this file reads to decide whether the
+  # running transports are executing a stale binary -- an upgrade
+  # changes no unit file, so nothing else in this role would notice.
+  ansible.builtin.copy:
+    src: "{{ stortree_rclone_unpacked }}"
+    dest: "{{ stortree_rclone_bin }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  register: stortree_rclone_binary_installed
+  when: stortree_rclone_install == "upstream"
+  tags: [mounts]
+
+- name: Note whether the rclone binary changed under the running mounts
+  # Carried as its own fact rather than read off the register directly
+  # at the restart step, which is ~500 lines below and has no business
+  # knowing which task installed what. `default(false)` covers the apt
+  # path, where the task above is skipped.
+  ansible.builtin.set_fact:
+    stortree_rclone_upgraded: >-
+      {{ stortree_rclone_binary_installed.changed | default(false) | bool }}
   tags: [mounts]
 
 - name: Allow FUSE mounts to grant access beyond the mounting user
@@ -217,14 +324,20 @@
 
 - name: Read the rclone version this host actually has
   # Only to decide between the two metrics spellings, and only when the
-  # operator left that on `auto`. The roles install rclone from apt, so
-  # the answer legitimately differs across a fleet that spans two Debian
-  # releases (bookworm ships 1.60.1; --metrics-addr arrived in 1.68),
-  # and guessing wrong is not a missing counter but a mount that never
-  # starts -- rclone rejects an unknown flag outright and the transport
+  # operator left that on `auto`. The answer legitimately differs across
+  # a fleet -- apt hosts get 1.60.1 on every Debian release there is,
+  # upstream hosts get whatever stortree_rclone_version pins -- and
+  # guessing wrong is not a missing counter but a mount that never
+  # starts: rclone rejects an unknown flag outright and the transport
   # unit is Type=notify.
+  #
+  # stortree_rclone_bin, not a bare `rclone`: an upstream host has both
+  # binaries installed (the apt one is left in place on purpose, see the
+  # install task), so a PATH lookup here could read a version other than
+  # the one the units below will actually execute -- and this probe's
+  # whole job is to describe that binary.
   ansible.builtin.command:  # noqa: command-instead-of-module
-    cmd: rclone version
+    cmd: "{{ stortree_rclone_bin }} version"
   register: stortree_metrics_rclone_version
   changed_when: false
   # Reads nothing but a version string, and has to run under --check
@@ -685,13 +798,26 @@
   # something restarts it. Scoped to just the units that actually
   # re-rendered, not every resolved unit, so an unrelated mount's open
   # file handles aren't disrupted on every apply.
+  #
+  # A replaced rclone binary is the same staleness with no changed file
+  # to notice it by: the running process holds the old inode open and
+  # goes on serving 1.60.1 behaviour indefinitely, so an upgraded host
+  # would keep the old metrics flavour and the old bugs until something
+  # unrelated happened to restart it. Hence the second clause -- but
+  # only for the transports, which are the units that execute rclone at
+  # all. The presentations and binds above them come back on their own
+  # through PartOf=, which is also why this is genuinely disruptive and
+  # why the runbook says to roll an upgrade one host at a time.
   ansible.builtin.systemd_service:
     name: "{{ item.dest | basename }}"
     state: restarted
   loop: "{{ stortree_mounts_rendered_units }}"
   loop_control:
     label: "{{ item.entry.local_path }}"
-  when: item.changed
+  when: >-
+    item.changed
+    or (stortree_rclone_upgraded
+        and item.dest | basename is match('stortree-remote@'))
   tags: [mounts]
 
 - name: Enable and start every rendered unit

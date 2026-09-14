@@ -151,6 +151,17 @@ tooling that the roles configure rather than reinvent — `rclone`, `samba`,
 [docs/spec.md §9](docs/spec.md) for the full dependency list and
 test-harness design.
 
+rclone is the one of those worth a decision rather than a default.
+Debian ships 1.60.1 in bookworm *and* trixie, and Ubuntu in noble — no
+deployable release has the 1.68 `--metrics-addr` flag, so metrics on an
+apt host must go out over the rc API, which also serves this host's
+backend credentials. `stortree_rclone_install: upstream` installs a
+pinned, checksum-verified build from upstream instead, at
+`/usr/local/bin/rclone`, and takes over patching it in exchange. The
+trade-off and the rollout are in
+[docs/runbook.md](docs/runbook.md#upgrading-rclone); the default stays
+`apt`.
+
 ## Setup
 
 Real config (`inventory/hosts.yml`, `stortree/config.yml`,

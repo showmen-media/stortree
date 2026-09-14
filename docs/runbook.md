@@ -127,8 +127,19 @@ than guessing:
   `config/dump` -- this host's scoped `rclone.conf`, backend credentials
   and all. Loopback is no exemption: every LDAP user with a shell here
   is a local user. `stortree_metrics_flavour` picks per host by reading
-  `rclone version`; Debian bookworm ships 1.60.1, eight releases before
-  `--metrics-addr`.
+  `rclone version`.
+
+  On an apt fleet that is *every* host, permanently: Debian ships 1.60.1
+  in bookworm and in trixie, Ubuntu ships it in noble, and 1.69 only
+  ever reached sid -- there is no release you can deploy on that has
+  `--metrics-addr`. Hosts on `stortree_rclone_install: upstream` get
+  `--metrics-addr` instead, which serves counters and no config
+  endpoints, and the htpasswd becomes optional there (still worth
+  setting if the bind address is a network you would not publish your
+  transfer volumes to). Same fleet, same 1.60.1, also means `--rc-addr`
+  is not yet repeatable -- it became so in 1.63 -- so a
+  `stortree_metrics_bind` naming more than one address quietly listens
+  on the last one alone until that host is upgraded.
 
 ### "both want metrics port N"
 
@@ -152,6 +163,71 @@ covers a late arrival -- but only within systemd's default start-limit
 burst, so an interface that takes minutes needs
 `systemctl restart stortree-remote@<slug>` afterwards. Binding loopback
 and scraping through a tunnel avoids the whole class.
+
+## Upgrading rclone
+
+Debian's rclone is 1.60.1 (November 2022) on every release you can
+deploy on -- bookworm, trixie, and Ubuntu noble all ship it, and 1.69
+only ever reached sid. `stortree_rclone_install` chooses between that
+and a pinned upstream build:
+
+```yaml
+# inventory/group_vars/all.yml, or host_vars/<host>.yml to roll it one
+# host at a time
+stortree_rclone_install: upstream
+stortree_rclone_version: "1.75.1"
+```
+
+The role downloads `rclone-v<version>-linux-<arch>.zip` into
+`/var/cache/stortree`, verifies it against the SHA256 in
+`stortree_rclone_checksums`, and installs the binary at
+`/usr/local/bin/rclone` -- never `/usr/bin`, which belongs to dpkg. The
+apt package is left installed and simply stops being used; the unit
+files name `stortree_rclone_bin`, so reverting is
+`stortree_rclone_install: apt` plus a re-apply.
+
+**Bumping the version means bumping the checksums.** They are not
+fetched at apply time on purpose -- a hash pulled from the same host over
+the same TLS session as the download proves little. Get them from
+upstream and paste them into `stortree_rclone_checksums`:
+
+```sh
+curl -s https://downloads.rclone.org/v1.75.1/SHA256SUMS \
+  | grep -E 'linux-(amd64|arm64|arm-v7|386)\.zip'
+```
+
+`tests/test_repo_consistency.py` checks their shape and that every
+architecture in `stortree_rclone_arch_map` has one, but only upstream
+can tell you the values.
+
+**An upgrade restarts every transport mount on the host.** A running
+rclone holds the old binary's inode open and goes on behaving like the
+old version indefinitely, and replacing the file changes no unit, so the
+apply restarts the `stortree-remote@*` units itself when -- and only
+when -- the binary on disk actually changed. Every presentation and bind
+above them goes down and comes back with them through `PartOf=`. That is
+an I/O interruption for anyone reading the tree at the time, so roll it
+with `--limit` one host at a time rather than fleet-wide, and check
+`playbooks/status.yml` in between.
+
+What upgrading gets you, concretely: `--metrics-addr` (1.68) instead of
+the `rc` metrics flavour that also serves `config/dump`, so
+`stortree_metrics_htpasswd` stops being mandatory; a repeatable
+`--rc-addr` (1.63), so a multi-address `stortree_metrics_bind` stops
+silently binding only its last entry; and three years of VFS and mount
+fixes under processes that are meant to stay up for months.
+
+What it does not get you: `--allow-root`. The "Ignoring --allow-root.
+Support has been removed upstream" line the transport units work around
+comes from the FUSE library rclone's `mount` is built on, not from the
+rclone version, and no upgrade restores it. The `--allow-other` +
+`0700` + `--default-permissions` arrangement in
+`stortree-remote@.service.j2` stays exactly as it is.
+
+The cost is that nothing else upgrades this binary -- no
+unattended-upgrades, no distro security tracker. Watch
+<https://github.com/rclone/rclone/releases> and treat a version bump as
+a change to be rolled, because it is one.
 
 ## Onboarding a new LDAP user for Samba
 

@@ -156,15 +156,26 @@ stortree_metrics_port_overrides: {}
 #                 host older than that a stortree_metrics_bind with
 #                 several entries quietly listens on the last one
 #                 alone.
-#   auto          read `rclone version` on the host and pick. The
-#                 default, because the roles install rclone from apt
-#                 (bookworm ships 1.60.1, eight releases before
-#                 --metrics-addr existed) and a fleet spanning two
-#                 Debian releases would otherwise need this set per
-#                 host. Falls back to `rc` if the version can't be
-#                 parsed: the conservative choice, since it works on
-#                 every rclone and the assert below keeps it off the
-#                 network unauthenticated.
+#   auto          read `{{ stortree_rclone_bin }} version` on the host
+#                 and pick. The default, because which rclone a host has
+#                 is a per-host question: an apt host gets 1.60.1 --
+#                 eight releases before --metrics-addr existed, and what
+#                 *every* Debian release ships, bookworm and trixie
+#                 alike, Ubuntu noble too -- while a host on
+#                 stortree_rclone_install: upstream gets whatever
+#                 stortree_rclone_version pins. A fleet part-way through
+#                 that migration would otherwise need this set per host.
+#                 Falls back to `rc` if the version can't be parsed: the
+#                 conservative choice, since it works on every rclone
+#                 and the assert below keeps it off the network
+#                 unauthenticated.
+#
+# Worth being plain about what the default costs on an apt fleet: `auto`
+# resolves to `rc` on all of it, forever, because no deployable Debian
+# release carries 1.68. So the credential-serving flavour and its
+# mandatory htpasswd are the permanent state there, not a transitional
+# one -- see stortree_rclone_install in
+# roles/stortree_mounts/defaults/main.yml for the way out.
 stortree_metrics_flavour: auto
 
 # Path on the managed host to an htpasswd file for the metrics endpoint,

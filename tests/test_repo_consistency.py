@@ -396,3 +396,65 @@ def test_the_metrics_fragment_lives_in_the_directory_stortree_common_creates():
             line for line in text.splitlines() if not line.lstrip().startswith("#")
         )
         assert etc not in directives, path
+
+
+def test_every_architecture_the_rclone_map_names_has_a_checksum():
+    # stortree_rclone_arch_map is documented as the thing to extend for
+    # an architecture this fleet doesn't run yet, and the install task
+    # asserts against it by name. An entry added there but not to
+    # stortree_rclone_checksums passes that assert and then fails three
+    # tasks later on an undefined key, mid-install, with the units
+    # already pointing at a binary nothing put in place.
+    defaults = role_defaults("stortree_mounts")
+    mapped = set(defaults["stortree_rclone_arch_map"].values())
+    assert mapped <= set(defaults["stortree_rclone_checksums"])
+
+
+def test_the_pinned_rclone_checksums_are_well_formed():
+    # get_url takes "<algo>:<digest>"; a bare digest is accepted by the
+    # module and silently treated as... a bare digest with no algorithm,
+    # which fails at fetch time on every host at once. Cheap to assert
+    # here, and it catches the likelier mistake of pasting SHA256SUMS'
+    # own two-column output straight in.
+    for arch, checksum in role_defaults("stortree_mounts")[
+        "stortree_rclone_checksums"
+    ].items():
+        algo, _, digest = checksum.partition(":")
+        assert algo == "sha256", arch
+        assert re.fullmatch(r"[0-9a-f]{64}", digest), arch
+
+
+def test_the_rclone_binary_path_follows_the_install_source():
+    # The two paths are not interchangeable and the reason is in the
+    # defaults file: /usr/bin is dpkg's, so an upstream build written
+    # there is reverted by any apt operation touching the package, with
+    # no file this repo renders having changed to show it. The unit
+    # template reads this variable and nothing else, so this default is
+    # the only place the distinction exists.
+    binary = role_defaults("stortree_mounts")["stortree_rclone_bin"]
+    assert "/usr/local/bin/rclone" in binary
+    assert "/usr/bin/rclone" in binary
+    assert "stortree_rclone_install" in binary
+
+    # tests/conftest.py renders the unit templates against the apt
+    # default; if that stopped matching, every template test would be
+    # asserting about a path no unconfigured host actually gets.
+    from conftest import COMMON_VARS
+
+    assert COMMON_VARS["stortree_rclone_bin"] == "/usr/bin/rclone"
+
+
+def test_the_transport_unit_names_no_rclone_path_of_its_own():
+    # The one place an ExecStart could quietly re-hardcode /usr/bin.
+    unit = (
+        REPO_ROOT
+        / "roles/stortree_mounts/templates/stortree-remote@.service.j2"
+    ).read_text()
+    directives = "\n".join(
+        line
+        for line in unit.splitlines()
+        if not line.lstrip().startswith("#") and "rclone.conf" not in line
+    )
+    assert "/usr/bin/rclone" not in directives
+    assert "/usr/local/bin/rclone" not in directives
+    assert "ExecStart={{ stortree_rclone_bin }} mount " in unit

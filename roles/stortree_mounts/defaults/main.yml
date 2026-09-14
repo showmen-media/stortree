@@ -24,3 +24,113 @@
 # re-run after adding entries. There, a still-missing path is a real
 # failure and should stop the run rather than scroll past.
 stortree_mounts_strict: false
+
+
+# -- where rclone comes from ----------------------------------------------
+
+# `apt` (Debian's package, what this role has always done) or `upstream`
+# (the pinned release binary from downloads.rclone.org, checksum-verified
+# and installed at stortree_rclone_bin).
+#
+# Default `apt`, so an existing fleet's behaviour does not change under
+# this variable merely existing. The reason to leave it is the metrics
+# flavour, not novelty:
+#
+# Debian ships rclone 1.60.1 (November 2022) in bookworm *and* in
+# trixie, and Ubuntu ships it in noble -- 1.69 only ever reached sid.
+# There is no release you can actually deploy on that carries the 1.68
+# `--metrics-addr` flag, so `stortree_metrics_flavour: auto` resolves to
+# `rc` on every apt host, permanently rather than transitionally. `rc`
+# is the flavour that serves the whole rc API alongside the counters --
+# `config/dump` reads back this host's scoped rclone.conf, backend
+# credentials and all -- which is why stortree_metrics_htpasswd is
+# mandatory there and why the apply refuses without it. On an upstream
+# build the same `auto` resolves to `metrics-addr`, which serves
+# counters and nothing else. 1.60.1 also predates `--rc-addr` becoming
+# repeatable in 1.63, so a stortree_metrics_bind naming more than one
+# address quietly listens on the last one alone on every apt host today.
+#
+# What it costs: nothing upgrades this binary but this role -- no
+# unattended-upgrades, no distro security tracker. That is a trade, not
+# a free win. Pin a version, follow upstream's changelog, and roll it
+# one host at a time; see docs/runbook.md "Upgrading rclone".
+stortree_rclone_install: apt
+
+# The binary every transport unit's ExecStart names, and the one the
+# metrics version probe reads.
+#
+# /usr/local/bin for the upstream build, never /usr/bin: the apt package
+# owns /usr/bin/rclone, and writing an unmanaged binary there means dpkg
+# and this role fight over one path -- the next `apt install --reinstall
+# rclone` silently reverts the fleet to 1.60.1, with no file this role
+# renders having changed to show it. Two separate paths also make the
+# rollback trivial (set stortree_rclone_install back to `apt`, re-apply,
+# and the units point at the distro binary again on the next restart).
+#
+# Spelled absolutely rather than relying on PATH order, because on an
+# upstream host both binaries exist and `rclone` alone would resolve by
+# whatever PATH systemd or the probe happened to have -- and picking the
+# wrong one is not a cosmetic error here, it is a metrics flavour
+# chosen for the wrong version and a transport that fails to start on an
+# unknown flag.
+stortree_rclone_bin: >-
+  {{ '/usr/local/bin/rclone' if stortree_rclone_install == 'upstream'
+     else '/usr/bin/rclone' }}
+
+# Which upstream release to install. Pinned, deliberately: `latest`
+# would mean an unannounced rclone upgrade -- and so a restart of every
+# transport mount on the host -- on whatever apply happened to run after
+# upstream tagged a release.
+stortree_rclone_version: "1.75.1"
+
+# SHA256 of each release archive, in the `checksum:` spelling get_url
+# takes. From https://downloads.rclone.org/v<version>/SHA256SUMS; these
+# are v1.75.1's. Replace them whenever stortree_rclone_version changes --
+# tests/test_repo_consistency.py asserts the two agree on the version
+# string, but only upstream can tell you the hashes.
+#
+# A literal hash rather than get_url's "fetch the SHA256SUMS file and
+# look it up" form, which would verify the download against a checksum
+# fetched from the same host over the same TLS session and so prove
+# little beyond "not truncated".
+stortree_rclone_checksums:
+  amd64: "sha256:982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab"
+  arm64: "sha256:03f2504174034b6d004152ed7369251c9a9ec1f7e0836eda420f5c7a5ec0dff9"
+  arm-v7: "sha256:33c683053b677d9a89d4a985e8a25cfed7c8a95dd8379e367a5c73d8745356c3"
+  "386": "sha256:9250a48ace446b32ad3f3cb26e0744f9245efb65ef4f51dfb416288950b84285"
+
+# uname's architecture -> the name upstream builds under. Extend it
+# rather than editing the tasks if you run this on something not listed;
+# an architecture missing from here fails the apply by name, which is
+# the intent -- the alternative is a 404 halfway through an install.
+stortree_rclone_arch_map:
+  x86_64: amd64
+  aarch64: arm64
+  armv7l: arm-v7
+  i386: "386"
+  i686: "386"
+
+# Where the release archive is downloaded and unpacked on the managed
+# host. Kept (rather than unpacked to a tempdir and discarded) so a
+# re-apply re-verifies the existing file's checksum instead of
+# re-downloading, and so the previous version's binary is still sitting
+# there if a rollback has to happen without network.
+stortree_rclone_download_dir: /var/cache/stortree
+
+# Where upstream's releases are fetched from. A variable so an
+# air-gapped or mirrored fleet can point it at an internal copy; the
+# checksums above are what make that safe.
+stortree_rclone_base_url: https://downloads.rclone.org
+
+# Derived from the four settings above; overriding any of those is
+# enough, and these exist only so the tasks and the runbook name one
+# thing each instead of rebuilding the same string four times.
+#
+# The release layout is upstream's: rclone-v<version>-linux-<arch>.zip
+# unpacks to a directory of the same stem containing the binary, so the
+# unpacked path is per-version and `creates:` on it is a real idempotence
+# check rather than one that goes stale on the next version bump.
+stortree_rclone_goarch: "{{ stortree_rclone_arch_map[ansible_facts['architecture']] }}"
+stortree_rclone_stem: "rclone-v{{ stortree_rclone_version }}-linux-{{ stortree_rclone_goarch }}"
+stortree_rclone_archive: "{{ stortree_rclone_stem }}.zip"
+stortree_rclone_unpacked: "{{ stortree_rclone_download_dir }}/{{ stortree_rclone_stem }}/rclone"

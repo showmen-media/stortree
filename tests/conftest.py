@@ -49,6 +49,11 @@ COMMON_VARS = {
     "stortree_remotes_root": "/srv/.stortree-remotes",
     "stortree_user": "stortree",
     "stortree_group": "stortree",
+    # roles/stortree_mounts/defaults/main.yml, as `stortree_rclone_install:
+    # apt` leaves it -- the distro path, so these renders match what an
+    # unconfigured fleet actually gets. A test that cares about the
+    # upstream path passes its own value.
+    "stortree_rclone_bin": "/usr/bin/rclone",
     "stortree_uid": 900,
     "stortree_gid": 900,
     "stortree_user_uids": {"jd": 10001, "mw": 10002},

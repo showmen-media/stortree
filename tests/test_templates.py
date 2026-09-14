@@ -214,6 +214,29 @@ def test_remote_unit_declared_requires_is_hard_and_never_partof(
     assert "PartOf=stortree-remote@.bravo\\x2dcache.service" not in unit
 
 
+def test_remote_unit_executes_the_configured_rclone_binary(
+    render, mount_plans, containers
+):
+    # stortree_rclone_install: upstream puts a pinned build at
+    # /usr/local/bin and leaves the distro's at /usr/bin, so the unit
+    # has to name the one it means. A hardcoded /usr/bin/rclone here
+    # would run 1.60.1 on a host that was upgraded precisely to stop
+    # doing that -- and the metrics flavour, decided from the *other*
+    # binary's version, would then render a flag this one rejects,
+    # taking the mount down rather than merely mis-versioning it.
+    entry = transport_for(mount_plans[ALPHA], "tree")
+    common = mount_vars(containers, ALPHA)
+
+    apt = render(REMOTE_UNIT, entry=entry, stortree_rclone_bin="/usr/bin/rclone", **common)
+    upstream = render(
+        REMOTE_UNIT, entry=entry, stortree_rclone_bin="/usr/local/bin/rclone", **common
+    )
+
+    assert "ExecStart=/usr/bin/rclone mount " in apt
+    assert "ExecStart=/usr/local/bin/rclone mount " in upstream
+    assert "/usr/bin/rclone" not in upstream
+
+
 def test_remote_unit_flattens_rclone_args_one_per_line(
     render, mount_plans, containers
 ):
