@@ -38,9 +38,20 @@
   # ansible-core -- and which would have applied to every play run
   # against this repo, including the two read-only ones that gather no
   # facts at all.
+  #
+  # `all` first is load-bearing, not noise. A gather_subset made only of
+  # negations does not mean "everything except those" -- it collapses to
+  # the minimal set, so `!hardware` alone drops the *network* facts too,
+  # and this play needs those: stortree_metrics_bind names an interface
+  # (tailscale0) that stortree_metrics_listeners resolves against
+  # ansible_facts. Measured on a real host: ['!hardware'] yields 57 fact
+  # keys and no ansible_interfaces at all; ['all', '!hardware'] yields 74
+  # with the interfaces present and the hardware ones gone; ['all'] is
+  # 108. Only the middle one is what this play wants.
   module_defaults:
     ansible.builtin.setup:
       gather_subset:
+        - "all"
         - "!hardware"
   roles:
     - stortree_facts

@@ -528,3 +528,38 @@ def test_the_transport_unit_names_no_rclone_path_of_its_own():
     assert "/usr/bin/rclone" not in directives
     assert "/usr/local/bin/rclone" not in directives
     assert "ExecStart={{ stortree_rclone_bin }} mount " in unit
+
+
+def test_the_apply_play_keeps_every_fact_family_its_roles_read():
+    # site.yml narrows fact gathering to skip the hardware collector,
+    # whose only fact this repo ever read was `ansible_facts.mounts` --
+    # gathering it calls statvfs() on every mount, which on an rclone
+    # mount is a round trip to the backend and on a stuck one never
+    # returns.
+    #
+    # The trap this guards is that a `gather_subset` made only of
+    # negations does NOT mean "everything except those". Ansible starts
+    # from the *minimal* set in that case, so `['!hardware']` silently
+    # drops the network facts as well -- and stortree_metrics_listeners
+    # resolves `stortree_metrics_bind`'s interface names against exactly
+    # those, so an apply fails outright with "no gathered facts for
+    # interface 'tailscale0'". Measured against a live host: 57 fact
+    # keys and no ansible_interfaces for ['!hardware'], 74 with them for
+    # ['all', '!hardware'], 108 for ['all'].
+    #
+    # Hence both halves are asserted: an explicit additive base, and the
+    # one exclusion that was the point.
+    play = yaml.safe_load((REPO_ROOT / "playbooks/site.yml").read_text())[0]
+    subset = play["module_defaults"]["ansible.builtin.setup"]["gather_subset"]
+
+    assert "all" in subset, (
+        "a negation-only gather_subset collapses to the minimal set -- "
+        "start from 'all' and subtract"
+    )
+    assert "!hardware" in subset
+
+    # Nothing may exclude the families the roles actually read:
+    # `network` for the metrics listeners, and the minimal set that
+    # carries `architecture` (used to pick the rclone release).
+    for forbidden in ("!network", "!min", "!all"):
+        assert forbidden not in subset, forbidden
