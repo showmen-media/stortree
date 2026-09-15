@@ -106,6 +106,14 @@ ExecStart=/usr/bin/bindfs {{ stortree_remotes_root }}/{{ entry.local_path }} {{ 
   --chgrp-ignore \
   --chmod-ignore
 ExecStop=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do mountpoint -q "{{ stortree_root }}/{{ entry.local_path }}" || exit 0; /bin/fusermount -uz "{{ stortree_root }}/{{ entry.local_path }}" || exit 0; done'
+{#
+bindfs is the process that actually wedged in production: it reads
+through the transport's FUSE mount below it, so when that goes away
+mid-teardown bindfs blocks in the kernel and stops being killable at
+all. The lazy unmount above is what usually avoids that; this bounds
+what it costs when it doesn't. See stortree_mounts_stop_timeout.
+#}
+TimeoutStopSec={{ stortree_mounts_stop_timeout }}
 Restart=on-failure
 RestartSec=5
 

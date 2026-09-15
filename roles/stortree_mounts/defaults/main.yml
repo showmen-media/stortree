@@ -26,6 +26,36 @@
 stortree_mounts_strict: false
 
 
+# -- how long a stuck unmount is allowed to hold up a shutdown ------------
+
+# `TimeoutStopSec` for the two layers above the transports -- the
+# presentation (bindfs) and per-user bind units.
+#
+# Their stop is a lazy unmount and nothing else, so it either succeeds
+# at once or is never going to. systemd's own default of 90s is sized
+# for daemons that need to finish work; here it is 90s of waiting for
+# something that already failed, and it is not spent once but four
+# times, because systemd escalates through stop -> stop-sigterm ->
+# final-sigterm -> give up with the same timeout at each step. A
+# production reboot spent seven and a half minutes in exactly that
+# ladder, serialized across the units, with `bindfs` unkillable in
+# uninterruptible sleep the whole way (see the lazy unmount in
+# stortree-bind@.service.j2 for the cause, which is the real fix -- this
+# only bounds what it costs when something wedges anyway).
+#
+# 30s is far longer than a lazy unmount can legitimately need and still
+# cuts the worst case from ~6 minutes per stuck unit to 2.
+#
+# The *transports* deliberately keep systemd's 90s and are not covered
+# by this. An rclone mount running `--vfs-cache-mode full` flushes
+# pending uploads to the backend when it stops, and that genuinely can
+# take time on a slow link -- cutting it short is not a faster shutdown,
+# it is an upload that has to be redone from the on-disk cache at next
+# start. They were also not what wedged: the journal named `bindfs` and
+# `umount`, never `rclone`.
+stortree_mounts_stop_timeout: 30
+
+
 # -- where rclone comes from ----------------------------------------------
 
 # `apt` (Debian's package, what this role has always done) or `upstream`

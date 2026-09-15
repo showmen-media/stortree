@@ -70,7 +70,27 @@ in. A bare umount fails there and leaves the unit failed rather than
 cleanly stopped -- nothing to unmount is a successful stop, not an
 error.
 #}
-ExecStop=-/bin/sh -c 'mountpoint -q "{{ stortree_root }}/{{ entry.local_path }}" || exit 0; /bin/umount "{{ stortree_root }}/{{ entry.local_path }}"'
+{#
+`-l` (lazy), matching the `fusermount -uz` the other two layers have
+always used, and for a stronger reason than symmetry: a plain `umount`
+here is what turned an ordinary reboot into a seven-and-a-half-minute
+one in production.
+
+A bind's source is a FUSE mount. When it goes away underneath -- which
+at shutdown it routinely does, since the layer below is being torn down
+in the same pass -- a blocking `umount` enters uninterruptible sleep in
+the kernel waiting for a daemon that is already gone, and a process in D
+state cannot be killed by anything, SIGKILL included ("Processes still
+around after final SIGKILL. Entering failed mode."). `umount -l`
+detaches the mountpoint immediately and lets the kernel clean up the
+reference behind it, so there is nothing to block on.
+#}
+ExecStop=-/bin/sh -c 'mountpoint -q "{{ stortree_root }}/{{ entry.local_path }}" || exit 0; /bin/umount -l "{{ stortree_root }}/{{ entry.local_path }}"'
+{#
+See stortree_mounts_stop_timeout in the role's defaults for why this is
+capped at all, and why the transports keep systemd's own 90s.
+#}
+TimeoutStopSec={{ stortree_mounts_stop_timeout }}
 
 [Install]
 WantedBy=multi-user.target

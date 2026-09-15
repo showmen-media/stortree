@@ -14,6 +14,34 @@
 - name: Apply the resolved stortree
   hosts: all
   become: true
+  # Skip the hardware collector when gathering facts. Its only fact this
+  # repo ever read was `ansible_facts.mounts`, and nothing reads that any
+  # more -- the one check that did (roles/stortree_common) reads
+  # /proc/self/mountinfo instead, which is both cheaper and more accurate
+  # about rclone mounts than Ansible's own gathering, which drops any
+  # mount whose device string neither starts with "/" nor contains ":/".
+  #
+  # Gathering it was not free on this fleet: the collector calls
+  # statvfs() on every mount, which on an rclone mount is a round trip to
+  # the backend and on a stuck one never returns, so every play on every
+  # host paid `gather_timeout` (10s) and printed one "Timeout exceeded
+  # when getting mount info" warning per mount before moving on.
+  #
+  # `mounts` is only an alias for this whole collector, so there is no
+  # way to drop the mounts and keep the rest -- which costs nothing here:
+  # `architecture` comes from the `platform` collector and the interface
+  # addresses `stortree_metrics_listeners` resolves come from `network`.
+  # Neither is affected.
+  #
+  # Set through `module_defaults` rather than ansible.cfg's
+  # `gather_subset`, which is deprecated and due to be removed from
+  # ansible-core -- and which would have applied to every play run
+  # against this repo, including the two read-only ones that gather no
+  # facts at all.
+  module_defaults:
+    ansible.builtin.setup:
+      gather_subset:
+        - "!hardware"
   roles:
     - stortree_facts
     - stortree_common

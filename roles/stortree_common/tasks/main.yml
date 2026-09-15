@@ -47,6 +47,29 @@
     mode: "0750"
   tags: [common]
 
+- name: Read this host's mount table
+  # Read straight out of the kernel rather than taken from
+  # `ansible_facts.mounts`, for the same two reasons stortree_mounts
+  # gives -- correctness and cost.
+  #
+  # Correctness: Ansible's mount-fact gathering drops any mount whose
+  # device string neither starts with "/" nor contains ":/", which
+  # silently loses rclone's own mounts depending on whether the remote
+  # path happens to begin with a slash.
+  #
+  # Cost: that gathering also calls statvfs() on every mount to get its
+  # size, which on an rclone mount is a round trip to the backend, and
+  # on a dead one never returns at all. It is bounded by `gather_timeout`
+  # (10s by default) and a fleet with a stuck mount paid all ten seconds
+  # of it on every host on every play, plus a screenful of "Timeout
+  # exceeded when getting mount info" warnings. This task was the only
+  # reader of those facts in the whole repo; with it reading mountinfo
+  # instead, ansible.cfg switches the hardware collector off entirely.
+  ansible.builtin.slurp:
+    src: /proc/self/mountinfo
+  register: stortree_common_mountinfo
+  tags: [common]
+
 - name: Ensure the fixed mount root exists
   # Skipped once `stortree_root` is itself already an active mountpoint.
   # Nothing stortree resolves ever mounts there any more (every path
@@ -67,11 +90,11 @@
   # through to a raw create and dies on the mount's own EEXIST. That
   # window closes for good on the apply that restarts the unit, but the
   # skip stays right either way: nothing to ensure once
-  # something's already mounted there, so check `ansible_facts.mounts`
-  # (gathered at this play's own start, i.e. reflecting whatever the
-  # previous apply already set up, not anything stortree_mounts changes
-  # later in this same run) and skip outright rather than touch a path
-  # this host can no longer even see.
+  # something's already mounted there, so check the mount table read
+  # above (this play's own view of it, i.e. whatever the previous apply
+  # already set up, not anything stortree_mounts changes later in this
+  # same run) and skip outright rather than touch a path this host can
+  # no longer even see.
   ansible.builtin.file:
     path: "{{ stortree_root }}"
     state: directory
@@ -84,7 +107,9 @@
     # a member of the local `stortree` group) can ever reach a grant no
     # matter how permissive that grant itself is (spec.md §6).
     mode: "0751"
-  when: stortree_root not in (ansible_facts.mounts | map(attribute='mount') | list)
+  when: >-
+    stortree_root not in (stortree_common_mountinfo.content | b64decode
+                          | stortree_mountinfo_targets)
   tags: [common]
 
 - name: Ensure the per-host rendered-state directory exists

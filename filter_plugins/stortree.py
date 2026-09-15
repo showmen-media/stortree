@@ -3777,6 +3777,7 @@ class FilterModule(object):
             "stortree_metrics_listeners": metrics_listeners,
             "stortree_stale_units": stale_unit_names,
             "stortree_path_masked": path_masked,
+            "stortree_mountinfo_targets": _mountinfo_targets,
             "stortree_mounted_transports": mounted_transport_slugs,
             "stortree_apt_installable": apt_installable,
             "stortree_ownership_mismatch": ownership_mismatch,

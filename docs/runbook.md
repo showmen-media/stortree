@@ -566,6 +566,68 @@ Nothing here affects who can read what. A host nobody can find is still
 mountable by anyone who types `\\host\share`, and `valid users` is still
 the thing that says no.
 
+## A shutdown or reboot that takes minutes
+
+Symptom: `systemctl reboot` sits for several minutes; the journal from
+the previous boot is full of `Stopping timed out. Terminating.`,
+`Killing process N (bindfs) with signal SIGKILL`, and finally
+`Processes still around after final SIGKILL. Entering failed mode.`
+
+`bindfs` reads through the rclone mount below it. At shutdown that lower
+layer is torn down in the same pass, so bindfs can end up blocked in the
+kernel on a FUSE mount whose daemon is already gone. A task in
+uninterruptible sleep cannot be killed by anything, SIGKILL included --
+which is what that last message means. systemd then applies
+`TimeoutStopSec` once per rung of stop -> stop-sigterm -> final-sigterm
+-> give up, so the 90s default is really six minutes per wedged unit,
+and they stop in sequence rather than together.
+
+Two settings close it, and both are already in the rendered units:
+`umount -l` in the bind units (a lazy unmount detaches at once and never
+blocks, which is what the rclone layers have always done with
+`fusermount -uz`), and `stortree_mounts_stop_timeout` (30s) capping the
+ladder for the bind and presentation layers. Re-apply to pick them up on
+a host still running older units.
+
+The transports keep systemd's own 90s deliberately -- an rclone mount in
+`--vfs-cache-mode full` flushes pending uploads when it stops, and
+cutting that short only moves the upload to the next start. Lower
+`stortree_mounts_stop_timeout` further if a host still drags; raising it
+is almost never the answer, since a lazy unmount that has not returned
+in 30s is not going to.
+
+A reboot is also worth checking *after* the fact, for a different
+reason: the transports come back, but a presentation whose transport
+failed its first start attempt does not (see below).
+
+## Shares are empty after a reboot
+
+Symptom: every `stortree-remote@` unit is `active running`, every
+`stortree-mount@` and `stortree-bind@` is `inactive dead` -- not
+`failed` -- and the paths they present list zero entries. Nothing
+reports an error.
+
+At boot a transport can fail its first attempt (the peer is not up yet,
+the network is not ready) and recover a few seconds later through
+`Restart=on-failure`. The presentations above it have `Requires=` on
+that transport, so systemd fails their start jobs the moment it fails --
+and it does not retry a dependent when the dependency later succeeds.
+The journal shows the pair plainly:
+
+```
+20:04:23  Dependency failed for stortree-mount@...fips-internet-docker
+20:04:23  stortree-remote@...fips-internet-docker: Failed with result 'exit-code'
+20:04:39  Started stortree-remote@...                     <- recovers, alone
+```
+
+Re-applying fixes it: `stortree_mounts`' "Enable and start every
+rendered unit" starts each presentation and bind, and by then the
+transports are up. There is no cleanup to do first.
+
+Worth knowing rather than worked around: a host that reboots
+unattended will sit like this until its next apply, so check after any
+reboot you did not follow with one.
+
 ## Taking a host out of Samba service
 
 Narrow `stortree_samba_hosts` (defaults to the whole fleet) and re-run

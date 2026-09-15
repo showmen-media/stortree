@@ -37,6 +37,10 @@ AVAHI_SERVICE = "stortree-smb.avahi.xml.j2"
 
 ALPHA, BRAVO, GADGET = EXAMPLE_HOSTS
 
+MOUNTS_DEFAULTS = yaml.safe_load(
+    (REPO_ROOT / "roles/stortree_mounts/defaults/main.yml").read_text()
+)
+
 
 def transport_for(plan, local_path):
     """The layer-1 entry for a path. A transport and the presentation
@@ -79,8 +83,16 @@ def mount_vars(containers, host):
     Off is the honest default here, not a convenience: a template that
     reads a metrics variable outside its own `stortree_metrics_enabled`
     guard has to fail these renders, and it only does if the guarded
-    variables are genuinely absent."""
-    return {"stortree_metrics_enabled": False}
+    variables are genuinely absent.
+
+    `stortree_mounts_stop_timeout` comes from the role's own defaults
+    rather than a number written here, so a change to that file reaches
+    these assertions instead of leaving them agreeing with a stale
+    copy."""
+    return {
+        "stortree_metrics_enabled": False,
+        "stortree_mounts_stop_timeout": MOUNTS_DEFAULTS["stortree_mounts_stop_timeout"],
+    }
 
 
 # One interface, as ansible_facts would report it, for the listener
@@ -658,6 +670,55 @@ def test_bind_unit_stop_tolerates_an_already_unmounted_path(
     entry = entry_for(mount_plans[BRAVO], "tree/home/mw/mw-fam")
     unit = render(BIND_UNIT, entry=entry, **mount_vars(containers, BRAVO))
     assert "ExecStop=-/bin/sh -c 'mountpoint -q" in unit
+
+
+def test_bind_unit_unmounts_lazily_so_a_dead_source_cannot_wedge_shutdown(
+    render, mount_plans, containers
+):
+    # A bind's source is a FUSE mount, and at shutdown the layer below it
+    # is torn down in the same pass. A blocking `umount` then waits in
+    # uninterruptible sleep for a daemon that is already gone, and a task
+    # in D state survives SIGKILL -- which is how one production reboot
+    # spent seven and a half minutes in systemd's kill ladder. The other
+    # two layers have always used `fusermount -uz`; this is the same
+    # thing for a kernel bind mount.
+    entry = entry_for(mount_plans[BRAVO], "tree/home/mw/mw-fam")
+    unit = render(BIND_UNIT, entry=entry, **mount_vars(containers, BRAVO))
+    (stop,) = directives(unit, "ExecStop")
+    assert "/bin/umount -l " in stop
+
+
+def test_mount_and_bind_units_cap_how_long_a_stuck_unmount_holds_a_shutdown(
+    render, mount_plans, containers
+):
+    # systemd applies TimeoutStopSec at each rung of stop ->
+    # stop-sigterm -> final-sigterm -> give up, so the default 90s is
+    # really 6 minutes per wedged unit, serialized across them. These two
+    # layers only ever lazy-unmount, which either works at once or never.
+    want = f"TimeoutStopSec={MOUNTS_DEFAULTS['stortree_mounts_stop_timeout']}"
+    for template, path in (
+        (MOUNT_UNIT, "tree/home/.mounts/mw-fam"),
+        (BIND_UNIT, "tree/home/mw/mw-fam"),
+    ):
+        entry = entry_for(mount_plans[BRAVO], path)
+        unit = render(template, entry=entry, **mount_vars(containers, BRAVO))
+        assert want in unit, template
+
+
+def test_transport_units_keep_systemds_own_stop_timeout(
+    render, mount_plans, containers
+):
+    # Deliberately *not* capped. An rclone mount in --vfs-cache-mode full
+    # flushes pending uploads when it stops, and on a slow link that is
+    # real work -- cutting it short does not shorten the shutdown, it
+    # just moves the upload to the next start. The transports were also
+    # never what wedged: the journal named bindfs and umount, not rclone.
+    unit = render(
+        REMOTE_UNIT,
+        entry=transport_for(mount_plans[ALPHA], "tree"),
+        **mount_vars(containers, ALPHA),
+    )
+    assert "TimeoutStopSec" not in unit
 
 
 def test_bind_unit_names_no_source_unit_when_the_source_is_a_plain_directory(
