@@ -69,8 +69,10 @@ dependents from its own entry.
 
 Worth knowing before it surprises someone: a unit listed here cannot be
 stopped by hand while this one is running -- it comes back within
-seconds. Stop this unit instead, or mask that one. See docs/runbook.md
-"Stopping a mount by hand".
+seconds. Stop *this* unit instead and PartOf= carries the stop upwards.
+`systemctl mask` is not the way out: these are real per-instance files
+in /etc/systemd/system, which is exactly where masking wants to put its
+symlink, so it refuses. See docs/runbook.md "Stopping a mount by hand".
 #}
 {% for unit in entry.upholds %}
 Upholds={{ unit }}

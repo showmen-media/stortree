@@ -788,6 +788,77 @@ systemctl list-jobs --no-pager | grep running
 journalctl -u 'stortree-mount@*' | grep -E 'start operation timed out|Killing process'
 ```
 
+## Two hosts that peer-mount each other can deadlock
+
+The worst failure this fleet has, and the one that turns a short apply
+into an unbounded one. Worth understanding before touching mounts on
+more than one host at a time.
+
+Peer mounts can point both ways at once, and on this fleet they do:
+
+* **bravo** peer-mounts the whole tree root from **alpha**, so every one
+  of bravo's own mountpoints lives *inside* a mount sourced from alpha.
+* **alpha** peer-mounts three subtrees back from **bravo**
+  (`home/.mounts/_mp-fam`, `home/.mounts/_psychias-media`,
+  `system-data/configs/psychias-alpha`).
+
+Take both down and neither can come up. Alpha's mount of a
+bravo-owned subtree blocks, waiting for bravo. That blocked mount makes
+`readdir` of the directory *containing* it hang, so alpha's sftp server
+stalls serving that directory, so bravo cannot read the mountpoint it
+needs, so bravo cannot start the mount alpha is waiting for.
+
+It shows up as I/O that hangs rather than fails, which is why it is
+hard to recognise:
+
+```
+# On the owning host -- the individual entries are fine ...
+stat .../home/fp/_fp-archive          15ms
+# ... but the directory holding them is not.
+ls -l .../home/fp/                    45s, and climbing
+```
+
+Each retry on either side leaves another stale FUSE mount behind, and
+every retry hammers the peer over sftp, so the two hosts hold each other
+down indefinitely. Measured during exactly this: alpha's listing went
+from 45s back to **39ms** the moment bravo stopped retrying.
+
+**Recovery, in order.** The rule is that the *owner* of a subtree comes
+up before anyone peering it.
+
+```sh
+# 1. On each host that peers a subtree it does not own, stop that
+#    transport, so its mountpoint reverts to a plain directory.
+systemctl stop 'stortree-remote@<peer-slug>.service'
+
+# 2. Sweep both hosts for what the retries left behind. A stale mount
+#    fails stat(2) with ENOTCONN; deepest first, so a parent never
+#    detaches a child out from under the loop.
+awk '$5 ~ /^\/srv\// {print $5}' /proc/self/mountinfo |
+  awk '{print length, $0}' | sort -rn | cut -d' ' -f2- |
+  while read -r m; do
+    timeout 5 stat "$m" >/dev/null 2>&1 || umount -l "$m"
+  done
+systemctl reset-failed 'stortree-remote@*.service' \
+                       'stortree-mount@*.service' 'stortree-bind@*.service'
+
+# 3. Apply the owning host, and check it actually serves the subtree.
+#    Read it as the service account, not as root -- that is who sftp is.
+sudo -u stortree ls /srv/stortree/<subtree>
+
+# 4. Only then start the peering host's transports back up.
+systemctl start 'stortree-remote@<peer-slug>.service'
+```
+
+A note on step 3, because it costs an hour to learn: read as
+`stortree`, not as root. The sftp server serves peers as that account,
+and a path can be instant for root and hang for `stortree`.
+
+Watch for rclone's directory cache in between -- `--dir-cache-time` is
+5m, so a host can keep reporting "No such file or directory" for a
+directory its peer has already created. Restarting that transport
+refreshes it.
+
 ## Restarting mounts on a fleet that peer-mounts itself
 
 Any edit to a unit template re-renders every unit on every host, and the
@@ -844,19 +915,26 @@ parent is active systemd restarts this one within seconds. That is the
 point -- it is what makes the tree converge after a transport blips --
 but it does surprise people.
 
-To actually take a path down, pick the one that matches your intent:
+To actually take a path down, stop the mount *below* it. `PartOf=`
+carries the stop upwards through every layer, and a parent that is not
+running upholds nothing:
 
 ```sh
-# The whole subtree, transport included -- PartOf= carries the stop up.
-systemctl stop stortree-remote@<transport-slug>.service
-
-# Just this one mount, indefinitely. Remember to unmask it afterwards.
-systemctl mask --now stortree-mount@<slug>.service
+# The whole subtree, transport included.
+systemctl stop 'stortree-remote@<transport-slug>.service'
 ```
 
-Do not `systemctl disable` it and expect that to help: `UpheldBy=` is a
-runtime dependency of the parent, not an `[Install]` edge, so a disabled
-unit is upheld exactly as before.
+Two things that look like they should work and do not:
+
+* `systemctl mask` **fails on these units**: stortree renders one real
+  file per instance into `/etc/systemd/system`, and masking works by
+  putting a symlink to `/dev/null` in exactly that place --
+  `Failed to mask unit: File '/etc/systemd/system/stortree-mount@....service'
+  already exists`. Masking into `/run/systemd/system` does not help
+  either; `/etc` has the higher precedence of the two.
+* `systemctl disable` changes nothing. `Upholds=` is a runtime
+  dependency of the parent, not an `[Install]` edge, so a disabled unit
+  is upheld exactly as before.
 
 ## Taking a host out of Samba service
 
