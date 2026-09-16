@@ -40,6 +40,42 @@ PartOf=stortree-mount@{{ entry.requires_slug }}.service
 RequiresMountsFor={{ stortree_root }}/{{ entry.requires_slug_path }}
 {% endif %}
 
+{#
+Upholds= is the other half of every PartOf= above, and the only one that
+repairs anything. PartOf= propagates a stop downwards and stops there:
+a parent that goes away takes its dependents with it, correctly, and
+nothing ever brings them back. Not Requires=, which propagates ordering
+and stop. Not Restart=on-failure, because a stop propagated from a
+parent is a clean stop -- and the binds are Type=oneshot, which cannot
+carry Restart= at all. Not even systemd's own restart propagation, which
+applies to a *requested* restart and not to an automatic one.
+
+That gap is what left this fleet serving empty directories after a boot:
+transports failed on an unready metrics address, recovered five seconds
+later on their own, and every presentation and bind above them stayed
+`inactive dead` until someone re-applied.
+
+Declared here, on the parent, because this is the only end systemd
+accepts it from: `UpheldBy=` is an [Install] directive that
+`systemctl enable` turns into a symlink, so writing it in [Unit] on the
+dependent is silently ignored -- `systemctl show` reports an empty
+UpheldBy= and the dependent stays dead. `Upholds=` in [Unit] needs no
+symlink and takes effect on daemon-reload. Verified both ways on this
+fleet.
+
+`upholds` is computed once over the whole plan (_uphold_plan_entries()
+in filter_plugins/stortree.py), because a unit cannot know its own
+dependents from its own entry.
+
+Worth knowing before it surprises someone: a unit listed here cannot be
+stopped by hand while this one is running -- it comes back within
+seconds. Stop this unit instead, or mask that one. See docs/runbook.md
+"Stopping a mount by hand".
+#}
+{% for unit in entry.upholds %}
+Upholds={{ unit }}
+{% endfor %}
+
 [Service]
 {#
 Type=forking, not the Type=notify the transport units use: bindfs is a

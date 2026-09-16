@@ -563,3 +563,48 @@ def test_the_apply_play_keeps_every_fact_family_its_roles_read():
     # carries `architecture` (used to pick the rclone release).
     for forbidden in ("!network", "!min", "!all"):
         assert forbidden not in subset, forbidden
+
+
+def test_the_disruptive_unit_restart_runs_one_host_at_a_time():
+    # On a fleet whose hosts peer-mount each other, restarting transports
+    # everywhere at once is not merely disruptive, it is destructive: a
+    # host serves its peers over sftp out of its own visible tree, so a
+    # transport restarting here is a source vanishing there, and a peer
+    # starting its own transport in that window fails outright with
+    # `stat failed: sftp: "Failure"` rather than retrying.
+    #
+    # Observed from a single template edit that re-rendered every unit
+    # on both hosts: restart storms on each side, StartLimitBurst
+    # exhausted, and two transports left as stale FUSE mounts that had
+    # to be lazily unmounted by hand before any apply could recover
+    # them.
+    #
+    # `throttle: 1` is what keeps that from being reachable, and its
+    # absence is silent until the day it isn't -- every test of the
+    # rendered units still passes without it.
+    tasks = load_yaml("roles/stortree_mounts/tasks/main.yml")
+    restart = next(
+        t for t in tasks if t["name"] == "Restart any unit whose file actually changed"
+    )
+    assert restart.get("throttle") == 1
+
+
+def test_the_sssd_socket_reset_survives_a_second_apply():
+    # `systemctl reset-failed <unit>` exits 1 with "Unit ... not loaded"
+    # once the unit has been dropped from memory -- which is exactly
+    # what happens after this role disables, stops and un-fails it. So
+    # the task works on the first apply and breaks the run on every one
+    # after it, a failure mode strictly worse than the degraded state it
+    # exists to clear.
+    #
+    # A failed unit is always loaded, so "not loaded" means "nothing
+    # left to reset": it is the success case, and tolerating it is what
+    # makes this idempotent. Everything else still fails the apply.
+    tasks = load_yaml("roles/stortree_identity/tasks/main.yml")
+    reset = next(
+        t
+        for t in tasks
+        if t["name"] == "Clear the failed state a retired responder socket leaves behind"
+    )
+    assert "not loaded" in reset["failed_when"]
+    assert "rc != 0" in reset["failed_when"]

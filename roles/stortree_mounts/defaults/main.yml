@@ -164,3 +164,36 @@ stortree_rclone_goarch: "{{ stortree_rclone_arch_map[ansible_facts['architecture
 stortree_rclone_stem: "rclone-v{{ stortree_rclone_version }}-linux-{{ stortree_rclone_goarch }}"
 stortree_rclone_archive: "{{ stortree_rclone_stem }}.zip"
 stortree_rclone_unpacked: "{{ stortree_rclone_download_dir }}/{{ stortree_rclone_stem }}/rclone"
+
+
+# -- how long a transport waits for its metrics address to appear ---------
+
+# Seconds `stortree-remote@.service` will wait, before it starts rclone,
+# for each metrics listener address that `needs_wait`
+# (metrics_listeners() in filter_plugins/stortree.py decides which:
+# everything except loopback and the wildcard).
+#
+# It exists because rclone binds its metrics server at startup and
+# *exits* when the address is not there yet, and the transport is
+# Type=notify -- so an address that arrives a second after the unit does
+# is not a missing counter, it is a failed mount that takes every
+# presentation and bind above it down with it. That is not hypothetical:
+# it is what both hosts on this fleet do on every single boot, tailscale0
+# being a late-appearing interface and the tailnet address being what
+# stortree_metrics_bind names.
+#
+# 60s is sized for the interface, not for the check -- the poll costs one
+# `ip addr` per second and stops at the first hit, so a normal boot pays
+# whatever tailscaled actually takes (a second or two here) and nothing
+# more. The ceiling only matters when the interface never arrives, and
+# there the point is to fail with a clear message in the journal rather
+# than hang: TimeoutStartSec is rendered as this plus 90s so the wait
+# always loses the race to systemd's own timeout and the reason is the
+# one that gets logged.
+#
+# Raising this is the right move for an interface that genuinely takes
+# minutes (a WireGuard link waiting on DHCP and a DNS lookup, say).
+# Setting it to 0 disables the wait entirely and restores the old
+# behaviour, which is only correct if every address in
+# stortree_metrics_bind is configured before multi-user.target.
+stortree_mounts_bind_wait: 60

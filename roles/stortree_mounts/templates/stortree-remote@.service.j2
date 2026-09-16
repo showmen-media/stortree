@@ -54,8 +54,17 @@ exist yet fails the start job outright, and systemd does not retry that
 -- Restart=on-failure covers a process that died, not a dependency that
 was missing -- which would leave the mount down until someone restarted
 it by hand. Wants= orders behind the device when it's there and costs
-nothing when it isn't, leaving the existing Restart=on-failure to pick
-up an interface that arrives late.
+nothing when it isn't.
+
+Necessary but nowhere near sufficient, and the second half is in
+[Service] below. A .device unit only ever becomes active because udev
+said so, and udev does not run in a container: on this fleet -- two
+unprivileged LXC guests -- sys-subsystem-net-devices-tailscale0.device
+is loaded and permanently inactive while tailscale0 is up and addressed,
+so both edges here resolve to a unit that never starts and order this
+mount after nothing at all. Kept regardless, because where udev *is*
+running they are the cheaper and more precise signal; the ExecStartPre
+poll below is what makes the guarantee hold everywhere else.
 #}
 {% if stortree_metrics_enabled %}
 {% for listener in stortree_metrics_listeners if listener.device %}
@@ -63,12 +72,106 @@ After={{ listener.device }}
 Wants={{ listener.device }}
 {% endfor %}
 {% endif %}
+{#
+Upholds= is the other half of every PartOf= above, and the only one that
+repairs anything. PartOf= propagates a stop downwards and stops there:
+a parent that goes away takes its dependents with it, correctly, and
+nothing ever brings them back. Not Requires=, which propagates ordering
+and stop. Not Restart=on-failure, because a stop propagated from a
+parent is a clean stop -- and the binds are Type=oneshot, which cannot
+carry Restart= at all. Not even systemd's own restart propagation, which
+applies to a *requested* restart and not to an automatic one.
+
+That gap is what left this fleet serving empty directories after a boot:
+transports failed on an unready metrics address, recovered five seconds
+later on their own, and every presentation and bind above them stayed
+`inactive dead` until someone re-applied.
+
+Declared here, on the parent, because this is the only end systemd
+accepts it from: `UpheldBy=` is an [Install] directive that
+`systemctl enable` turns into a symlink, so writing it in [Unit] on the
+dependent is silently ignored -- `systemctl show` reports an empty
+UpheldBy= and the dependent stays dead. `Upholds=` in [Unit] needs no
+symlink and takes effect on daemon-reload. Verified both ways on this
+fleet.
+
+`upholds` is computed once over the whole plan (_uphold_plan_entries()
+in filter_plugins/stortree.py), because a unit cannot know its own
+dependents from its own entry.
+
+Worth knowing before it surprises someone: a unit listed here cannot be
+stopped by hand while this one is running -- it comes back within
+seconds. Stop this unit instead, or mask that one. See docs/runbook.md
+"Stopping a mount by hand".
+#}
+{% for unit in entry.upholds %}
+Upholds={{ unit }}
+{% endfor %}
 
 [Service]
 Type=notify
 User={{ stortree_user }}
 Group={{ stortree_group }}
 {% set mount_path = stortree_remotes_root ~ '/' ~ entry.local_path %}
+{#
+Wait for every metrics address that can be late before starting rclone,
+because rclone binding one that isn't there yet is a failed *mount*
+(see the .device comment above for why systemd's own ordering cannot be
+relied on to do this). Measured on this fleet before the wait existed:
+every transport on both hosts failed at boot with "bind: cannot assign
+requested address", each one taking its presentation and its per-user
+binds down through Requires=, and the fleet came up serving nothing.
+
+Restart=on-failure did eventually bring the transports themselves back
+five seconds later -- which is exactly why this is worth fixing at the
+start rather than leaning on the retry. A restart that succeeds still
+leaves every dependent dead (systemd does not propagate an *automatic*
+restart the way it propagates a requested one; UpheldBy= in the other
+two templates is the repair for that), and the retry budget is finite:
+StartLimitBurst gives up after 5 starts in 10s, so an interface slower
+than ~25s is a mount that stays down until someone restarts it by hand.
+
+`needs_wait` rather than `device`: the question is whether the *address*
+can race, not where it came from. A literal address in
+stortree_metrics_bind can be just as late and never had a .device to
+wait on; loopback and the wildcard cannot race at all, and the wildcard
+must be skipped rather than merely optimized out -- it never appears in
+`ip addr` output, so waiting for it would fail a bind that works.
+
+Three details that are load-bearing rather than stylistic.
+
+`$$`, not `$`. systemd expands `$n` and `${n}` in an Exec line itself,
+before /bin/sh ever sees them, and an unset one becomes the empty
+string -- so a shell counter written the obvious way renders as
+`while [ -lt 60 ]`, which is a syntax error, which is a failed
+ExecStartPre, which is the failed mount this whole block exists to
+prevent. `$$` is how systemd spells a literal dollar. (The ExecStop
+lines in this file and the other two templates use no variables at all,
+which is why the hazard has not come up before.)
+
+`ip` unqualified, where the rest of this file spells out /bin/umount and
+/bin/fusermount: it is /bin/ip on Debian and /usr/sbin/ip elsewhere, and
+systemd's default PATH for services covers both.
+
+And the test is on output, not exit status, because `ip addr show to
+<absent address>` exits 0 having printed nothing.
+#}
+{% set awaited = stortree_metrics_listeners | selectattr('needs_wait') | list
+                 if (stortree_metrics_enabled and stortree_mounts_bind_wait | int > 0)
+                 else [] %}
+{% for listener in awaited %}
+ExecStartPre=/bin/sh -c 'n=0; while [ $$n -lt {{ stortree_mounts_bind_wait | int }} ]; do ip -o addr show to {{ listener.address }} | grep -q . && exit 0; n=$$(($$n+1)); sleep 1; done; echo "stortree: {{ listener.address }} did not appear within {{ stortree_mounts_bind_wait | int }}s -- stortree_metrics_bind names it, but nothing on this host has configured it" >&2; exit 1'
+{% endfor %}
+{% if awaited %}
+{#
+Rendered from the wait rather than left at systemd's 90s default so the
+two can't drift into a start timeout that fires *during* the wait and
+reports "start operation timed out" instead of which address was
+missing. The 90s on top is the budget for the rclone mount itself, which
+is what the default was always for.
+#}
+TimeoutStartSec={{ stortree_mounts_bind_wait | int + 90 }}
+{% endif %}
 {#
 The binary, not a bare `rclone`: an upstream-installed host carries both
 it and the distro's, and systemd's own PATH is not the operator's. See

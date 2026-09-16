@@ -4496,7 +4496,38 @@ def test_metrics_listeners_pass_a_literal_address_through():
         "listen": "127.0.0.1",
         "device": None,
         "loopback": True,
+        "needs_wait": False,
     }
+
+
+def test_metrics_listeners_make_a_literal_address_wait_like_any_other():
+    # `needs_wait` is deliberately not the same question as `device`.
+    # A literal address has no .device unit to order behind and can
+    # still be configured seconds after the transport unit is reached --
+    # exactly the case the .device edge never covered.
+    (listener,) = metrics_listeners(["10.10.0.9"], {})
+    assert listener["device"] is None
+    assert listener["needs_wait"] is True
+
+
+def test_metrics_listeners_never_wait_for_loopback_or_the_wildcard():
+    # Loopback is configured before userspace starts, so waiting for it
+    # is only noise. The wildcard is the one that would actually break:
+    # it never appears in `ip addr` output, so a wait for it runs to the
+    # timeout and fails a bind that would have worked.
+    for address in ("127.0.0.1", "::1", "0.0.0.0", "::"):
+        (listener,) = metrics_listeners([address], {})
+        assert listener["needs_wait"] is False, address
+
+
+def test_metrics_listeners_make_an_interface_derived_address_wait():
+    # The case that took this fleet down on every boot: tailscale0 up
+    # and addressed, its .device unit permanently inactive because no
+    # udev runs in a container, and rclone exiting on "cannot assign
+    # requested address" before the interface arrived.
+    facts = {"wg0": {"ipv4": {"address": "10.10.0.4"}}}
+    (listener,) = metrics_listeners(["wg0"], facts)
+    assert listener["needs_wait"] is True
 
 
 def test_metrics_listeners_bracket_ipv6_for_the_listen_string():

@@ -16,6 +16,23 @@
     cache_valid_time: 3600
   tags: [identity]
 
+- name: Settle this host's [sssd] section
+  # One resolved value for the two things that have to agree about it:
+  # the template renders it, and the socket retirement below reads the
+  # responders out of it. Writing the same `combine` in both places is
+  # how they would come to disagree, and a disagreement here is silent
+  # -- the render would be right and the wrong sockets retired.
+  #
+  # Not `no_log`, unlike the tasks either side of it: this section is
+  # `services` and `domains`, and the credentials live in the domain
+  # section. Keeping it visible is what makes the loop below readable
+  # in a run log.
+  ansible.builtin.set_fact:
+    stortree_identity_sssd: >-
+      {{ stortree_identity_sssd_defaults
+         | combine(stortree_identity_ldap.extra.sssd | default({})) }}
+  tags: [identity]
+
 - name: Render sssd.conf
   ansible.builtin.template:
     src: sssd.conf.j2
@@ -25,6 +42,103 @@
     mode: "0600"
   notify: stortree sssd.conf changed
   no_log: true
+  tags: [identity]
+
+- name: Ask systemd which sssd responder sockets this platform ships
+  # Which responders have socket units is a platform question, not a
+  # config one -- `sudo`, `autofs`, `pac` and `ifp` exist on some
+  # builds and not others -- and naming a unit that isn't there fails
+  # the task outright. Asking first keeps the loop below to units that
+  # actually exist.
+  # `command`, not the systemd module: it starts, stops and enables a
+  # unit, and has no way to ask which units exist.
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    cmd: systemctl list-unit-files --no-legend --plain sssd-*.socket
+  register: stortree_identity_sssd_sockets
+  changed_when: false
+  check_mode: false
+  tags: [identity]
+
+- name: Settle which responder sockets conflict with sssd.conf
+  # The intersection of two lists: the responders `services` names, and
+  # the sockets this platform actually ships. Both halves matter --
+  # naming a unit that doesn't exist fails the task outright, and
+  # `sudo`, `autofs`, `pac` and `ifp` come and go between builds.
+  #
+  # Empty, and so a no-op for every task below, on a host that sets
+  # `extra.sssd.services: ""` and leaves the platform's socket
+  # activation to do the work -- see stortree_identity_sssd_defaults.
+  ansible.builtin.set_fact:
+    stortree_identity_sssd_retire: >-
+      {{ stortree_identity_sssd.services | default("") | split(",")
+         | map("trim") | reject("equalto", "")
+         | select("in", stortree_identity_sssd_shipped)
+         | map("regex_replace", "^(.*)$", "sssd-\1.socket") | list }}
+  vars:
+    stortree_identity_sssd_shipped: >-
+      {{ stortree_identity_sssd_sockets.stdout
+         | regex_findall("sssd-([a-z_]+)\.socket") }}
+  tags: [identity]
+
+- name: Retire the responder sockets sssd.conf starts directly
+  # A responder named in `services` is forked by sssd.service itself,
+  # and its socket unit then refuses to start: the ExecStartPre check
+  # exits 17 ("configured to be socket-activated but it's still
+  # mentioned in the services' line"). Nothing breaks that an operator
+  # would notice -- identity works, because the responder is running --
+  # so the host simply sits at `degraded` forever with three failed
+  # units, and the next real failure arrives somewhere nobody is
+  # looking. Both hosts on this fleet were in exactly that state.
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+  loop: "{{ stortree_identity_sssd_retire }}"
+  tags: [identity]
+
+- name: Clear the failed state a retired responder socket leaves behind
+  # Disabling and stopping is not enough, and the difference is the
+  # whole point of the exercise: `systemctl stop` on a unit that is
+  # already `failed` leaves it `failed`, because the failure is separate
+  # bookkeeping from the active state. Measured here -- after the task
+  # above reported `changed` on all three sockets, `UnitFileState` was
+  # `disabled` and `ActiveState` was still `failed`, and both hosts were
+  # still `degraded`. Only reset-failed clears it.
+  #
+  # Same idiom, and the same reasoning, as stortree_mounts' "Clear
+  # failed-state bookkeeping for any stortree unit no longer backed by a
+  # file". Unconditional and idempotent: resetting a unit that is not in
+  # a failed state is a documented no-op, so this costs nothing on a
+  # clean run and self-heals a host that has been sitting degraded since
+  # before this task existed.
+  #
+  # Named units rather than an `sssd-*.socket` glob, so a socket that is
+  # failing for some reason of its own -- one this role deliberately did
+  # *not* retire -- keeps its failure visible instead of being quietly
+  # tidied away. That costs the glob's tolerance of matching nothing,
+  # which is what `failed_when` below buys back.
+  #
+  # "Unit ... not loaded" is the *success* case, not an error, and this
+  # is the only reason it needs saying out loud: once a socket has been
+  # disabled, stopped and un-failed, systemd drops it from memory
+  # entirely, and `reset-failed` on a unit that is not loaded exits 1.
+  # A failed unit is always loaded, so "not loaded" means precisely
+  # "nothing left to reset". Without this the task worked exactly once
+  # per host and failed every apply after it -- which is worse than the
+  # degraded state it exists to fix, because it stops the run.
+  #
+  # Anything else -- a permission error, a unit name that cannot be
+  # parsed -- still fails the apply. systemctl processes every argument
+  # it is given regardless of the others, so a genuinely failed socket
+  # named alongside an unloaded one is still reset.
+  ansible.builtin.command:  # noqa: command-instead-of-module
+    cmd: systemctl reset-failed {{ stortree_identity_sssd_retire | join(" ") }}
+  register: stortree_identity_sssd_reset
+  when: stortree_identity_sssd_retire | length > 0
+  changed_when: false
+  failed_when: >-
+    stortree_identity_sssd_reset.rc != 0
+    and not stortree_identity_sssd_reset.stderr is search("not loaded")
   tags: [identity]
 
 - name: Ensure sssd is enabled and running

@@ -3015,6 +3015,78 @@ def _relate_plan_entries(entries, transports):
             if path in transport_by_path
         ]
 
+    _uphold_plan_entries(entries, transports)
+
+
+def _uphold_plan_entries(entries, transports):
+    """Give every entry the list of units it has to keep alive --
+    `upholds`, rendered as systemd `Upholds=` in the [Unit] section.
+
+    It is the exact mirror of the `PartOf=` edges the three templates
+    already declare, and it exists because `PartOf=` covers only half of
+    what the tree needs. `PartOf=` propagates a stop *downwards*: a
+    parent that goes away takes its dependents with it, correctly, and
+    then nothing ever brings them back. Neither does anything else --
+    `Requires=` propagates start ordering and stop, systemd propagates a
+    *requested* restart to `PartOf=` dependents but an automatic
+    `Restart=` is not one, and a stop propagated from a parent is a
+    clean stop, so even `Restart=on-failure` (which the binds cannot
+    have at all, being Type=oneshot) never fires.
+
+    Measured on this fleet, twice. At boot: transports failed on an
+    unready metrics address, recovered five seconds later through
+    `Restart=on-failure`, and left every presentation and bind
+    `inactive dead` -- both hosts serving empty directories until
+    someone re-applied. And during an apply that re-rendered every unit:
+    a restarted container transport stopped the transports nested inside
+    it, which is why nested transports are upheld here too rather than
+    being treated as self-healing.
+
+    Computed from the parent's side because that is the only side
+    systemd accepts it from. `UpheldBy=` is an [Install] directive --
+    `systemctl enable` writes it out as a symlink -- so putting it in
+    [Unit] on the dependent is silently ignored, which is exactly what
+    the first attempt at this did: `systemctl show` reported an empty
+    `UpheldBy=`, and a stopped presentation sat dead for the full 24s it
+    was watched. `Upholds=` in [Unit] on the parent needs no symlink and
+    takes effect on daemon-reload; the same presentation came back in
+    under two seconds."""
+    upheld = {}
+
+    def uphold(family, slug, unit):
+        # A null slug is a parent that does not exist -- a bind whose
+        # source is a plain local directory, a transport with nothing
+        # above it. Naming a unit for one is the "Unit not found" that
+        # systemd refuses to start at all, only retried forever.
+        if slug:
+            upheld.setdefault((family, slug), set()).add(unit)
+
+    for e in entries:
+        if e["kind"] == "mount":
+            unit = f"stortree-mount@{e['slug']}.service"
+            uphold("transport", e["transport_slug"], unit)
+            uphold("mount", e["requires_slug"], unit)
+        elif e["kind"] == "bind":
+            unit = f"stortree-bind@{e['slug']}.service"
+            uphold("mount", e["symlink_target_slug"], unit)
+            uphold("mount", e["requires_slug"], unit)
+
+    for t in transports:
+        # A transport nested inside another is PartOf= it, so it needs
+        # upholding for the same reason everything else does.
+        uphold(
+            "transport",
+            t["requires_transport"],
+            f"stortree-remote@{t['slug']}.service",
+        )
+
+    for t in transports:
+        t["upholds"] = sorted(upheld.get(("transport", t["slug"]), ()))
+    for e in entries:
+        # Binds are leaves -- nothing nests inside one -- so the ("bind",
+        # ...) key is never populated and this resolves to [] for them.
+        e["upholds"] = sorted(upheld.get((e["kind"], e["slug"]), ()))
+
 
 def _check_slug_collisions(entries):
     """Fail the run when two entries in the same unit family want one
@@ -3714,7 +3786,7 @@ def metrics_listeners(bind, facts):
     """Turn `stortree_metrics_bind` -- addresses, interface names, or
     both -- into what the transport unit and the targets file need:
 
-        [{"address", "listen", "device", "loopback"}, ...]
+        [{"address", "listen", "device", "loopback", "needs_wait"}, ...]
 
     rclone binds addresses, never interfaces, so an interface name has
     to be resolved against this host's own facts at render time; that is
@@ -3731,7 +3803,30 @@ def metrics_listeners(bind, facts):
     systemd can wait on. `loopback` is what the role's safety assert
     reads: an rc-flavour endpoint serves config/dump, so binding one off
     loopback without authentication publishes this host's scoped
-    rclone.conf, credentials and all."""
+    rclone.conf, credentials and all.
+
+    `needs_wait` marks an address the transport unit has to *wait* for
+    before it starts rclone, because it may not be there yet when the
+    unit is first reached at boot. It is deliberately not the same
+    question as `device`. The .device unit was the original answer to
+    that race and it is the wrong one twice over: an address typed
+    literally into stortree_metrics_bind gets no .device to wait on even
+    though it can be just as late to appear, and -- the reason this
+    exists at all -- .device units come from udev, which does not run in
+    a container, so on an LXC fleet
+    sys-subsystem-net-devices-tailscale0.device is loaded but
+    permanently inactive and every After=/Wants= naming it is a silent
+    no-op. Measured on this fleet: tailscale0 up and addressed, its
+    .device unit ActiveState=inactive, and every transport failing at
+    boot with "bind: cannot assign requested address".
+
+    So the predicate is about the address, not about where it came from:
+    everything waits except the two kinds that cannot race. Loopback is
+    configured before userspace starts. The unspecified address
+    (0.0.0.0, ::) is a wildcard that binds whatever exists -- and,
+    unlike loopback, actively must not be waited for, since it never
+    appears in `ip addr` output and a wait would turn a working wildcard
+    bind into a mount that fails after the timeout."""
     listeners = []
     for item in bind or []:
         try:
@@ -3752,6 +3847,7 @@ def metrics_listeners(bind, facts):
                 "listen": f"[{address}]" if ip.version == 6 else address,
                 "device": device,
                 "loopback": ip.is_loopback,
+                "needs_wait": not (ip.is_loopback or ip.is_unspecified),
             }
         )
     return listeners

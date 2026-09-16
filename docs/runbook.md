@@ -155,14 +155,40 @@ stortree_metrics_port_overrides:
 
 ### An endpoint that never comes up on an interface
 
-An interface that appears later than the mount (WireGuard, a bridge
-something other than networkd brings up) means rclone had nothing to
-bind when it started. The unit orders itself after that interface's
-`.device` unit where systemd knows about it, and `Restart=on-failure`
-covers a late arrival -- but only within systemd's default start-limit
-burst, so an interface that takes minutes needs
-`systemctl restart stortree-remote@<slug>` afterwards. Binding loopback
-and scraping through a tunnel avoids the whole class.
+An interface that appears later than the mount (WireGuard, Tailscale, a
+bridge something other than networkd brings up) means rclone has nothing
+to bind when it starts -- and rclone *exits* when it cannot bind its
+metrics server, so this is a failed mount, not a missing counter.
+
+Each transport waits for its own listen addresses before it starts
+rclone, polling `ip addr` once a second for up to
+`stortree_mounts_bind_wait` (60s by default). A normal boot pays
+whatever the interface actually takes and nothing more. Raise it for an
+interface that genuinely needs minutes:
+
+```yaml
+# inventory/group_vars/all.yml
+stortree_mounts_bind_wait: 300
+```
+
+The unit also orders itself after the interface's `.device` unit, but
+do not rely on that alone: `.device` units are published by udev, and
+**udev does not run in a container**, so in an LXC or Docker guest that
+unit is loaded and permanently `inactive` however healthy the interface
+is. The wait is what holds the guarantee there. Check with:
+
+```sh
+systemctl show sys-subsystem-net-devices-<iface>.device -p ActiveState
+```
+
+If an address never arrives, the journal names it:
+
+```
+stortree: 10.10.0.4 did not appear within 60s -- stortree_metrics_bind
+names it, but nothing on this host has configured it
+```
+
+Binding loopback and scraping through a tunnel avoids the whole class.
 
 ## Upgrading rclone
 
@@ -210,6 +236,13 @@ an I/O interruption for anyone reading the tree at the time, so roll it
 with `--limit` one host at a time rather than fleet-wide, and check
 `playbooks/status.yml` in between.
 
+The restart step itself carries `throttle: 1`, so it is already one host
+at a time even when you forget -- see [Restarting mounts on a fleet that
+peer-mounts itself](#restarting-mounts-on-a-fleet-that-peer-mounts-itself)
+for why that matters more than it sounds. `--limit` is still the right
+way to *stage* an upgrade: it lets you look at one host before the rest
+gets the new binary at all.
+
 What upgrading gets you, concretely: `--metrics-addr` (1.68) instead of
 the `rc` metrics flavour that also serves `config/dump`, so
 `stortree_metrics_htpasswd` stops being mandatory; a repeatable
@@ -228,6 +261,47 @@ The cost is that nothing else upgrades this binary -- no
 unattended-upgrades, no distro security tracker. Watch
 <https://github.com/rclone/rclone/releases> and treat a version bump as
 a change to be rolled, because it is one.
+
+## A host stuck at `degraded` with failed `sssd-*.socket` units
+
+Symptom: `systemctl is-system-running` says `degraded`, three units are
+failed, and identity works perfectly.
+
+```
+sssd-nss.socket   loaded failed failed SSSD NSS Service responder socket
+sssd-pam.socket   loaded failed failed SSSD PAM Service responder socket
+sssd-ssh.socket   loaded failed failed SSSD SSH Service responder socket
+```
+
+There are two ways to start an SSSD responder and they are mutually
+exclusive. Naming it in `services` in the `[sssd]` section makes
+`sssd.service` fork it directly; leaving it out hands the job to socket
+activation, which is how Debian ships SSSD. Configure both and each
+socket unit refuses to start -- its `ExecStartPre` check exits 17 with
+"configured to be socket-activated but it's still mentioned in the
+services' line".
+
+Nothing an operator would notice actually breaks, which is the problem:
+the responder *is* running, `getent` works, and the host simply sits at
+`degraded` forever. The next real failure then arrives somewhere nobody
+is looking.
+
+The apply resolves this: it disables and stops the socket for every
+responder `services` names, then clears the failed-state bookkeeping
+that stopping leaves behind. If you are seeing it, run one.
+
+To go the other way instead -- socket activation, no `services` line,
+nothing for stortree to retire -- set it empty in `stortree/ldap.yml`:
+
+```yaml
+extra:
+  sssd:
+    services: ""
+```
+
+Only do that on a platform whose responder sockets are enabled. Where
+they are not, an empty `services` starts no responders at all and takes
+identity down for the whole host.
 
 ## Onboarding a new LDAP user for Samba
 
@@ -607,26 +681,182 @@ Symptom: every `stortree-remote@` unit is `active running`, every
 `failed` -- and the paths they present list zero entries. Nothing
 reports an error.
 
-At boot a transport can fail its first attempt (the peer is not up yet,
-the network is not ready) and recover a few seconds later through
-`Restart=on-failure`. The presentations above it have `Requires=` on
-that transport, so systemd fails their start jobs the moment it fails --
-and it does not retry a dependent when the dependency later succeeds.
-The journal shows the pair plainly:
+This is fixed, in two places. Read on if you see it anyway.
+
+**What went wrong.** A transport fails its first start, recovers a few
+seconds later through `Restart=on-failure`, and takes its whole subtree
+with it on the way down. The journal shows the pair plainly:
 
 ```
-20:04:23  Dependency failed for stortree-mount@...fips-internet-docker
-20:04:23  stortree-remote@...fips-internet-docker: Failed with result 'exit-code'
-20:04:39  Started stortree-remote@...                     <- recovers, alone
+20:25:59  rclone: Failed to start metrics server: listen tcp
+          100.127.27.30:27031: bind: cannot assign requested address
+20:25:59  Dependency failed for stortree-mount@...psychias-media
+20:26:11  Started stortree-remote@...                     <- recovers, alone
 ```
 
-Re-applying fixes it: `stortree_mounts`' "Enable and start every
-rendered unit" starts each presentation and bind, and by then the
-transports are up. There is no cleanup to do first.
+Two independent defects, both now addressed:
 
-Worth knowing rather than worked around: a host that reboots
-unattended will sit like this until its next apply, so check after any
-reboot you did not follow with one.
+1. *Why the transport failed at all.* rclone binds its metrics server at
+   startup and exits if the address is not there yet -- and on this
+   fleet `stortree_metrics_bind` names `tailscale0`, which is not up
+   when the unit is first reached. Each transport now waits for its own
+   addresses first; see [An endpoint that never comes up on an
+   interface](#an-endpoint-that-never-comes-up-on-an-interface).
+2. *Why nothing recovered.* `PartOf=` propagates a stop downwards but
+   never brings anything back, and systemd propagates a **requested**
+   restart to `PartOf=` dependents while an automatic `Restart=` is not
+   one. Presentations and binds now carry `UpheldBy=` on each parent
+   they are `PartOf=`, so as long as the parent is active systemd keeps
+   them up, retried continuously.
+
+**If you still see it.** Re-applying fixes it -- `stortree_mounts`'
+"Enable and start every rendered unit" starts each presentation and
+bind, and by then the transports are up. There is no cleanup to do
+first. Then find out which half did not hold:
+
+```sh
+# Did a transport fail at boot, and why?
+journalctl -b -u 'stortree-remote@*' --no-pager | grep -iE 'fail|error'
+
+# Is the UpheldBy edge actually on the unit?
+systemctl show stortree-mount@<slug>.service -p UpheldBy
+```
+
+An empty `UpheldBy` means the host is running units rendered before this
+change; one apply rewrites them.
+
+## An apply that takes hours
+
+Known, not fixed. What follows is what is understood about it.
+
+The cost is concentrated in `stortree_mounts`' "Enable and start every
+rendered unit" and "Restart any unit whose file actually changed", and
+it is paid per unit, serially:
+
+* `bindfs` **blocks** when the source it is mounting cannot be read,
+  rather than failing. A presentation whose transport is not up, or
+  whose transport is up but reading through it stalls, therefore holds
+  its start job until `TimeoutStartSec` -- systemd's default 90s --
+  expires. systemd then kills it, `Restart=on-failure` waits
+  `RestartSec=5`, and the whole 95s repeats. `StartLimitBurst` never
+  intervenes, because five starts at 95s apart do not fall inside the
+  10s `StartLimitIntervalSec` window.
+* Ansible's `systemd_service` waits for each of those jobs. Ten mounts
+  in that state is over fifteen minutes in one task, with nothing
+  printed in between.
+
+What puts a mount in that state on this fleet is the peer chain. A host
+serves its peers over sftp out of its own visible tree, so a read from
+one host traverses SMB or sftp, the peer's `bindfs`, the peer's
+`rclone`, and finally the third-party backend. Anything slow or flapping
+at any hop is a start that hangs rather than a start that fails.
+Observed directly on this fleet, during an apply:
+
+```
+rclone[...]: ERROR : home/fp/: Dir.Stat error: error listing "home/fp": connection lost
+```
+
+-- with the peer's `sshd` accepting a fresh connection in the same
+second, so this is the sftp session being torn down and remade
+underneath a listing, not a host refusing connections. `MaxSessions`
+and `MaxStartups` on the serving host were checked and are not being
+hit.
+
+Two things genuinely help today, both of them already in the repo:
+
+* `throttle: 1` on the restart task, so the fleet no longer does this to
+  itself from both ends at once (see [Restarting mounts on a fleet that
+  peer-mounts itself](#restarting-mounts-on-a-fleet-that-peer-mounts-itself)).
+* Not letting transports fail at boot in the first place, which is what
+  the metrics-address wait is for -- a transport that never failed is a
+  presentation that never hangs.
+
+What would fix it properly is bounding how long a presentation may
+block, and that needs a number nobody has measured yet: too short and a
+cold cache on a slow backend becomes a mount that never comes up, which
+is worse than a slow one. `TimeoutStartSec` on
+`stortree-mount@.service.j2` is where it would go.
+
+If an apply is grinding, this is how to tell it is this and not
+something else:
+
+```sh
+# Units stuck starting, and for how long.
+systemctl list-jobs --no-pager | grep running
+
+# The tell: a start that timed out rather than failed.
+journalctl -u 'stortree-mount@*' | grep -E 'start operation timed out|Killing process'
+```
+
+## Restarting mounts on a fleet that peer-mounts itself
+
+Any edit to a unit template re-renders every unit on every host, and the
+apply then restarts each one whose file changed. On a fleet where hosts
+peer-mount each other that is sharper than it looks, because a host
+serves its peers over sftp **out of its own visible tree**: a transport
+restarting here is a source disappearing there.
+
+A peer that is starting its own transport in that window does not
+retry and recover. It fails outright:
+
+```
+ERROR: Failed to create file system for "peer-<host>-...:/srv/stortree/...":
+       stat failed: sftp: "Failure" (SSH_FX_FAILURE)
+```
+
+Survivable once. What turns it into an outage is both hosts doing it to
+each other at the same time: restart storms on both sides,
+`StartLimitBurst` exhausted ("Start request repeated too quickly"), and
+transports left behind as **stale FUSE mounts** -- whose mountpoints
+then cannot be `stat`'d at all, so the next apply cannot even create the
+directory the mount needs. That state does not self-heal; it needs a
+lazy unmount by hand.
+
+The restart task runs `throttle: 1`, one host at a time, which removes
+the mutual half. If you land in the broken state anyway, recover it in
+this order:
+
+```sh
+# 1. On each host: stop the transport, which takes its subtree with it.
+systemctl stop 'stortree-remote@<slug>.service'
+
+# 2. Find and detach anything left stale. A stale mount fails stat(2)
+#    with ENOTCONN ("Transport endpoint is not connected").
+awk '$5 ~ /^\/srv\// {print $5}' /proc/self/mountinfo | sort -u |
+  while read -r m; do
+    timeout 5 stat "$m" >/dev/null 2>&1 || umount -l "$m"
+  done
+
+# 3. Clear the start-limit and failed-state bookkeeping.
+systemctl reset-failed 'stortree-remote@*.service' \
+                       'stortree-mount@*.service' 'stortree-bind@*.service'
+```
+
+Then re-apply. Do the host that **owns** the subtree first: a peer
+cannot mount a path its owner is not currently serving.
+
+## Stopping a mount by hand
+
+`systemctl stop stortree-mount@<slug>` will not keep it stopped. Every
+presentation and bind is `UpheldBy=` the mount below it (see [Shares are
+empty after a reboot](#shares-are-empty-after-a-reboot)), so while that
+parent is active systemd restarts this one within seconds. That is the
+point -- it is what makes the tree converge after a transport blips --
+but it does surprise people.
+
+To actually take a path down, pick the one that matches your intent:
+
+```sh
+# The whole subtree, transport included -- PartOf= carries the stop up.
+systemctl stop stortree-remote@<transport-slug>.service
+
+# Just this one mount, indefinitely. Remember to unmask it afterwards.
+systemctl mask --now stortree-mount@<slug>.service
+```
+
+Do not `systemctl disable` it and expect that to help: `UpheldBy=` is a
+runtime dependency of the parent, not an `[Install]` edge, so a disabled
+unit is upheld exactly as before.
 
 ## Taking a host out of Samba service
 

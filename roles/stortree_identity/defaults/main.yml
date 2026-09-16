@@ -1,0 +1,37 @@
+---
+# The `[sssd]` section stortree renders before stortree/ldap.yml's
+# `extra.sssd` is merged over it (roles/stortree_identity/tasks/main.yml
+# settles the two into `stortree_identity_sssd`, which is what both the
+# template and the socket-retirement task below it read -- one resolved
+# value rather than the same `combine` written twice).
+#
+# `services` is what decides how the responders start, and the two ways
+# are mutually exclusive in a way sssd enforces rather than merely
+# prefers. Naming a responder here makes sssd.service fork it directly.
+# Leaving it out hands the job to socket activation, which is how every
+# current distro ships sssd -- Debian bookworm and trixie both enable
+# sssd-nss.socket, sssd-pam.socket and sssd-ssh.socket out of the box.
+#
+# Configure both and sssd does not pick one: each socket unit runs
+# `sssd_check_socket_activated_responders` as its ExecStartPre, which
+# exits 17 with "configured to be socket-activated but it's still
+# mentioned in the services' line", and the socket unit fails. Identity
+# still works -- sssd.service started that responder itself -- so the
+# damage is quiet and permanent: three failed units and
+# `systemctl is-system-running` stuck at `degraded` on every host, for
+# every boot and every apply, which is exactly the signal an operator
+# needs to stay meaningful. Measured on this fleet: both hosts degraded,
+# sssd-nss/pam/ssh.socket failed, `getent passwd` working fine.
+#
+# stortree keeps `services` and retires the conflicting sockets, rather
+# than the other way round: it is the choice sssd's own error message
+# recommends, and it is the one that cannot fail closed. Dropping
+# `services` on a platform whose sockets are *not* enabled would start
+# no responders at all and take identity down for the whole host.
+#
+# Setting `extra.sssd.services: ""` in stortree/ldap.yml is the way to
+# the modern arrangement: nothing is named, no socket is retired, and
+# the platform's socket activation is left to do the work.
+stortree_identity_sssd_defaults:
+  services: "nss, pam"
+  domains: stortree

@@ -885,14 +885,45 @@
   # unrelated happened to restart it. Hence the second clause -- but
   # only for the transports, which are the units that execute rclone at
   # all. The presentations and binds above them come back on their own
-  # through PartOf=, which is also why this is genuinely disruptive and
-  # why the runbook says to roll an upgrade one host at a time.
+  # through PartOf=, which is also why this is genuinely disruptive.
+  #
+  # `throttle: 1` because on a fleet whose hosts peer-mount each other
+  # this is not merely disruptive in parallel, it is destructive. A host
+  # serves its peers over sftp out of its own visible tree, so a
+  # transport restarting here is a source disappearing there -- and a
+  # peer that happens to be starting its own transport in that window
+  # does not retry-and-recover, it fails outright:
+  #
+  #   Failed to create file system for "peer-...:/srv/stortree/...":
+  #   stat failed: sftp: "Failure" (SSH_FX_FAILURE)
+  #
+  # Which is survivable once. What made it an outage was that both hosts
+  # were doing it to each other at the same time: restart storms on each
+  # side, StartLimitBurst exhausted ("Start request repeated too
+  # quickly"), and two transports left as stale FUSE mounts whose
+  # mountpoints then could not be stat'd at all -- so the *next* apply
+  # could not create the directory the mount needed either. Recovering
+  # it took a hand-driven lazy unmount on both hosts. Observed here,
+  # from one template edit that re-rendered every unit on both hosts.
+  #
+  # One host at a time removes the mutual half entirely: a peer's source
+  # tree is only ever unavailable while that peer is the one restarting,
+  # and by then this host is done. It costs wall-clock time on exactly
+  # the applies that change a unit file and nothing on the ones that
+  # don't, since the `when` below already scopes this to units that
+  # genuinely re-rendered.
+  #
+  # Note this is a stronger guarantee than the runbook's "roll an rclone
+  # upgrade one host at a time with --limit": that is advice an operator
+  # has to remember, for one specific kind of change, and the hazard is
+  # the same for every edit to a unit template.
   ansible.builtin.systemd_service:
     name: "{{ item.dest | basename }}"
     state: restarted
   loop: "{{ stortree_mounts_rendered_units }}"
   loop_control:
     label: "{{ item.entry.local_path }}"
+  throttle: 1
   when: >-
     item.changed
     or (stortree_rclone_upgraded

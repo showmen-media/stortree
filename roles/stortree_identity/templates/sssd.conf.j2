@@ -6,7 +6,14 @@
 # attributes rather than algorithmically synthesizing them -- confirm
 # your server actually exposes those attributes, see spec.md §5.
 
-{% set sssd_section = {'services': 'nss, pam', 'domains': 'stortree'} | combine(stortree_identity_ldap.extra.sssd | default({})) %}
+{#
+Settled in the role's tasks rather than here, because the socket
+retirement that follows the render has to act on exactly the responders
+this section names -- see stortree_identity_sssd_defaults in the role's
+defaults for what happens when the two arrangements disagree. One
+resolved value, read twice.
+#}
+{% set sssd_section = stortree_identity_sssd %}
 [sssd]
 {% for key, value in sssd_section.items() %}
 {{ key }} = {{ value }}

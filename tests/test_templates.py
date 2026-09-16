@@ -85,13 +85,16 @@ def mount_vars(containers, host):
     guard has to fail these renders, and it only does if the guarded
     variables are genuinely absent.
 
-    `stortree_mounts_stop_timeout` comes from the role's own defaults
-    rather than a number written here, so a change to that file reaches
-    these assertions instead of leaving them agreeing with a stale
-    copy."""
+    `stortree_mounts_stop_timeout` and `stortree_mounts_bind_wait` come
+    from the role's own defaults rather than numbers written here, so a
+    change to that file reaches these assertions instead of leaving them
+    agreeing with a stale copy. Both are role defaults, so both really
+    are in scope whatever the metrics settings say -- unlike the
+    metrics_vars() entries below, whose absence here is the point."""
     return {
         "stortree_metrics_enabled": False,
         "stortree_mounts_stop_timeout": MOUNTS_DEFAULTS["stortree_mounts_stop_timeout"],
+        "stortree_mounts_bind_wait": MOUNTS_DEFAULTS["stortree_mounts_bind_wait"],
     }
 
 
@@ -100,17 +103,27 @@ def mount_vars(containers, host):
 METRICS_FACTS = {"wg0": {"ipv4": {"address": "10.10.0.4"}}}
 
 
-def metrics_vars(plan, bind=("127.0.0.1",), mode="metrics-addr", htpasswd=None):
+def metrics_vars(
+    plan, bind=("127.0.0.1",), mode="metrics-addr", htpasswd=None, bind_wait=None
+):
     """What the role has in scope once metrics are switched on -- the
     two facts it derives ("Allocate a metrics port and resolve the
     listen addresses for every mount") plus the two settings it passes
-    straight through."""
+    straight through, and the role default the transport unit waits on.
+
+    `bind_wait` is the role's own default unless a test is about what
+    some other value renders."""
     return {
         "stortree_metrics_enabled": True,
         "stortree_metrics_mode": mode,
         "stortree_metrics_htpasswd": htpasswd,
         "stortree_metrics_listeners": metrics_listeners(list(bind), METRICS_FACTS),
         "stortree_metrics_ports": metrics_ports(plan),
+        "stortree_mounts_bind_wait": (
+            MOUNTS_DEFAULTS["stortree_mounts_bind_wait"]
+            if bind_wait is None
+            else bind_wait
+        ),
     }
 
 
@@ -380,6 +393,121 @@ def test_remote_unit_orders_itself_after_nothing_for_a_literal_address(
     assert "sys-subsystem-net-devices" not in unit
 
 
+def test_remote_unit_waits_for_every_metrics_address_that_can_be_late(
+    render, mount_plans, containers
+):
+    # The .device ordering above is a no-op wherever udev doesn't run,
+    # which includes every container: on this fleet's two LXC guests
+    # sys-subsystem-net-devices-tailscale0.device is loaded and
+    # permanently inactive while the interface is up and addressed, so
+    # every transport failed at boot with "bind: cannot assign requested
+    # address" and took its whole subtree down with it. The wait is what
+    # holds the guarantee there.
+    #
+    # Keyed on the address rather than on where it came from: a literal
+    # address never had a .device to wait on and can be just as late.
+    plan = mount_plans[ALPHA]
+    unit = render(
+        REMOTE_UNIT,
+        entry=transport_for(plan, "tree"),
+        **metrics_vars(plan, bind=("wg0", "10.10.0.9")),
+    )
+    waits = [d for d in directives(unit, "ExecStartPre") if "ip -o addr show" in d]
+    assert len(waits) == 2
+    assert any("10.10.0.4" in w for w in waits)  # wg0, resolved from facts
+    assert any("10.10.0.9" in w for w in waits)  # literal
+    # Matching on output, not exit status: `ip addr show to <absent>`
+    # exits 0 having printed nothing, so testing the command alone would
+    # let every wait through immediately.
+    assert all("grep -q ." in w for w in waits)
+
+
+def test_remote_unit_wait_escapes_its_shell_variables_from_systemd(
+    render, mount_plans, containers
+):
+    # systemd expands $n and ${n} in an Exec line itself, before
+    # /bin/sh is reached, and substitutes the empty string for anything
+    # unset -- so the obvious `[ $n -lt 60 ]` reaches the shell as
+    # `[ -lt 60 ]`, fails to parse, fails ExecStartPre, and fails the
+    # mount this wait exists to protect. `$$` is systemd's literal
+    # dollar. The other Exec lines in these templates use no variables
+    # at all, which is why nothing caught this before.
+    plan = mount_plans[ALPHA]
+    unit = render(
+        REMOTE_UNIT,
+        entry=transport_for(plan, "tree"),
+        **metrics_vars(plan, bind=("wg0",)),
+    )
+    (wait,) = [d for d in directives(unit, "ExecStartPre") if "ip -o addr" in d]
+    assert "$$n" in wait
+    # No bare `$` survives anywhere: every one is half of a `$$` pair.
+    assert "$" not in wait.replace("$$", "")
+
+
+def test_remote_unit_never_waits_for_an_address_that_cannot_race(
+    render, mount_plans, containers
+):
+    # Loopback is up before userspace, so waiting for it is only noise.
+    # The wildcard is the one that matters: it never appears in `ip
+    # addr` output at all, so waiting for it would spend the full
+    # timeout and then fail a bind that would have worked.
+    plan = mount_plans[ALPHA]
+    for address in ("127.0.0.1", "0.0.0.0", "::"):
+        unit = render(
+            REMOTE_UNIT,
+            entry=transport_for(plan, "tree"),
+            **metrics_vars(plan, bind=(address,)),
+        )
+        waits = [d for d in directives(unit, "ExecStartPre") if "ip -o addr" in d]
+        assert waits == [], address
+        assert "TimeoutStartSec" not in unit, address
+
+
+def test_remote_unit_start_timeout_always_outlasts_its_own_wait(
+    render, mount_plans, containers
+):
+    # Otherwise systemd's default 90s start timeout fires *during* a
+    # longer wait, and the journal says "start operation timed out"
+    # instead of naming the address that never arrived.
+    plan = mount_plans[ALPHA]
+    for wait in (30, MOUNTS_DEFAULTS["stortree_mounts_bind_wait"], 600):
+        unit = render(
+            REMOTE_UNIT,
+            entry=transport_for(plan, "tree"),
+            **metrics_vars(plan, bind=("wg0",), bind_wait=wait),
+        )
+        assert str(wait) in directives(unit, "ExecStartPre")[0]
+        (timeout,) = directives(unit, "TimeoutStartSec")
+        assert int(timeout) > wait
+
+
+def test_remote_unit_bind_wait_of_zero_restores_the_unwaited_start(
+    render, mount_plans, containers
+):
+    # The escape hatch documented on the default: a fleet whose
+    # addresses are all configured before multi-user.target has nothing
+    # to wait for and should pay nothing for the option.
+    plan = mount_plans[ALPHA]
+    unit = render(
+        REMOTE_UNIT,
+        entry=transport_for(plan, "tree"),
+        **metrics_vars(plan, bind=("wg0",), bind_wait=0),
+    )
+    assert [d for d in directives(unit, "ExecStartPre") if "ip -o addr" in d] == []
+    assert "TimeoutStartSec" not in unit
+    # ... while still ordering after the device, which costs nothing.
+    assert "sys-subsystem-net-devices-wg0.device" in directives(unit, "After")
+
+
+def test_remote_unit_never_waits_when_metrics_are_off(render, mount_plans, containers):
+    unit = render(
+        REMOTE_UNIT,
+        entry=transport_for(mount_plans[ALPHA], "tree"),
+        **mount_vars(containers, ALPHA),
+    )
+    assert "ExecStartPre" not in unit
+
+
 def test_remote_unit_rc_flavour_always_carries_its_htpasswd(
     render, mount_plans, containers
 ):
@@ -517,6 +645,120 @@ def test_mount_unit_requires_its_own_transport(render, mount_plans, containers):
     assert "After=stortree-remote@tree.service" in unit
     assert "Requires=stortree-remote@tree.service" in unit
     assert "PartOf=stortree-remote@tree.service" in unit
+
+
+def test_every_partof_edge_has_its_upholds_twin_somewhere_in_the_plan(
+    render, mount_plans, containers
+):
+    # PartOf= propagates a stop downwards and stops there; nothing brings
+    # the dependent back when the parent returns. Not Requires=, not
+    # Restart=on-failure (a propagated stop is a clean stop, and a
+    # Type=oneshot bind cannot carry Restart= at all), not systemd's own
+    # restart propagation, which applies to a *requested* restart only.
+    #
+    # That is the whole of the reboot failure on this fleet: transports
+    # failed on an unready metrics address, recovered five seconds later
+    # by themselves, and every presentation and bind stayed `inactive
+    # dead` until someone re-applied. So every PartOf= edge needs an
+    # Upholds= pointing back the other way.
+    #
+    # Asserted over two whole plans as a global mirror rather than unit
+    # by unit, because the two halves are declared in different files:
+    # the dependent names its parent, and the parent names it back.
+    for host in (ALPHA, BRAVO):
+        plan = mount_plans[host]
+        partof, upholds = set(), set()
+        for entry in plan:
+            # `dir` entries render no unit at all -- a path the apply
+            # just creates -- so they have no edges either way.
+            if entry["kind"] not in ("transport", "mount", "bind"):
+                continue
+            template = {
+                "transport": REMOTE_UNIT,
+                "mount": MOUNT_UNIT,
+            }.get(entry["kind"], BIND_UNIT)
+            unit = render(template, entry=entry, **mount_vars(containers, host))
+            me = {
+                "transport": "stortree-remote@",
+                "mount": "stortree-mount@",
+            }.get(entry["kind"], "stortree-bind@") + entry["slug"] + ".service"
+            partof |= {(parent, me) for parent in directives(unit, "PartOf")}
+            upholds |= {(me, child) for child in directives(unit, "Upholds")}
+        assert partof == upholds, host
+
+
+def test_upholds_is_declared_on_the_parent_because_systemd_takes_it_there(
+    render, mount_plans, containers
+):
+    # `UpheldBy=` is an [Install] directive -- `systemctl enable` writes
+    # it out as a symlink -- so naming it in [Unit] on the dependent is
+    # silently ignored. That is not theory: the first version of this
+    # fix did exactly that, `systemctl show` reported an empty
+    # UpheldBy=, and a stopped presentation sat dead for the full 24s it
+    # was watched. `Upholds=` in [Unit] on the parent needs no symlink,
+    # takes effect on daemon-reload, and brought the same unit back in
+    # under two seconds.
+    for host in (ALPHA, BRAVO):
+        for entry in mount_plans[host]:
+            if entry["kind"] not in ("transport", "mount", "bind"):
+                continue
+            template = {
+                "transport": REMOTE_UNIT,
+                "mount": MOUNT_UNIT,
+            }.get(entry["kind"], BIND_UNIT)
+            unit = render(template, entry=entry, **mount_vars(containers, host))
+            assert "UpheldBy" not in unit, entry["slug"]
+
+
+def test_a_transport_upholds_the_transports_nested_inside_it(
+    render, mount_plans, containers
+):
+    # A nested transport is PartOf= its container, so a container
+    # restart stops it -- cleanly, which means Restart=on-failure does
+    # not bring it back either. Observed during an apply that
+    # re-rendered every unit: the container transport restarted, the
+    # nested one stayed down, and its mountpoint was left as a stale
+    # FUSE mount that had to be unmounted by hand.
+    plan = mount_plans[BRAVO]
+    nested = next(
+        e for e in plan if e["kind"] == "transport" and e["requires_transport"]
+    )
+    container = next(
+        e
+        for e in plan
+        if e["kind"] == "transport" and e["slug"] == nested["requires_transport"]
+    )
+    unit = render(REMOTE_UNIT, entry=container, **mount_vars(containers, BRAVO))
+    assert (
+        f"Upholds=stortree-remote@{nested['slug']}.service" in unit
+    )
+
+
+def test_nothing_upholds_a_unit_that_was_never_rendered(
+    render, mount_plans, containers
+):
+    # A `group`-only node on the host that owns the subtree collapses to
+    # a local directory with a real chown and no presentation unit at
+    # all. Naming one in Upholds= would be the same "Unit not found"
+    # that once took out both members' folders, only retried forever.
+    for host in (ALPHA, BRAVO):
+        plan = mount_plans[host]
+        real = {
+            "stortree-remote@" + e["slug"] + ".service"
+            for e in plan
+            if e["kind"] == "transport"
+        } | {
+            "stortree-mount@" + e["slug"] + ".service"
+            for e in plan
+            if e["kind"] == "mount"
+        } | {
+            "stortree-bind@" + e["slug"] + ".service"
+            for e in plan
+            if e["kind"] == "bind"
+        }
+        for entry in plan:
+            assert set(entry["upholds"]) <= real, (host, entry["slug"])
+            assert all("None" not in u for u in entry["upholds"])
 
 
 def test_mount_unit_orders_after_the_deepest_presentation_above_it(
@@ -908,6 +1150,30 @@ LDAP_MIN = {
     "posix": {"uid_attr": "uidNumber", "gid_attr": "gidNumber"},
 }
 
+IDENTITY_DEFAULTS = yaml.safe_load(
+    (REPO_ROOT / "roles/stortree_identity/defaults/main.yml").read_text()
+)
+
+
+def sssd_vars(ldap):
+    """What roles/stortree_identity/tasks/main.yml has in scope when it
+    renders sssd.conf: the raw ldap.yml, plus the `[sssd]` section it
+    settled first ("Settle this host's [sssd] section").
+
+    The settling is repeated here rather than the fixture writing out a
+    section of its own, because retiring the conflicting responder
+    sockets keys off exactly this value -- a test that invented its own
+    would stop being about what the role does. The defaults come from
+    the role's own file, for the same reason MOUNTS_DEFAULTS does."""
+    extra = (ldap.get("extra") or {}).get("sssd", {})
+    return {
+        "stortree_identity_ldap": ldap,
+        "stortree_identity_sssd": {
+            **IDENTITY_DEFAULTS["stortree_identity_sssd_defaults"],
+            **extra,
+        },
+    }
+
 
 def ini_pairs(rendered, section):
     """The `key = value` pairs of one section of a rendered ini file."""
@@ -927,7 +1193,7 @@ def ini_pairs(rendered, section):
 def test_sssd_conf_renders_without_an_extra_key_at_all(render):
     # ldap.yml.example ships `extra:` fully commented out, so the
     # common case is a config that simply has no such key.
-    rendered = render(SSSD_CONF, stortree_identity_ldap=LDAP_MIN)
+    rendered = render(SSSD_CONF, **sssd_vars(LDAP_MIN))
     assert ini_pairs(rendered, "sssd") == {
         "services": "nss, pam",
         "domains": "stortree",
@@ -946,7 +1212,7 @@ def test_sssd_conf_leaves_ldap_id_mapping_unset(render):
     # Deliberate: unset means SSSD reads the directory's real POSIX
     # attributes instead of synthesizing ids (spec.md §5). Setting it
     # would give every host its own made-up, mutually inconsistent uids.
-    rendered = render(SSSD_CONF, stortree_identity_ldap=LDAP_MIN)
+    rendered = render(SSSD_CONF, **sssd_vars(LDAP_MIN))
     # The header comment mentions it by name, so check the directives
     # themselves rather than the raw text.
     assert "ldap_id_mapping" not in ini_pairs(rendered, "domain/stortree")
@@ -956,9 +1222,7 @@ def test_sssd_conf_leaves_ldap_id_mapping_unset(render):
 def test_sssd_conf_extra_overrides_a_default_rather_than_duplicating_it(render):
     rendered = render(
         SSSD_CONF,
-        stortree_identity_ldap=dict(
-            LDAP_MIN, extra={"sssd": {"services": "nss, pam, ssh"}}
-        ),
+        **sssd_vars(dict(LDAP_MIN, extra={"sssd": {"services": "nss, pam, ssh"}})),
     )
     assert ini_pairs(rendered, "sssd")["services"] == "nss, pam, ssh"
     assert rendered.count("services = ") == 1
@@ -967,14 +1231,16 @@ def test_sssd_conf_extra_overrides_a_default_rather_than_duplicating_it(render):
 def test_sssd_conf_extra_domain_merges_over_the_built_in_domain_section(render):
     rendered = render(
         SSSD_CONF,
-        stortree_identity_ldap=dict(
-            LDAP_MIN,
-            extra={
-                "domain": {
-                    "ldap_tls_reqcert": "demand",
-                    "cache_credentials": "false",
-                }
-            },
+        **sssd_vars(
+            dict(
+                LDAP_MIN,
+                extra={
+                    "domain": {
+                        "ldap_tls_reqcert": "demand",
+                        "cache_credentials": "false",
+                    }
+                },
+            )
         ),
     )
     domain = ini_pairs(rendered, "domain/stortree")
@@ -987,13 +1253,15 @@ def test_sssd_conf_extra_domain_merges_over_the_built_in_domain_section(render):
 def test_sssd_conf_any_other_extra_key_becomes_its_own_section(render):
     rendered = render(
         SSSD_CONF,
-        stortree_identity_ldap=dict(
-            LDAP_MIN,
-            extra={
-                "sssd": {"services": "nss, pam, ssh"},
-                "domain": {"ldap_tls_reqcert": "demand"},
-                "ssh": {"ssh_hash_known_hosts": "false"},
-            },
+        **sssd_vars(
+            dict(
+                LDAP_MIN,
+                extra={
+                    "sssd": {"services": "nss, pam, ssh"},
+                    "domain": {"ldap_tls_reqcert": "demand"},
+                    "ssh": {"ssh_hash_known_hosts": "false"},
+                },
+            )
         ),
     )
     assert "[ssh]" in rendered
