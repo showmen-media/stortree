@@ -34,12 +34,22 @@
   tags: [identity]
 
 - name: Render sssd.conf
+  # 0640, not the 0600 you would expect for a file holding an LDAP bind
+  # password, because 0640 is what sssd itself maintains: it rewrites
+  # the mode of its own config on every start. Declaring 0600 here does
+  # not make the file 0600 -- it makes every apply differ from disk, so
+  # the template reports `changed`, the handler restarts sssd, sssd sets
+  # 0640 back, and the next apply does it again. Measured on a host:
+  # chmod 0600 held until `systemctl restart sssd`, which returned it to
+  # 0640 within seconds. The cost was a needless sssd restart on every
+  # single run, on a fleet where identity underpins Samba and every
+  # file's ownership. 0640 root:root is still root-only.
   ansible.builtin.template:
     src: sssd.conf.j2
     dest: /etc/sssd/sssd.conf
     owner: root
     group: root
-    mode: "0600"
+    mode: "0640"
   notify: stortree sssd.conf changed
   no_log: true
   tags: [identity]
