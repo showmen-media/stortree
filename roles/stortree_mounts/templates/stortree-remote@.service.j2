@@ -179,7 +179,33 @@ stortree_rclone_bin in roles/stortree_mounts/defaults/main.yml.
 #}
 ExecStart={{ stortree_rclone_bin }} mount {{ entry.remote }} {{ mount_path }} \
 {% for k, v in entry.args.items() %}
-  --{{ k }}{{ ' ' ~ (v | string) if (v is not sameas true) else '' }} \
+{#
+systemd splits ExecStart on whitespace, so an args value that contains a
+space becomes two arguments. For `rclone mount`, which takes exactly two
+positional arguments, the stray one lands as a third positional: rclone
+exits 2 and prints its whole usage text, naming no flag, which is a long
+way from the actual mistake. Real case, and the reason this is here --
+an rclone.args `bwlimit: "03:00,3M:off 07:00,1M:off"` (rclone's own
+timetable syntax, one value, one space) rendered as
+`--bwlimit 03:00,3M:off 07:00,1M:off` and failed every start on the one
+host that carried it, while the rest of the fleet came up clean.
+
+Quote only when the value actually contains whitespace. Quoting every
+value unconditionally would rewrite every unit file on every host, and
+the apply restarts each unit whose file changed -- on a fleet that
+peer-mounts itself that is the expensive kind of restart (see
+docs/runbook.md "Restarting mounts on a fleet that peer-mounts itself").
+This way a fleet with no spaces in any args value renders byte-identical
+units and nothing restarts.
+
+systemd still processes backslash escapes inside double quotes, so a
+backslash and an embedded quote both have to be escaped on the way in.
+#}
+{% set rendered = v | string %}
+{% if ' ' in rendered or '\t' in rendered %}
+{% set rendered = '"' ~ (rendered | replace('\\', '\\\\') | replace('"', '\\"')) ~ '"' %}
+{% endif %}
+  --{{ k }}{{ ' ' ~ rendered if (v is not sameas true) else '' }} \
 {% endfor %}
 {#
 This mount's own metrics endpoint. Per mount rather than per host

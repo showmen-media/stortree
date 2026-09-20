@@ -287,6 +287,36 @@ def test_remote_unit_renders_a_boolean_true_arg_as_a_bare_flag(
     assert "  --read-only \\" in unit
 
 
+def test_remote_unit_quotes_an_arg_value_containing_whitespace(
+    render, mount_plans, containers
+):
+    # systemd splits ExecStart on whitespace, so rclone's own bwlimit
+    # timetable syntax -- one value, one space -- would otherwise reach
+    # `rclone mount` as a third positional argument, and it exits 2 with a
+    # usage dump that names no flag.
+    entry = dict(
+        transport_for(mount_plans[ALPHA], "tree"),
+        args={"bwlimit": "03:00,3M:off 07:00,1M:off"},
+    )
+    unit = render(REMOTE_UNIT, entry=entry, **mount_vars(containers, ALPHA))
+    assert '  --bwlimit "03:00,3M:off 07:00,1M:off" \\' in unit
+
+
+def test_remote_unit_leaves_a_whitespace_free_arg_value_unquoted(
+    render, mount_plans, containers
+):
+    # Quoting every value would rewrite every unit file on every host, and
+    # the apply restarts each unit whose file changed -- costly on a fleet
+    # that peer-mounts itself. Only values that need quotes get them.
+    entry = dict(
+        transport_for(mount_plans[ALPHA], "tree"),
+        args={"vfs-cache-max-size": "200G"},
+    )
+    unit = render(REMOTE_UNIT, entry=entry, **mount_vars(containers, ALPHA))
+    assert "  --vfs-cache-max-size 200G \\" in unit
+    assert '"200G"' not in unit
+
+
 def test_remote_unit_stop_is_tolerant_of_an_already_gone_mountpoint(
     render, mount_plans, containers
 ):
