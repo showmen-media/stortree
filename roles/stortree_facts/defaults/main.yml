@@ -14,10 +14,12 @@ stortree_root: /srv/stortree
 
 # Where layer-1 (transport) rclone mounts live -- a local directory on
 # every managed host, deliberately outside stortree_root and never part
-# of the visible tree (docs/spec.md §2 "The two layers"). It mirrors the
-# tree, so <stortree_remotes_root>/<path> and <stortree_root>/<path> are
-# the same directory on the backend reached by two different local
-# paths.
+# of the visible tree (docs/spec.md §2 "The two layers"). It is flat:
+# each transport mounts on one directory of its own here, named from its
+# node's path (filter_plugins/stortree.py, _remote_dir()), so no
+# transport's mountpoint is ever inside another transport's mount. It
+# mirrored the tree until that nesting turned out to be what let two
+# peering hosts hold each other down -- see the same docstring.
 #
 # It is local, which is the point: nothing here is ever written to a
 # backend, so a remote's own directory structure holds only the paths

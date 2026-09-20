@@ -212,23 +212,25 @@ def test_remote_unit_presents_one_uniform_ownership_and_enforces_it(
     assert "--allow-other \\" in unit
 
 
-def test_remote_unit_nests_inside_the_transport_above_it(
+def test_remote_unit_does_not_nest_inside_the_transport_above_it(
     render, mount_plans, containers
 ):
-    # The remotes root mirrors the tree, so a transport sits inside
-    # whichever transport is above it and a remount of the outer one
-    # detaches it -- PartOf=, exactly as in the visible tree.
+    # Layer 1 is flat, so a transport whose *node* sits below another
+    # transport's node is still an independent mount on a local
+    # directory of its own. While the remotes root mirrored the tree its
+    # mountpoint really was inside the outer mount, which is why this
+    # unit used to carry After=/PartOf= it: an outer remount detached it
+    # silently. Nothing above it can detach it now, so nothing orders it.
     unit = render(
         REMOTE_UNIT,
         entry=transport_for(mount_plans[BRAVO], "tree/home/.mounts/whitfield-media"),
         **mount_vars(containers, BRAVO),
     )
-    assert "After=stortree-remote@tree.service" in unit
-    assert "PartOf=stortree-remote@tree.service" in unit
-    assert (
-        "RequiresMountsFor=/srv/.stortree-remotes/tree/home/.mounts/whitfield-media"
-        in unit
-    )
+    assert "After=stortree-remote@tree.service" not in unit
+    assert "PartOf=stortree-remote@tree.service" not in unit
+    # It mounts on its own flat directory, and on no path inside `tree`.
+    assert "/srv/.stortree-remotes/tree,home,.mounts,whitfield-media" in unit
+    assert "/srv/.stortree-remotes/tree/" not in unit
 
 
 def test_remote_unit_declared_requires_is_hard_and_never_partof(
@@ -740,28 +742,28 @@ def test_upholds_is_declared_on_the_parent_because_systemd_takes_it_there(
             assert "UpheldBy" not in unit, entry["slug"]
 
 
-def test_a_transport_upholds_the_transports_nested_inside_it(
-    render, mount_plans, containers
-):
-    # A nested transport is PartOf= its container, so a container
-    # restart stops it -- cleanly, which means Restart=on-failure does
-    # not bring it back either. Observed during an apply that
-    # re-rendered every unit: the container transport restarted, the
-    # nested one stayed down, and its mountpoint was left as a stale
-    # FUSE mount that had to be unmounted by hand.
+def test_a_transport_upholds_no_other_transport(render, mount_plans, containers):
+    # This edge existed because a nested transport was PartOf= its
+    # container: a container restart stopped it *cleanly*, so
+    # Restart=on-failure never brought it back, and the mountpoint was
+    # left as a stale FUSE mount to unmount by hand. Observed during an
+    # apply that re-rendered every unit.
+    #
+    # Flat, a transport's mountpoint is its own local directory and an
+    # outer restart cannot reach it, so the PartOf= went -- and with it
+    # the only reason one transport had to uphold another.
     plan = mount_plans[BRAVO]
     nested = next(
-        e for e in plan if e["kind"] == "transport" and e["requires_transport"]
+        e for e in plan if e["kind"] == "transport" and e["parent_transport"]
     )
     container = next(
         e
         for e in plan
-        if e["kind"] == "transport" and e["slug"] == nested["requires_transport"]
+        if e["kind"] == "transport" and e["slug"] == nested["parent_transport"]
     )
     unit = render(REMOTE_UNIT, entry=container, **mount_vars(containers, BRAVO))
-    assert (
-        f"Upholds=stortree-remote@{nested['slug']}.service" in unit
-    )
+    assert f"Upholds=stortree-remote@{nested['slug']}.service" not in unit
+    assert "Upholds=stortree-remote@" not in unit
 
 
 def test_nothing_upholds_a_unit_that_was_never_rendered(

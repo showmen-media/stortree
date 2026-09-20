@@ -318,6 +318,70 @@ you changed tree shape/hosts/remotes). Nothing needs manual cleanup --
 `stortree_mounts` removes stale units and always recomputes every path's
 ownership/mode from the current resolved facts.
 
+## A lazy unmount that will not return
+
+Symptom: `umount -l` on a stortree path does not come back at all, and
+neither does `stat` or `mountpoint` on it. `findmnt` may show nothing
+mounted there while the path still hangs, and the rclone that served it
+is a zombie (`Z` in `ps`) that `kill -9` cannot clear.
+
+A lazy unmount detaches a mount from the namespace; it does not cancel
+I/O the kernel has already handed to a FUSE server. When that server
+died without answering, those requests sit in the connection's queue
+forever and every new syscall on the path joins them. The runbook's own
+teardown loops then block on the first such path and never reach the
+rest.
+
+Abort the connection instead. That fails every pending and future
+request on it with `ENOTCONN` immediately, which is what lets the
+unmount finish:
+
+```sh
+# Connections with requests waiting are the wedged ones.
+for c in /sys/fs/fuse/connections/*/; do
+  w=$(cat "$c/waiting" 2>/dev/null) || continue
+  [ "${w:-0}" != 0 ] && { echo "aborting ${c} (waiting=$w)"; echo 1 > "$c/abort"; }
+done
+```
+
+Then re-run the unmount sweep. Measured on a production host: one
+connection with 19 requests waiting was holding 17 mounts and both
+teardown loops; aborting it detached all 17 at once, and the zombie
+rclones were reaped immediately. Without it the only remaining option is
+a reboot.
+
+Aborting is safe for a mount you are tearing down anyway — it is the
+mount equivalent of the process already being dead — and it is not a
+substitute for `ExecStop` on a healthy mount, which should be stopped
+normally.
+
+**Abort, then unmount, then start — in that order.** Aborting kills the
+FUSE server but leaves its mount *attached*, now stale, so anything
+trying to mount there next fails with
+
+```
+fuse: failed to access mountpoint /srv/stortree/<path>:
+      Transport endpoint is not connected
+```
+
+and keeps failing, because `Restart=` cannot clear a stale mount. Going
+straight from abort to `systemctl start` is therefore worse than the
+hang it was meant to fix: it converts one stuck mount into a
+mountpoint nothing can use. Doing it in a restart of a whole
+presentation family took a host from 29/29 units to 4/29 until the
+stranded mount was cleared by hand. Always put the unmount sweep
+between them:
+
+```sh
+# ... abort loop above, then:
+findmnt -t fuse,fuse.rclone,fuse.bindfs -no TARGET | grep '^/srv/' |
+  while read -r m; do
+    timeout 5 stat "$m" >/dev/null 2>&1 || umount -l "$m"
+  done
+systemctl reset-failed 'stortree-*'
+systemctl start '<the unit>'
+```
+
 ## A masked mount (e.g. after upgrading `stortree-mount@.service.j2`)
 
 A top-level subtree's own mount can end up active but unreachable to
@@ -371,15 +435,11 @@ Restarting the covering mount does not help either: `PartOf=`
 propagates a stop to the nested unit, but the stranded mount is not
 what that unit is holding.
 
-It happens in **either root**, and the remotes root is the more likely
-of the two during a migration:
-
-- in the visible tree, when a node gains a presentation
-  (`stortree-mount@`) over descendants that already had mounts;
-- under `stortree_remotes_root`, when a subtree gains a transport
-  (`stortree-remote@`) above transports that were already mounted at
-  paths beneath it -- which is what happens the first time a host that
-  peer-mounts only some leaves starts peer-mounting the whole subtree.
+It happens **in the visible tree only**, when a node gains a
+presentation (`stortree-mount@`) over descendants that already had
+mounts. Layer 1 cannot produce it: transports mount on flat
+directories of their own, so none is ever above another
+(spec.md §2 "The two layers").
 
 For a single stranded mount, stop from the outside in, unmount it while
 it is reachable, then start in the other order:
@@ -424,84 +484,6 @@ own `After=`/`PartOf=` order them correctly from then on -- and it
 cannot recur once a host is past the apply that introduced the covering
 mount.
 
-## A transport mountpoint buried under stray local directories
-
-Symptom: a `stortree-remote@` unit restart-loops with
-
-```
-Fatal error: failed to mount FUSE fs: "/srv/.stortree-remotes/<path>"
-is not empty, use --allow-non-empty to mount anyway
-```
-
-and every transport nested inside it fails alongside, usually with the
-opposite-sounding `cannot open: ... no such file or directory` for its
-own mountpoint. `findmnt` shows nothing mounted at either path.
-
-Read the two messages together: the parent will not mount because its
-mountpoint has content, and the children have no mountpoint to mount on
-because the only place theirs could exist is inside the parent's
-backend, which nothing can reach while the parent is down.
-
-Not the same failure as "A stranded mount" above, which reports
-`directory already mounted` and is about a live mount attached in the
-wrong place. This one is about a mountpoint that is not a mountpoint at
-all -- an ordinary local directory with ordinary local directories
-inside it.
-
-**Cause.** A transport's mountpoint under `stortree_remotes_root` is a
-plain local directory whenever its unit is down. Applies before this
-was guarded created every nested path regardless, so anything under a
-stopped transport landed on the underlying disk instead of on the
-backend -- and rclone refuses a non-empty mountpoint, so the mount could
-never come back. The two states hold each other up: the mount is down,
-so the strays get created; the strays exist, so the mount stays down.
-
-A current apply will not do this to you -- it reads
-`/proc/self/mountinfo` and skips every path that resolves inside a
-transport that is not currently mounted -- but it also cannot clean up
-what an older one left, because "an empty directory that should not
-exist" and "an empty directory waiting to be mounted on" are the same
-thing on disk. Clearing it is a manual step, once per affected host.
-
-**Check what is actually there** before deleting anything. Use `find
--xdev` and `du -x`: without them both walk into any live mount nested
-under the path and report the backend's contents as if they were local,
-which turns a handful of empty directories into an alarming number.
-
-```sh
-find /srv/.stortree-remotes/<transport path> -xdev ! -type d   # files?
-du -xsh /srv/.stortree-remotes/<transport path>                # bytes?
-```
-
-Expect no files and near-zero bytes: these are directory skeletons, and
-often under names a later config change has already retired, since
-nothing ever removed them. If files *do* turn up, stop -- that is
-content written to the local disk instead of to the backend, and it
-wants copying somewhere before any of the below.
-
-**Clear it.** Stop the transport family outside in first: a nested
-transport can legitimately be mounted *inside* the mountpoint you are
-about to empty, and removing directories around a live mount is how the
-stranded-mount entry above starts.
-
-```sh
-systemctl stop 'stortree-bind@*' 'stortree-mount@*' 'stortree-remote@*'
-systemctl reset-failed
-findmnt -t fuse.rclone,fuse -no TARGET | grep /srv/     # expect nothing
-
-find /srv/.stortree-remotes/<transport path> -mindepth 1 -depth -type d -delete
-```
-
-`-depth -type d -delete` removes directories deepest-first and only
-directories, so it stops at anything that is not one rather than
-deleting it. `-mindepth 1` keeps the mountpoint itself, which the role
-expects to exist.
-
-Re-apply. The transport mounts on the now-empty mountpoint, and the
-nested transports' mountpoints get created through it -- which is a
-second apply's work, as it is for any brand-new nested entry (see "N
-path(s) ... are still missing" below).
-
 ## "N path(s) ... are still missing" at the end of a mounts run
 
 `stortree_mounts` creates directories with `ignore_errors: true`
@@ -519,11 +501,10 @@ One missing path is not automatically a bug:
 - **Expected, and pointing at something else.** Every path inside a
   transport is listed, because that transport is down. The role skips
   creating anything inside a transport it cannot see mounted, rather
-  than writing it to the local disk under the mountpoint and locking
-  the mount out for good (see "A transport mountpoint buried under
-  stray local directories" above). The missing paths are a symptom: fix
-  the transport -- `systemctl status stortree-remote@<slug>` -- and
-  they are created on the next apply.
+  than writing it to the local disk under the mountpoint, which rclone
+  would then refuse to ever mount over. The missing paths are a
+  symptom: fix the transport -- `systemctl status
+  stortree-remote@<slug>` -- and they are created on the next apply.
 - **Real.** The same paths are still listed after a second, back-to-back
   apply. Scroll back to the `ignore_errors`'d directory tasks in the run
   output: the actual error (a full disk, a backend rejecting the write,
@@ -689,8 +670,8 @@ with it on the way down. The journal shows the pair plainly:
 
 ```
 20:25:59  rclone: Failed to start metrics server: listen tcp
-          100.127.27.30:27031: bind: cannot assign requested address
-20:25:59  Dependency failed for stortree-mount@...psychias-media
+          10.10.0.4:27031: bind: cannot assign requested address
+20:25:59  Dependency failed for stortree-mount@...whitfield-media
 20:26:11  Started stortree-remote@...                     <- recovers, alone
 ```
 
@@ -788,76 +769,83 @@ systemctl list-jobs --no-pager | grep running
 journalctl -u 'stortree-mount@*' | grep -E 'start operation timed out|Killing process'
 ```
 
-## Two hosts that peer-mount each other can deadlock
+## Two hosts that peer-mount each other can stall
 
-The worst failure this fleet has, and the one that turns a short apply
-into an unbounded one. Worth understanding before touching mounts on
-more than one host at a time.
+Not the old mount-time deadlock -- that one needed a host's own
+mountpoints to live inside a mount it peers from the other host, and
+layer 1 being flat ended it (spec.md §2). Mounts now always start. What
+survives is the same cycle at *read* time, and it is quieter.
 
-Peer mounts can point both ways at once, and on this fleet they do:
+Two hosts that peer each other read through one another: one serves its
+visible tree out of a mount sourced from the other, and that other
+serves the subtrees it peers out of the first one's visible tree. So a
+stall anywhere on the cycle travels all the way around it.
 
-* **bravo** peer-mounts the whole tree root from **alpha**, so every one
-  of bravo's own mountpoints lives *inside* a mount sourced from alpha.
-* **alpha** peer-mounts three subtrees back from **bravo**
-  (`home/.mounts/_mp-fam`, `home/.mounts/_psychias-media`,
-  `system-data/configs/psychias-alpha`).
+**Symptom.** Reads hang rather than fail, on more hosts than the one
+with the problem, while `systemctl` insists everything is fine --
+`Upholds=` keeps the units `active (running)` because the processes are
+alive; it is the *requests* that are stuck.
 
-Take both down and neither can come up. Alpha's mount of a
-bravo-owned subtree blocks, waiting for bravo. That blocked mount makes
-`readdir` of the directory *containing* it hang, so alpha's sftp server
-stalls serving that directory, so bravo cannot read the mountpoint it
-needs, so bravo cannot start the mount alpha is waiting for.
-
-It shows up as I/O that hangs rather than fails, which is why it is
-hard to recognise:
-
-```
-# On the owning host -- the individual entries are fine ...
-stat .../home/fp/_fp-archive          15ms
-# ... but the directory holding them is not.
-ls -l .../home/fp/                    45s, and climbing
-```
-
-Each retry on either side leaves another stale FUSE mount behind, and
-every retry hammers the peer over sftp, so the two hosts hold each other
-down indefinitely. Measured during exactly this: alpha's listing went
-from 45s back to **39ms** the moment bravo stopped retrying.
-
-**Recovery, in order.** The rule is that the *owner* of a subtree comes
-up before anyone peering it.
+**Find the one that is actually broken**, rather than the ones waiting
+on it. Layer 1 and layer 2 fail separately, so test them separately on
+each host: a transport reads at `<remotes_root>/<its flat dir>`, its
+presentation at the visible path on top.
 
 ```sh
-# 1. On each host that peers a subtree it does not own, stop that
-#    transport, so its mountpoint reverts to a plain directory.
-systemctl stop 'stortree-remote@<peer-slug>.service'
+findmnt -no SOURCE /srv/.stortree-remotes/<flat dir>     # what it is
+timeout 10 ls /srv/.stortree-remotes/<flat dir>          # layer 1
+timeout 10 ls /srv/stortree/<path>                       # layer 2
+```
 
-# 2. Sweep both hosts for what the retries left behind. A stale mount
-#    fails stat(2) with ENOTCONN; deepest first, so a parent never
-#    detaches a child out from under the loop.
-awk '$5 ~ /^\/srv\// {print $5}' /proc/self/mountinfo |
-  awk '{print length, $0}' | sort -rn | cut -d' ' -f2- |
+A host where layer 1 answers quickly and layer 2 hangs is the culprit,
+and it is local to that host -- nothing upstream is involved. That is
+worth knowing before touching the peers, because the hosts that merely
+*wait* on it look identically broken from the outside. Seen in
+production: one host's root transport answered in 26ms while its
+presentation hung past 10s, and on the strength of the hang alone two
+other hosts had already been blamed.
+
+The usual culprit is a wedged presentation. Each `bindfs` is
+single-threaded (`Tasks: 1` in `systemctl status`), so one request that
+never returns blocks that entire mount and everything nested inside it.
+`ps -o stat,wchan` shows it parked in `request_wait_answer`.
+
+**Fix the broken one, in this order.** The order matters -- see
+"A lazy unmount that will not return" for why aborting first and
+starting second does not work.
+
+```sh
+# 1. Try the ordinary restart first; it often just works.
+systemctl restart 'stortree-mount@<slug>.service'
+
+# 2. If that hangs, the mount is wedged. Abort its FUSE connection,
+#    THEN clear the mount it leaves stranded, THEN start.
+for c in /sys/fs/fuse/connections/*/; do
+  w=$(cat "$c/waiting" 2>/dev/null) || continue
+  [ "${w:-0}" != 0 ] && echo 1 > "$c/abort"
+done
+findmnt -t fuse,fuse.rclone,fuse.bindfs -no TARGET | grep '^/srv/' |
   while read -r m; do
     timeout 5 stat "$m" >/dev/null 2>&1 || umount -l "$m"
   done
-systemctl reset-failed 'stortree-remote@*.service' \
-                       'stortree-mount@*.service' 'stortree-bind@*.service'
-
-# 3. Apply the owning host, and check it actually serves the subtree.
-#    Read it as the service account, not as root -- that is who sftp is.
-sudo -u stortree ls /srv/stortree/<subtree>
-
-# 4. Only then start the peering host's transports back up.
-systemctl start 'stortree-remote@<peer-slug>.service'
+systemctl reset-failed 'stortree-*'
+systemctl start 'stortree-mount@<slug>.service'
 ```
 
-A note on step 3, because it costs an hour to learn: read as
-`stortree`, not as root. The sftp server serves peers as that account,
-and a path can be instant for root and hang for `stortree`.
+**Then check the peers, which do not always recover on their own.** A
+peer that read an empty or failing directory while the owner was stuck
+has that answer cached for `--dir-cache-time` (5m), so it can come back
+*mounted and empty* -- which looks healthy and is not. Compare entry
+counts across hosts rather than trusting the mount state:
 
-Watch for rclone's directory cache in between -- `--dir-cache-time` is
-5m, so a host can keep reporting "No such file or directory" for a
-directory its peer has already created. Restarting that transport
-refreshes it.
+```sh
+ls -A /srv/stortree/<path> | wc -l      # on the owner, and on each peer
+```
+
+Restart the peer's transport for any that disagree; that refreshes the
+cache. Seen in production immediately after a recovery: the owner and
+one peer listed five entries, a second peer listed zero in 18ms, and a
+transport restart fixed it.
 
 ## Restarting mounts on a fleet that peer-mounts itself
 
@@ -892,8 +880,11 @@ this order:
 systemctl stop 'stortree-remote@<slug>.service'
 
 # 2. Find and detach anything left stale. A stale mount fails stat(2)
-#    with ENOTCONN ("Transport endpoint is not connected").
-awk '$5 ~ /^\/srv\// {print $5}' /proc/self/mountinfo | sort -u |
+#    with ENOTCONN ("Transport endpoint is not connected"). Select by
+#    filesystem *type*, not by path: /srv/stortree itself may be a
+#    mount you put there (a CIFS or NFS share backing the tree root),
+#    and a path-glob sweep will try to unmount it too.
+findmnt -t fuse.rclone,fuse -no TARGET | grep '^/srv/' |
   while read -r m; do
     timeout 5 stat "$m" >/dev/null 2>&1 || umount -l "$m"
   done
@@ -905,6 +896,9 @@ systemctl reset-failed 'stortree-remote@*.service' \
 
 Then re-apply. Do the host that **owns** the subtree first: a peer
 cannot mount a path its owner is not currently serving.
+
+If step 2 hangs rather than returning, the mount is wedged rather than
+merely stale -- see "A lazy unmount that will not return" above.
 
 ## Stopping a mount by hand
 

@@ -17,10 +17,13 @@ Ansible project.
 > creation, and
 > the unknown-key rejection each exist because the obvious version broke
 > on real hosts; those incidents are recorded at their point of
-> implementation. What that leaves untested is the *clean-slate* path:
-> nothing has ever applied these roles to a host that didn't already have
-> them, which is exactly what the Docker-based scenario in
-> `molecule/full-tree/` would cover. See
+> implementation. The *clean-slate* path has now been walked once, on a
+> real host that had none of these roles on it — it worked, and it
+> immediately surfaced a bug no converged host could have: an
+> `rclone.args` value containing a space rendered unquoted into
+> `ExecStart`, which systemd then split. One host and one config is not
+> the multi-host scenario `molecule/full-tree/` would cover, so the gap
+> is narrower rather than closed. See
 > [docs/plan.md](docs/plan.md) "What's verified" for the precise line
 > between the two, and [docs/spec.md](docs/spec.md) for the full design.
 
@@ -230,12 +233,12 @@ commands above are run by hand.
 ## Status
 
 All roles and both playbooks are implemented and applied to a real
-fleet. The gap is the clean-slate path: `molecule test` has never been
-run in any scenario, so nothing has verified a first apply against a
-host that didn't already have these roles on it — see
-[docs/plan.md](docs/plan.md) "What's verified" for exactly which checks
-back which claim. Contributions and design feedback are welcome via
-issues.
+fleet, including one first apply onto a host that had never seen them.
+`molecule test` has still never been run in any scenario, so nothing
+automated covers the clean-slate path and nothing at all covers it on
+more than the one host — see [docs/plan.md](docs/plan.md) "What's
+verified" for exactly which checks back which claim. Contributions and
+design feedback are welcome via issues.
 
 ## License
 

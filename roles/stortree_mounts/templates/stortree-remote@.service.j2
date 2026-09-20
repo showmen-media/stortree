@@ -1,10 +1,10 @@
 {#
 Layer 1, transport: the rclone mount for one node's `rclone.remote`,
-mounted under stortree_remotes_root at the node's own path rather than
-anywhere in the visible tree. The remotes root mirrors the tree, so
-<remotes_root>/<path> and <stortree_root>/<path> are the same directory
-on the backend reached by two different local paths. See
-docs/spec.md §2 "The two layers".
+mounted under stortree_remotes_root in a flat directory of its own
+(entry.source_path) rather than anywhere in the visible tree. Flat, so
+no transport's mountpoint is ever inside another transport's mount --
+see _layer_plan_entries() in filter_plugins/stortree.py for the three
+failure modes that bought that, and docs/spec.md §2 "The two layers".
 
 This is the only layer that talks to a backend and the only layer that
 caches, so every operator-supplied rclone.args value is rendered here
@@ -15,19 +15,13 @@ Description=rclone transport mount %i (managed by stortree, do not edit by hand)
 After=network-online.target
 Wants=network-online.target
 {#
-PartOf= alongside the containment dependency: this mount's own
-mountpoint lives *inside* that other transport's tree, so when it
-restarts, this mount is silently detached -- the rclone process keeps
-running and systemd keeps reporting the unit active, while the path it
-was serving quietly reverts to whatever sits underneath. After=/Requires=
-don't help: they propagate start ordering and stop, never restart.
-PartOf= is the one that does.
+No dependency on the transport containing this node, deliberately.
+While layer 1 mirrored the tree this unit's mountpoint lived inside
+that other mount, so an outer restart silently detached this one and
+only PartOf= brought it back. Flat, the mountpoint is this host's own
+local directory: nothing above it can detach, occupy or strand it, so
+there is nothing to order against and nothing to restart with.
 #}
-{% if entry.requires_transport %}
-After=stortree-remote@{{ entry.requires_transport }}.service
-PartOf=stortree-remote@{{ entry.requires_transport }}.service
-RequiresMountsFor={{ stortree_remotes_root }}/{{ entry.local_path }}
-{% endif %}
 {#
 Declared `requires` (docs/config-schema.md "Requires") attaches to layer
 1, not layer 2: what it expresses is a backend dependency -- most often
@@ -40,7 +34,7 @@ a path that gets shadowed the moment the real mount arrives.
 {% for req in entry.requires_mounts | default([]) %}
 After=stortree-remote@{{ req.slug }}.service
 Requires=stortree-remote@{{ req.slug }}.service
-RequiresMountsFor={{ stortree_remotes_root }}/{{ req.local_path }}
+RequiresMountsFor={{ stortree_remotes_root }}/{{ req.source_path }}
 {% endfor %}
 {#
 Ordering against the interface a metrics listener binds to, when
@@ -112,7 +106,7 @@ Upholds={{ unit }}
 Type=notify
 User={{ stortree_user }}
 Group={{ stortree_group }}
-{% set mount_path = stortree_remotes_root ~ '/' ~ entry.local_path %}
+{% set mount_path = stortree_remotes_root ~ '/' ~ entry.source_path %}
 {#
 Wait for every metrics address that can be late before starting rclone,
 because rclone binding one that isn't there yet is a failed *mount*

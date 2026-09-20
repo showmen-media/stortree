@@ -898,13 +898,12 @@ For that second case, the tree runs **two layers** instead of one.
 **Layer 1, transport** (`stortree-remote@.service.j2`). One `rclone
 mount` per node that declares an `rclone.remote`, mounted under
 `stortree_remotes_root` — a local directory on the host, outside
-`stortree_root` and never part of the visible tree — at the node's own
-path. The remotes root therefore mirrors the tree, and
-`<remotes_root>/<path>` and `<stortree_root>/<path>` are the same
-directory on the backend reached by two different local paths. This is
-the only layer that talks to a backend and the only layer that caches,
-so every operator-supplied `rclone.args` value belongs to it, and there
-is nothing to split between layers.
+`stortree_root` and never part of the visible tree — in a flat
+directory of its own, one per transport, named from the node's path by
+`_remote_dir()`. No transport's mountpoint is ever inside another
+transport's mount. This is the only layer that talks to a backend and
+the only layer that caches, so every operator-supplied `rclone.args`
+value belongs to it, and there is nothing to split between layers.
 
 It is also the only layer that can be *monitored* as rclone, and so the
 only one that renders a metrics listener (off by default; see §8). That
@@ -920,13 +919,61 @@ the paths `config.yml` describes. An earlier revision staged inside the
 tree, in a sibling directory next to each node it served, and every
 staging name it invented appeared on the remote.
 
-Mirroring the tree rather than flattening to one directory per remote is
-not only tidiness. A flat layout must name each directory somehow, and
-the obvious name — the systemd slug — is exactly the wrong one:
-`_slug()` escapes `-` as `\x2d` so unit names stay injective, and
-systemd then *unescapes* that same sequence when it parses an
-`ExecStart` path, silently pointing the mount at a different directory.
-Slugs name units; paths name paths.
+Flat, rather than mirroring the tree, and that is a reversal worth
+recording. Mirroring made `<remotes_root>/<path>` and
+`<stortree_root>/<path>` the same directory seen through two mounts,
+which reads beautifully — and means a nested node's mountpoint is a
+directory *inside the mount above it*. Three things follow that no
+amount of ordering fixes:
+
+* A host that peers a subtree from another host has its own mountpoints
+  inside that peer's mount. Two hosts that peer each other therefore
+  populate each other's mountpoints, and rclone refuses a non-empty
+  mountpoint — so each can hold the other down indefinitely.
+  Structural, not a race: it cost this fleet a weekend of hosts
+  hammering each other over sftp while neither could start the mount
+  the other was waiting for.
+* A transport that owns a node below a peered ancestor cannot be
+  restarted while that ancestor serves content there.
+* Any mount introduced above an existing one strands it: still
+  attached, no longer reachable at the path it occupies, and its own
+  `ExecStop` a no-op because `mountpoint -q` resolves through the new
+  mount.
+
+Flat removes the premise for all three: a transport's mountpoint is a
+plain local directory that nothing else can mount over, occupy or
+detach. What it costs is the pun — source and target are no longer the
+same path spelled two ways, so every consumer reads the plan's
+`source_path` instead of rebuilding `<remotes_root>/<local_path>`.
+
+**It does not remove the mutual dependency itself, and it is worth
+being exact about that**, because all three bullets above are about
+*mounting* and the cycle also exists at *read* time. Two hosts that
+peer each other still read through one another: one serves its visible
+tree out of a mount sourced from the other, and that other serves the
+subtrees it peers out of the first one's visible tree. Mountpoints no
+longer collide, so mounts now always start — but a stall anywhere on
+that cycle still travels around it. Observed in production *after* the
+flattening: a single wedged presentation `bindfs` (single-threaded, so
+one stuck request blocks the mount) made one host's whole visible tree
+hang, which hung the other host's peer mounts of that host's subtrees,
+because those read the hung tree over sftp. Nothing failed to mount;
+everything failed to read. See [runbook.md](runbook.md) "Two hosts
+that peer-mount each other can stall".
+
+Naming those directories is the part that has to be got right, and the
+obvious name — the systemd slug — is exactly the wrong one: `_slug()`
+escapes `-` as `\x2d` so unit names stay injective, and systemd then
+*unescapes* that same sequence when it parses an `ExecStart` path,
+silently pointing the mount at a different directory. `_remote_dir()`
+joins the path's segments with `,` and escapes anything that could be
+read as something else (`\`, `%`, the separator, the escape
+introducer) as `+HH`, so
+`tree/home/.mounts/whitfield-media` becomes
+`tree,home,.mounts,whitfield-media`. Only the mountpoint segment is
+encoded; everything below it keeps the tree's own names, because those
+are directories the backend actually stores. Slugs name units; this
+names paths.
 
 One transport per declaring node, with one exception: a peer mount whose
 content a transport already above it presents gets none of its own
@@ -946,7 +993,7 @@ it reads the covering mount from the inside.
 
 **Layer 2, presentation** (`stortree-mount@.service.j2`). One `bindfs`
 mount per visible node that needs its own ownership, reading
-`<remotes_root>/<path>` and mounted at `<stortree_root>/<path>`,
+`<remotes_root>/<source_path>` and mounted at `<stortree_root>/<path>`,
 carrying the resolved `access` grant as `-u`/`-g`/`-p`. Source and
 target are the same directory on the backend, so there is no data to
 move and nothing to self-mount. It caches nothing, so every byte and
@@ -1077,8 +1124,9 @@ hiding the very mountpoint the unit was about to mount onto.
 
 Creating directories in layer 1 is the fix and the general rule: every
 directory `stortree_mounts` creates for a path inside a transport is
-created at `<remotes_root>/<path>`, which is where the presentation
-serves it from — so it shows up at the visible path for real and stays
+created at `<remotes_root>/<source_path>` — its transport's own flat
+directory, then the node's path below that transport's node — which is
+where the presentation serves it from — so it shows up at the visible path for real and stays
 mountable. The mount units themselves are untouched by this: they still
 mount onto the visible path, which is the whole point — only directory
 *creation* follows the content to where it physically lives.

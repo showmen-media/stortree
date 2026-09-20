@@ -542,8 +542,9 @@
   # created normally below.
   ansible.builtin.stat:
     path: >-
-      {{ (stortree_remotes_root if item.kind == 'transport' else stortree_root)
-         ~ '/' ~ item.local_path }}
+      {{ (stortree_remotes_root ~ '/' ~ item.source_path)
+         if item.kind == 'transport'
+         else (stortree_root ~ '/' ~ item.local_path) }}
   loop: >-
     {{ stortree_mounts_plan
        | selectattr('kind', 'in', ['transport', 'mount']) | list }}
@@ -632,8 +633,9 @@
   # looked: the strays are empty directories, and they outlive the
   # config that named them. The production host this was found on had
   # its transport held shut by two dozen empty directories under names a
-  # later rename had retired (`mp-fam`, where the plan now says
-  # `_mp-fam`) -- nothing in the current plan referred to them, and
+  # later rename had retired (`whitfield-media`, where the plan now
+  # says `_whitfield-media`) -- nothing in the current plan referred to
+  # them, and
   # nothing in the tree was missing except the entire mount.
   #
   # The masked-path check a few tasks up does not catch this and is not
@@ -668,22 +670,22 @@
   tags: [mounts]
 
 - name: Ensure every transport mountpoint exists under the remotes root
-  # Real local directories -- but only a *top-level* transport's is
-  # local. A nested transport's mountpoint lives inside the transport
-  # above it, which means it is a directory on that transport's backend
-  # and can only be created through the running mount, so it waits for
-  # one (`requires_transport`, and the mounted-transports fact above).
+  # Real local directories, all of them, which is the point of layer 1
+  # being flat: a transport's mountpoint is `<remotes_root>/<one flat
+  # name>` and never sits inside another transport's mount, so there is
+  # no backend to reach and nothing to wait for.
   #
-  # Creating it anyway while the parent is down is precisely what
-  # poisons the parent's mountpoint and locks it out permanently: the
-  # directory lands on the local disk underneath, and rclone will not
-  # mount over it afterwards. That is how the failure this guard exists
-  # for actually presented -- the two nested `_mp-fam`/`_psychias-media`
-  # mounts on a peer host each reported "no such file or directory" for
-  # their own mountpoint, while the parent they live in reported "is not
-  # empty" for content a previous apply had written there.
+  # This used to be gated on the transport above being mounted, because
+  # a nested mountpoint *was* a directory on that transport's backend
+  # and creating it while the mount was down put it on the local disk
+  # instead -- which rclone then refused to ever mount over. That is how
+  # it presented on a production host: two nested mounts reporting "no
+  # such file or directory" for their own mountpoints while the parent
+  # they lived in reported "is not empty". Flat, neither half of that
+  # can happen to a mountpoint. The gate still exists, one task down,
+  # for the one directory that genuinely is on a backend.
   ansible.builtin.file:
-    path: "{{ stortree_remotes_root ~ '/' ~ item.local_path }}"
+    path: "{{ stortree_remotes_root ~ '/' ~ item.source_path }}"
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
@@ -694,17 +696,44 @@
     label: "{{ item.local_path }}"
   when:
     - not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
-    - >-
-      item.requires_transport is none
-      or item.requires_transport in stortree_transports_mounted
+  ignore_errors: true
+  tags: [mounts]
+
+- name: Ensure every nested transport has its directory inside the transport above
+  # The one thing flattening layer 1 does not remove. A transport whose
+  # node sits below another transport's node still gets a *presentation*
+  # at its own visible path, and that path is inside the presentation
+  # above it -- so it is a directory on the outer transport's backend,
+  # and only the outer mount can create it.
+  #
+  # Hence the same gate the transport mountpoints used to carry, now
+  # applied only where it is actually true: skip unless the outer
+  # transport is mounted, because with it down this writes to the local
+  # disk under its mountpoint and locks it out exactly as before.
+  ansible.builtin.file:
+    path: "{{ stortree_remotes_root ~ '/' ~ item.parent_source_path }}"
+    state: directory
+    owner: "{{ stortree_user }}"
+    group: "{{ stortree_group }}"
+    mode: "0751"
+  loop: >-
+    {{ stortree_mounts_plan | selectattr('kind', 'equalto', 'transport')
+       | selectattr('parent_transport') | list }}
+  loop_control:
+    label: "{{ item.local_path }}"
+  when:
+    - not (item.local_path | stortree_path_masked(stortree_masked_mount_paths))
+    - item.parent_transport in stortree_transports_mounted
   ignore_errors: true
   tags: [mounts]
 
 - name: Ensure every resolved path exists inside its transport
-  # This is where directory creation actually lands now: the remotes
-  # root mirrors the tree, so a node's real content sits at
-  # <remotes_root>/<path>, on the backend, under exactly the name
-  # config.yml gave it. Creating it here rather than in the visible tree
+  # This is where directory creation actually lands now: a node's real
+  # content sits at <remotes_root>/<source_path> -- its transport's flat
+  # directory, then the node's own path *below that transport's node*,
+  # on the backend, under exactly the name config.yml gave it. Only the
+  # mountpoint segment is flattened; everything past it is the tree's
+  # own names, because those are what the backend stores. Creating it here rather than in the visible tree
   # is what keeps a presentation mount from shadowing the directory a
   # nested mount is about to mount onto -- the failure that took out
   # every per-user bind on the first apply after presentation mounts
@@ -726,7 +755,7 @@
   # content and a mountpoint rclone will never mount over again. See the
   # mounted-transports fact above.
   ansible.builtin.file:
-    path: "{{ stortree_remotes_root ~ '/' ~ item.local_path }}"
+    path: "{{ stortree_remotes_root ~ '/' ~ item.source_path }}"
     state: directory
     owner: "{{ stortree_user }}"
     group: "{{ stortree_group }}"
@@ -991,8 +1020,9 @@
   # re-report here.
   ansible.builtin.stat:
     path: >-
-      {{ (stortree_remotes_root if item.kind == 'transport' else stortree_root)
-         ~ '/' ~ item.local_path }}
+      {{ (stortree_remotes_root ~ '/' ~ item.source_path)
+         if item.kind == 'transport'
+         else (stortree_root ~ '/' ~ item.local_path) }}
     get_checksum: false
   loop: "{{ stortree_mounts_plan }}"
   loop_control:

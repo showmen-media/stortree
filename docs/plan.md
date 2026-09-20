@@ -325,13 +325,22 @@ defaults to off, why the first enable belongs behind `--limit`
 role fails the apply on a port collision or an unresolvable interface
 rather than letting either reach a unit file.
 
-That is the gap, and it is specifically the **clean-slate** gap: the
-production fleet above only ever exercises an apply onto hosts that
-already converged once, so the one path with no evidence behind it at
-all is the first apply onto a host that has never seen these roles —
+That is the gap, and it is specifically the **clean-slate** gap. It has
+since been walked once, by hand, on a real host: a fleet member that
+had no stortree units at all took a first apply of every role —
 package installation, the initial SSSD join, peer trust bootstrapped
-from nothing, and a mount established where no directory yet exists.
-Closing it means running at least the `full-tree` scenario (`cd
+from nothing, and mounts established where no directory yet existed —
+and converged. It also paid for itself immediately, surfacing a bug no
+converged host could have hit: an `rclone.args` value containing a
+space (rclone's own `bwlimit` timetable syntax) rendered unquoted into
+`ExecStart`, so systemd split it and `rclone mount` exited 2 on a third
+positional argument. Every other host in the fleet happened to use
+whitespace-free values, so the defect had been latent since the
+template was written.
+
+One host, one config, and a human watching is not the same as a
+repeatable check. Closing the gap properly still means running at least
+the `full-tree` scenario (`cd
 molecule/full-tree && molecule test`, or per-role via `cd roles/<role>
 && molecule test`) somewhere Docker capacity isn't shared with other
 workloads — see spec.md §9's own caveat about what Molecule-in-Docker

@@ -15,6 +15,7 @@ from filter_plugins.stortree import (
     DEFAULT_ACCESS_PERMISSIONS,
     PER_USER_PLACEHOLDER,
     _normalize_access,
+    _remote_dir,
     _slug,
     access_grant_usernames,
     access_group,
@@ -1697,7 +1698,7 @@ def test_plan_mounts_peer_sources_samba_descendants_it_does_not_own():
     # no layer-1 entry left to nest, so what says where it reads from is
     # the transport its presentation points at.
     assert sys_configs["transport_slug"] == tree_slug
-    assert whitfield_mount["requires_transport"] == tree_slug
+    assert whitfield_mount["parent_transport"] == tree_slug
     # The presentations order against the *deepest* presentation above
     # them, which for a per-user leaf is now its own container rather
     # than the top-level subtree -- the container is a presentation in
@@ -1760,7 +1761,7 @@ def test_plan_mounts_keeps_a_nested_peer_transport_of_a_different_host():
     layer1 = transports(plan)
     for kept in ("tree/home/.mounts/whitfield-media", "tree/home/.mounts/mw-fam"):
         assert "storage-node-bravo" in layer1[kept]["remote"]
-        assert layer1[kept]["requires_transport"] == layer1["tree"]["slug"]
+        assert layer1[kept]["parent_transport"] == layer1["tree"]["slug"]
 
 
 def test_plan_mounts_keeps_a_nested_peer_inside_a_transport_that_is_not_a_peer():
@@ -1817,7 +1818,7 @@ def test_plan_mounts_keeps_a_nested_peer_transport_asking_for_different_args():
     }
     layer1 = transports(plan_mounts(resolved, {}))
     assert set(layer1) == {"top", "top/leaf"}
-    assert layer1["top/leaf"]["requires_transport"] == layer1["top"]["slug"]
+    assert layer1["top/leaf"]["parent_transport"] == layer1["top"]["slug"]
 
     # Same policy on both, and the inner one goes.
     resolved["peer_dependencies"][1] = peer_dependency(
@@ -2433,7 +2434,7 @@ def test_requires_orders_a_subtree_mount_after_a_sibling_cache_subtree():
     }
     plan = plan_mounts(resolve(tree, "h2", ["h1", "h2"]))
     assert _entry(plan, "tree")["requires_mounts"] == [
-        {"local_path": ".cache", "slug": ".cache"}
+        {"local_path": ".cache", "slug": ".cache", "source_path": ".cache"}
     ]
     # and it really is the mount that isn't nested under it
     assert _entry(plan, "tree")["requires_slug"] is None
@@ -2452,7 +2453,8 @@ def test_example_tree_requires_resolves_only_where_the_cache_is_mounted():
         h: plan_mounts(resolve(EXAMPLE_TREE, h, EXAMPLE_HOSTS)) for h in EXAMPLE_HOSTS
     }
     assert _entry(by_host["storage-node-bravo"], "tree")["requires_mounts"] == [
-        {"local_path": ".bravo-cache", "slug": ".bravo\\x2dcache"}
+        {"local_path": ".bravo-cache", "slug": ".bravo\\x2dcache",
+         "source_path": ".bravo-cache"}
     ]
     for host in ("storage-node-alpha", "some-storage-gadget"):
         assert _entry(by_host[host], "tree")["requires_mounts"] == []
@@ -2465,7 +2467,7 @@ def test_requires_accepts_a_bare_string_and_applies_to_a_server_subtree():
     }
     plan = plan_mounts(resolve(tree, "h1", ["h1"]))
     assert _entry(plan, "tree")["requires_mounts"] == [
-        {"local_path": ".cache", "slug": ".cache"}
+        {"local_path": ".cache", "slug": ".cache", "source_path": ".cache"}
     ]
 
 
@@ -2504,7 +2506,9 @@ def test_requires_reaches_a_nested_node_and_leaves_bind_mounts_alone():
     }
     plan = plan_mounts(resolve(tree, "h1", ["h1"]), {"Fam": ["ann", "bo"]})
     real = _entry(plan, "tree/home/.mounts/fam")
-    assert real["requires_mounts"] == [{"local_path": ".cache", "slug": ".cache"}]
+    assert real["requires_mounts"] == [
+        {"local_path": ".cache", "slug": ".cache", "source_path": ".cache"}
+    ]
     for user in ("ann", "bo"):
         assert _entry(plan, f"tree/home/{user}/fam")["requires_mounts"] == []
 
@@ -4192,14 +4196,16 @@ def _entries(*specs):
 
 def test_layer_plan_entries_keeps_the_deepest_ancestor_whatever_the_order():
     # All three "nearest ancestor" searches -- transport for a node,
-    # presentation for a nested mount, transport for a nested transport
-    # -- have to keep the deepest match rather than the last one seen.
+    # presentation for a nested mount, and the transport containing a
+    # nested transport's node (`parent_transport`, which now only says
+    # where that transport's one backend directory goes, not what it
+    # waits for) -- have to keep the deepest match, not the last seen.
     entries = _entries(("top", "r:/"), ("top/mid", "r2:/"), ("top/mid/leaf", "r3:/"))
     transports = relate(entries)
     by_path = {e["local_path"]: e for e in entries}
     assert by_path["top/mid/leaf"]["transport_slug"] == "top-mid-leaf"
     assert by_path["top/mid/leaf"]["requires_slug"] == "top-mid"
-    assert {t["local_path"]: t["requires_transport"] for t in transports} == {
+    assert {t["local_path"]: t["parent_transport"] for t in transports} == {
         "top": None,
         "top/mid": "top",
         "top/mid/leaf": "top-mid",
@@ -4229,7 +4235,7 @@ def test_layer_plan_entries_keeps_the_deepest_ancestor_seen_out_of_order():
     transports = relate(entries)
     by_path = {e["local_path"]: e for e in entries}
     assert by_path["top/mid/leaf"]["requires_slug"] == "top-mid"
-    assert {t["local_path"]: t["requires_transport"] for t in transports}[
+    assert {t["local_path"]: t["parent_transport"] for t in transports}[
         "top/mid/leaf"
     ] == "top-mid"
 
@@ -4287,19 +4293,78 @@ def test_relate_plan_entries_skips_a_plain_directory_ancestor():
     assert by_path["top"]["requires_slug"] is None
 
 
-def test_layer_plan_entries_nests_transports_as_their_nodes_nest():
-    # The remotes root mirrors the tree, so a transport sits inside
-    # whichever transport is above it and has to be ordered against it --
-    # a remount of the outer one detaches the inner, exactly as in the
-    # visible tree. This replaces has_nested_children, which existed only
-    # to force a nested-in mount to stortree:stortree and discard its
-    # grant; transports are uniformly stortree-owned anyway, so the
-    # premise is gone.
+def test_remote_dir_never_emits_a_systemd_escape():
+    # The whole reason layer 1 mirrored the tree for as long as it did.
+    # A slug escapes "-" as \x2d so unit instance names stay injective,
+    # and systemd unescapes exactly that again when it parses an
+    # ExecStart path -- so a slug used as a directory name silently
+    # points the mount somewhere nobody created. Verified on a real
+    # host. _remote_dir() must therefore never emit a backslash, and
+    # never a "%" either (a systemd specifier).
+    assert _slug("backups-mirror") == "backups\\x2dmirror"
+    assert _remote_dir("backups-mirror") == "backups-mirror"
+    for path in ("backups-mirror", "a b/c%d", "x\\y/z", "p,q/r+s"):
+        rendered = _remote_dir(path)
+        assert "\\" not in rendered
+        assert "%" not in rendered
+        assert "/" not in rendered
+
+
+def test_remote_dir_is_injective_over_paths_that_slugs_would_confuse():
+    # The separator has to be unambiguous in both directions: a literal
+    # separator inside a segment escapes, so "a,b" as one segment can
+    # never collide with "a"/"b" as two.
+    assert _remote_dir("a/b") != _remote_dir("a,b")
+    assert _remote_dir("a-b/c") != _remote_dir("a/b-c")
+    # And the escape introducer escapes itself, so a segment that
+    # literally spells an escape sequence is not read as one: "a,b"
+    # encodes to "a+2cb", and a segment literally named "a+2cb" must
+    # encode to something else again.
+    assert _remote_dir("a,b") == "a+2cb"
+    assert _remote_dir("a+2cb") != _remote_dir("a,b")
+
+
+def test_remote_dir_leaves_hyphens_and_dots_alone():
+    # Legibility is the point of not reusing the slug alphabet: the
+    # common case is an operator reading a mountpoint in `findmnt`.
+    assert (
+        _remote_dir("tree/home/.mounts/whitfield-media")
+        == "tree,home,.mounts,whitfield-media"
+    )
+
+
+def test_layer_plan_entries_lands_every_transport_on_a_flat_directory():
+    # Layer 1 is flat: each transport mounts on one directory of its own
+    # under the remotes root, so no mountpoint is ever inside another
+    # mount. `parent_transport` still names the transport containing a
+    # node, but only to say where that node's one backend directory goes
+    # -- its presentation mounts inside the presentation above it -- and
+    # `parent_source_path` says where. Neither orders anything any more.
     entries = _entries(("top", "r:/"), ("top/leaf", "r2:/"))
     transports = relate(entries)
     by_path = {t["local_path"]: t for t in transports}
-    assert by_path["top/leaf"]["requires_transport"] == "top"
-    assert by_path["top"]["requires_transport"] is None
+
+    assert by_path["top"]["source_path"] == "top"
+    assert by_path["top/leaf"]["source_path"] == "top,leaf"
+    # the inner mountpoint is a sibling of the outer one, not a child
+    assert not by_path["top/leaf"]["source_path"].startswith(
+        by_path["top"]["source_path"] + "/"
+    )
+
+    assert by_path["top/leaf"]["parent_transport"] == "top"
+    assert by_path["top/leaf"]["parent_source_path"] == "top/leaf"
+    assert by_path["top"]["parent_transport"] is None
+    assert by_path["top"]["parent_source_path"] is None
+
+
+def test_layer_plan_entries_keeps_real_names_below_a_transports_own_directory():
+    # Only the mountpoint segment is flattened. Everything past it is
+    # the tree's own names, because those are directories the backend
+    # actually stores -- flattening them would rename the remote.
+    entries = _entries(("top", "r:/"), ("top/a-b/c", None))
+    relate(entries)
+    by_path = {e["local_path"]: e for e in entries}
+    assert by_path["top/a-b/c"]["source_path"] == "top/a-b/c"
 
 
 def test_relate_plan_entries_resolves_a_declared_requires_to_its_mount():
@@ -4309,7 +4374,7 @@ def test_relate_plan_entries_resolves_a_declared_requires_to_its_mount():
     # layer 1 -- the layer that does the caching it exists to order.
     by_path = {t["local_path"]: t for t in transports}
     assert by_path["top"]["requires_mounts"] == [
-        {"local_path": "cache", "slug": "cache"}
+        {"local_path": "cache", "slug": "cache", "source_path": "cache"}
     ]
     assert "requires" not in by_path["top"]
 
@@ -4616,19 +4681,25 @@ MOUNTINFO = """\
 26 30 0:23 / /sys rw,nosuid,relatime shared:6 - sysfs sysfs rw
 40 30 0:99 / /srv/.stortree-remotes/top rw,nosuid,relatime shared:9 \
 - fuse.rclone peer-a-top:/srv/stortree/top rw,user_id=999,allow_other
-41 40 0:98 / /srv/.stortree-remotes/top/home/.mounts/_shared rw,relatime shared:10 \
+41 30 0:98 / /srv/.stortree-remotes/top,home,.mounts,_shared rw,relatime shared:10 \
 - fuse.rclone other:/media rw,user_id=999,allow_other
 """
 
+# Layer 1 is flat: a transport's mountpoint is `<remotes_root>/<one flat
+# name>` (_remote_dir()), never a path inside another transport's mount
+# -- note the nested-looking node above is a *sibling* directory here,
+# and that the kernel leaves "," alone in mountinfo (it escapes space,
+# tab, newline and backslash, which is why _remote_dir() emits none).
 PLAN = [
-    {"kind": "transport", "slug": "top", "local_path": "top"},
+    {"kind": "transport", "slug": "top", "local_path": "top", "source_path": "top"},
     {
         "kind": "transport",
         "slug": "top-home-.mounts-_shared",
         "local_path": "top/home/.mounts/_shared",
+        "source_path": "top,home,.mounts,_shared",
     },
-    {"kind": "transport", "slug": "other", "local_path": "other"},
-    {"kind": "dir", "slug": "top-home", "local_path": "top/home"},
+    {"kind": "transport", "slug": "other", "local_path": "other", "source_path": "other"},
+    {"kind": "dir", "slug": "top-home", "local_path": "top/home", "source_path": "top/home"},
 ]
 
 

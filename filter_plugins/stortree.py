@@ -2387,6 +2387,49 @@ def _escape_slug_segment(segment):
     return _SLUG_UNSAFE_CHAR.sub(lambda m: f"\\x{ord(m.group()):02x}", segment)
 
 
+# Characters kept literally in a layer-1 directory name. Deliberately
+# wider than _SLUG_UNSAFE_CHAR's set: this is a filename, not a systemd
+# instance name, so "-" and "." can stay as themselves and the common
+# case stays readable ("tree,home,.mounts,whitfield-media").
+_REMOTE_DIR_UNSAFE_CHAR = re.compile(r"[^A-Za-z0-9_.@-]")
+
+
+def _remote_dir(path):
+    """Turn a resolved node's tree path into the single directory name
+    its transport mounts on under `stortree_remotes_root`.
+
+    Layer 1 is flat -- one directory per transport, never one inside
+    another -- so the whole path has to survive in one filename, and
+    injectively: two nodes that collapse onto one directory are two
+    mounts fighting over one mountpoint.
+
+    Not `_slug()`, and this is the trap worth naming. A slug escapes
+    "-" as `\x2d` so unit *instance names* stay injective, and systemd
+    unescapes exactly that sequence again when it parses an `ExecStart`
+    path -- turning `backups\x2dmirror` back into `backups-mirror` and
+    pointing the mount at a directory nobody created. That was verified
+    on a real host, and it is why layer 1 mirrored the tree for as long
+    as it did. Slugs name units; this names paths.
+
+    So: "," joins the segments, and anything that could be read as
+    something other than itself -- the separator, the escape
+    introducer, "%" (a systemd specifier), "\" (a systemd escape), and
+    anything else outside a conservative literal set -- becomes `+HH`.
+    Same shape as _escape_slug_segment(), different alphabet, chosen so
+    nothing in the result means anything to systemd, to rclone (":" is
+    left out precisely because rclone reads it as a remote separator),
+    or to the shell in an ExecStop.
+
+    Only the transport's own mountpoint is named this way. Everything
+    *inside* it keeps its real path (`<remote_dir>/<real/tail>`),
+    because those are directories on the backend and their names are
+    what config.yml asked for."""
+    return ",".join(
+        _REMOTE_DIR_UNSAFE_CHAR.sub(lambda m: f"+{ord(m.group()):02x}", seg)
+        for seg in path.split("/")
+    )
+
+
 def _slug(path):
     """Turn a resolved node's `/`-joined tree path into a systemd
     instance name, unambiguously: each segment is escaped on its own
@@ -3006,11 +3049,18 @@ def _relate_plan_entries(entries, transports):
             else None
         )
 
-    transport_by_path = {t["local_path"]: t["slug"] for t in transports}
+    transport_by_path = {t["local_path"]: t for t in transports}
 
     for e in list(entries) + list(transports):
         e["requires_mounts"] = [
-            {"local_path": path, "slug": transport_by_path[path]}
+            {
+                "local_path": path,
+                "slug": transport_by_path[path]["slug"],
+                # Layer 1 is flat, so the mountpoint a RequiresMountsFor=
+                # has to name is the target transport's own directory,
+                # not its node's path under the remotes root.
+                "source_path": transport_by_path[path]["source_path"],
+            }
             for path in e.pop("requires", [])
             if path in transport_by_path
         ]
@@ -3071,15 +3121,12 @@ def _uphold_plan_entries(entries, transports):
             uphold("mount", e["symlink_target_slug"], unit)
             uphold("mount", e["requires_slug"], unit)
 
-    for t in transports:
-        # A transport nested inside another is PartOf= it, so it needs
-        # upholding for the same reason everything else does.
-        uphold(
-            "transport",
-            t["requires_transport"],
-            f"stortree-remote@{t['slug']}.service",
-        )
-
+    # Transports uphold nothing of each other's any more. That edge
+    # existed because a nested transport was PartOf= the one containing
+    # it, which was only ever true while layer 1 mirrored the tree and
+    # its mountpoint physically sat inside the outer mount. Flat, a
+    # transport's mountpoint is its own local directory: the outer mount
+    # going away cannot detach it, so there is nothing to bring back.
     for t in transports:
         t["upholds"] = sorted(upheld.get(("transport", t["slug"]), ()))
     for e in entries:
@@ -3123,32 +3170,64 @@ def _layer_plan_entries(entries):
     to prepend.
 
     **Layer 1, transport.** One `rclone mount` per node that declares an
-    `rclone.remote`, mounted under `stortree_remotes_root` at the node's
-    own path -- so the remotes root is a parallel copy of the tree
-    holding the raw, ungoverned view of every backend, and
-    `<remotes_root>/<path>` and `<stortree_root>/<path>` are the same
-    directory seen through two mounts. This is the only layer that talks
-    to a backend and the only layer that caches, so every
-    operator-supplied `rclone.args` value belongs to it.
+    `rclone.remote`, mounted under `stortree_remotes_root` in a flat
+    directory of its own (`_remote_dir()`) -- never inside another
+    transport's mount. This is the only layer that talks to a backend
+    and the only layer that caches, so every operator-supplied
+    `rclone.args` value belongs to it.
 
     Because layer 1 lives outside `stortree_root`, a backend's own
     directory structure holds only what config.yml describes. The
     revision this replaced staged inside the tree, next to each node it
     served, and every staging name it invented showed up on the remote.
 
-    Mirroring the tree rather than flattening to one directory per
-    remote is not just tidiness. A flat layout has to name each
-    directory somehow, and the obvious name -- the systemd slug -- is
-    exactly the wrong one: `_slug()` escapes `-` as `\x2d` so unit names
-    stay injective, and systemd then *unescapes* that same sequence when
-    it parses an `ExecStart` path, turning a slug like `backups\x2dmirror`
-    back into `backups-mirror` and silently pointing the mount at another
-    directory. Verified on a real host. Slugs name units; paths name
-    paths.
+    Flat, rather than mirroring the tree, and that is a reversal worth
+    recording. Mirroring made `<remotes_root>/<path>` and
+    `<stortree_root>/<path>` the same directory seen through two
+    mounts, which reads beautifully and cost this fleet a weekend. When
+    the remotes root has the tree's shape, a nested node's mountpoint is
+    a directory *inside the mount above it*, and three things follow
+    that no amount of ordering fixes:
+
+    * A host that peers a subtree from another host has its own
+      mountpoints inside that peer's mount. Two hosts that peer each
+      other therefore populate each other's mountpoints, and rclone
+      refuses a non-empty mountpoint -- so each can hold the other down
+      indefinitely. Structural, not a race: it cost this fleet a
+      weekend of hosts hammering each other over sftp while neither
+      could start the mount the other was waiting for.
+    * A transport that owns a node below a peered ancestor cannot be
+      restarted while that ancestor serves content there, because the
+      mountpoint it needs is no longer empty.
+    * Any mount introduced above an existing one strands it: still
+      attached, no longer reachable at the path it occupies, and its own
+      `ExecStop` a no-op because `mountpoint -q` resolves through the
+      new mount.
+
+    Flat removes the premise for all three. A transport's mountpoint is
+    a plain local directory that nothing else can mount over, occupy or
+    detach, so no transport waits on, restarts with, or strands another.
+    What it costs is the pun: source and target are no longer the same
+    path spelled two ways, so every consumer reads `source_path` (set
+    below) instead of reassembling `<remotes_root>/<local_path>`.
+
+    It does not remove the mutual dependency itself. Every bullet above
+    is about *mounting*; the cycle also exists at *read* time, where
+    two hosts that peer each other still read through one another.
+    Mounts now always start, and a stall on that cycle still travels
+    around it -- seen after the flattening, when one wedged
+    single-threaded presentation bindfs hung its host's whole visible
+    tree and with it the other host's peer mounts of that host's
+    subtrees, which read that tree over sftp. Nothing failed to mount;
+    everything failed to read.
+
+    Naming those directories is the part that has to be got right, and
+    the obvious name -- the systemd slug -- is exactly the wrong one;
+    `_remote_dir()` documents the trap and the encoding that avoids it.
 
     **Layer 2, presentation.** One `bindfs` mount per visible node that
-    needs its own ownership, reading `<remotes_root>/<path>` and mounted
-    at `<stortree_root>/<path>`. Source and target are the same
+    needs its own ownership, reading `<remotes_root>/<source_path>` and
+    mounted at `<stortree_root>/<path>`. Source and target are the same
     directory on the backend reached by two different local paths, which
     is what makes this work with no data movement and nothing to
     self-mount.
@@ -3221,6 +3300,11 @@ def _layer_plan_entries(entries):
                 "kind": "transport",
                 "local_path": e["local_path"],
                 "slug": e["slug"],
+                # Where this mount actually lands under the remotes
+                # root: one flat directory of its own, never inside
+                # another transport's (_remote_dir(), and the "Layer 1"
+                # note in this function's docstring).
+                "source_path": _remote_dir(e["local_path"]),
                 "remote": e["remote"],
                 "args": e["args"],
                 "peer": e["peer"],
@@ -3252,7 +3336,23 @@ def _layer_plan_entries(entries):
             for path, slug in roots.items()
             if e["local_path"] == path or e["local_path"].startswith(path + "/")
         ]
-        e["transport_slug"] = max(above, key=lambda ps: len(ps[0]))[1] if above else None
+        if above:
+            covering_path, covering_slug = max(above, key=lambda ps: len(ps[0]))
+            e["transport_slug"] = covering_slug
+            # The path this entry's content is at, under the remotes
+            # root: the covering transport's flat mountpoint plus
+            # whatever of this path lies below that transport's node.
+            # With layer 1 flat, that tail is the only thing tying a
+            # path back to the tree, so it is computed once here rather
+            # than reassembled by every template and task that needs it.
+            covering_dir = _remote_dir(covering_path)
+            tail = e["local_path"][len(covering_path) :].lstrip("/")
+            e["source_path"] = f"{covering_dir}/{tail}" if tail else covering_dir
+        else:
+            e["transport_slug"] = None
+            # Outside layer 1 entirely -- a real local directory in the
+            # visible tree, with no remotes-root path at all.
+            e["source_path"] = None
 
         access = e.get("access") or {}
         # A drop is a grant for this purpose: it asks for the plain
@@ -3285,9 +3385,17 @@ def _layer_plan_entries(entries):
         # `selectattr('remote')` count the same backend twice.
         e["remote"] = None
 
-    # A transport nests inside whichever transport is above it, exactly
-    # as its node does in the tree -- the remotes root mirrors the tree,
-    # so the shapes are identical.
+    # Layer 1 is flat, so no transport's mountpoint sits inside another
+    # one and no transport has to wait for, or restart with, the
+    # transport containing its node.
+    #
+    # What does survive the flattening is one directory. A nested
+    # transport's *presentation* still mounts at its node's visible
+    # path, which is inside the presentation above it -- and that
+    # mountpoint is a directory on the outer transport's backend, so it
+    # can still only be created through the outer mount while it is up.
+    # `parent_transport` gates that creation and `parent_source_path`
+    # says where, and neither implies any unit-level relationship.
     for t in transports:
         above = [
             other
@@ -3295,9 +3403,14 @@ def _layer_plan_entries(entries):
             if other is not t
             and t["local_path"].startswith(other["local_path"] + "/")
         ]
-        t["requires_transport"] = (
-            max(above, key=lambda o: len(o["local_path"]))["slug"] if above else None
-        )
+        if above:
+            outer = max(above, key=lambda o: len(o["local_path"]))
+            t["parent_transport"] = outer["slug"]
+            tail = t["local_path"][len(outer["local_path"]) :].lstrip("/")
+            t["parent_source_path"] = f"{_remote_dir(outer['local_path'])}/{tail}"
+        else:
+            t["parent_transport"] = None
+            t["parent_source_path"] = None
 
     return transports
 
@@ -3326,8 +3439,12 @@ def plan_mounts(resolved, group_members=None, stortree_root=DEFAULT_STORTREE_ROO
     for why a symlink doesn't work here -- kept as-is rather than renamed
     everywhere a per-user fan-out is read).
 
-    Each returned entry: {local_path, remote, args, access, peer, slug,
-    requires_slug, has_nested_children, requires_mounts, symlink_target}.
+    Each returned entry: {local_path, source_path, remote, args, access,
+    peer, slug, requires_slug, requires_mounts, symlink_target}.
+    `source_path` is where the entry's content lives under
+    `stortree_remotes_root` -- its transport's own flat directory, then
+    whatever of this path lies below that transport's node -- and None
+    for an entry outside layer 1 altogether.
     `peer` is {owning_host, remote_path} for an entry whose remote is a
     synthesized peer reference and None otherwise (_peer_provenance());
     the last four are settled by the two passes above, which document
@@ -3624,17 +3741,19 @@ def mounted_transport_slugs(plan, mountinfo, remotes_root):
     stortree_mounts uses this to decide whether a path that resolves
     *inside* a transport may be created yet, and getting that wrong is
     not a missed directory -- it is an unrecoverable one. A transport's
-    mountpoint under the remotes root is an ordinary local directory
-    while the mount is down, so `file: state: directory` on anything
-    beneath it writes to the underlying disk instead of to the backend,
+    mountpoint under the remotes root (`<remotes_root>/<slug>`, layer 1
+    being flat) is an ordinary local directory while the mount is down,
+    so `file: state: directory` on anything beneath it writes to the
+    underlying disk instead of to the backend,
     and rclone then refuses to ever mount there again ("is not empty,
     use --allow-non-empty to mount anyway"). The transport being down is
     what caused the stray directories, and the stray directories are
     what keep it down: without this check one failed mount is permanent.
     What buries it deeper is that the strays outlive the config they
     came from -- the production host this was found on had a mountpoint
-    held shut by two dozen empty directories under names (`mp-fam`) that
-    a later rename (`_mp-fam`) had already retired, so nothing in the
+    held shut by two dozen empty directories under names
+    (`whitfield-media`) that a later rename (`_whitfield-media`) had
+    already retired, so nothing in the
     current plan even referred to them any more.
 
     The masked-path check next door does not cover this. It asks whether
@@ -3647,7 +3766,7 @@ def mounted_transport_slugs(plan, mountinfo, remotes_root):
         entry["slug"]
         for entry in plan
         if entry["kind"] == "transport"
-        and f"{remotes_root.rstrip('/')}/{entry['local_path']}" in mounted
+        and f"{remotes_root.rstrip('/')}/{entry['source_path']}" in mounted
     ]
 
 

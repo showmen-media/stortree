@@ -25,7 +25,7 @@ propagate start ordering and stop, never restart.
 After=stortree-remote@{{ entry.transport_slug }}.service
 Requires=stortree-remote@{{ entry.transport_slug }}.service
 PartOf=stortree-remote@{{ entry.transport_slug }}.service
-RequiresMountsFor={{ stortree_remotes_root }}/{{ entry.local_path }}
+RequiresMountsFor={{ stortree_remotes_root }}/{{ entry.source_path }}
 {% endif %}
 {#
 The nearest presentation above this one, if any -- it is what puts this
@@ -134,7 +134,7 @@ mounted over that silently; libfuse2 will not. libfuse3 dropped the
 check and ignores the option, so this stays correct if the package is
 ever relinked.
 #}
-ExecStart=/usr/bin/bindfs {{ stortree_remotes_root }}/{{ entry.local_path }} {{ stortree_root }}/{{ entry.local_path }} \
+ExecStart=/usr/bin/bindfs {{ stortree_remotes_root }}/{{ entry.source_path }} {{ stortree_root }}/{{ entry.local_path }} \
   -u {{ stortree_user_uids[access.owner] if access.owner is defined else stortree_uid }} \
   -g {{ stortree_group_gids[access.group] if access.group is defined else stortree_gid }} \
   -p {{ access | stortree_bindfs_perms }} \
