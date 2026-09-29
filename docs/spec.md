@@ -628,11 +628,7 @@ upstream Samba dropped it in 4.4, and Debian/Ubuntu removed the package
 along with it well before any platform this project targets existed, so
 it's not installable anywhere `stortree_pam_smbpass` would run. The
 `stortree_pam_smbpass` role instead stacks `pam_exec.so
-expose_authtok seteuid` into the host's PAM `auth`/`password` chain
-*after* SSSD's module (via `community.general.pamd` for a declarative,
-idempotent edit rather than hand-patching `/etc/pam.d/common-auth` --
-`pamd` has only ever shipped in `community.general`, never in
-ansible-core),
+expose_authtok seteuid` into the host's PAM `auth`/`password` chain,
 pointed at a small script the role deploys
 (`roles/stortree_pam_smbpass/files/pam-smbpass-sync.sh`). `pam_exec`
 hands that script the plaintext credential on stdin on any successful PAM
@@ -646,6 +642,23 @@ to gate or short-circuit the real auth/password decision) and `seteuid`
 (`passwd` is setuid root, so its real UID is the invoking user — without
 `seteuid` the script would run as that user and be unable to write the
 local smbpasswd database).
+
+The script cannot tell a correct password from a wrong one, so it must
+sit where only an *accepted* credential reaches it. The role ships it as
+a `pam-auth-update` profile in the "Additional" block, which is rendered
+after `requisite pam_deny.so` / `required pam_permit.so`: a Primary
+module (`pam_unix`/`pam_sss`) that succeeds jumps over `pam_deny.so` to
+it, and a failure hits `pam_deny.so` and aborts first. `pam-auth-update`
+computes the jump counts, and the profile survives its regeneration.
+The distro sss profile's password line is plain `sufficient`, which
+returns before the Additional block, so the role rewrites that one
+control to jump over `pam_deny.so` instead. An earlier version of the
+role placed the script *before* `pam_deny.so` and raised the jump counts
+past it, which ran the sync only on failed authentications. That stored
+a mistyped or guessed password as the user's Samba password, and left
+correct logins unsynced. A host that ran that version may still hold
+such a password for any user until their next successful password login
+there.
 
 Caveat: the sync only fires on an actual PAM event *on that specific
 host*, so a user's first SMB connection to a given host fails until

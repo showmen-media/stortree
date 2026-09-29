@@ -1,11 +1,10 @@
 ---
-# Stacks a sync script into the host's PAM auth/password chain, after
-# SSSD's own module, so a successful PAM auth (SSH login, sudo, ...)
-# or password change also syncs that user's Samba NT-hash entry with
-# their LDAP password (spec.md §5 -- Samba's `security = user` needs
-# an NT-compatible hash, not a plain LDAP bind, and this is the
-# ready-made answer that doesn't require the LDAP server to maintain
-# the Samba schema itself).
+# Stacks a sync script into the host's PAM auth/password chain so a
+# successful PAM auth (SSH login, sudo, ...) or password change also
+# syncs that user's Samba NT-hash entry with their LDAP password
+# (spec.md §5 -- Samba's `security = user` needs an NT-compatible hash,
+# not a plain LDAP bind, and this is the ready-made answer that doesn't
+# require the LDAP server to maintain the Samba schema itself).
 #
 # This used to be Samba's own pam_smbpass.so (package libpam-smbpass),
 # spec.md's originally documented answer -- but upstream Samba dropped
@@ -14,72 +13,52 @@
 # bookworm, Ubuntu jammy/noble) existed. It is not installable on any
 # of them. pam_exec.so (ships in libpam-modules, always present)
 # stacked with `expose_authtok` is the modern replacement: it hands
-# the plaintext credential to files/pam-smbpass-sync.sh on stdin,
-# which drives `smbpasswd -s -a` the same way pam_smbpass used to.
+# the credential to files/pam-smbpass-sync.sh on stdin, which drives
+# `smbpasswd -s -a` the same way pam_smbpass used to.
 #
-# Declarative/idempotent via community.general.pamd (spec.md says
-# ansible.builtin.pamd; the module has always shipped in
-# community.general, not ansible-core, so that's what's actually used
-# here) rather than hand-patching /etc/pam.d/common-auth -- BUT pamd
-# only handles the single line it's told to insert; it doesn't know
-# that a `success=N` jump-count on an *earlier* line was tuned assuming
-# nothing sits between that line and pam_deny.so. Inserting a new
-# module there without also renumbering those earlier jump-counts
-# means a successful pam_unix/pam_sss auth falls through and lands on
-# `pam_deny.so requisite`, which always fails and aborts the whole
-# stack -- i.e. a correct password gets rejected. Both chains below
-# explicitly fix those counts (verified against this fleet's actual
-# /etc/pam.d/common-{auth,password} -- re-verify if the stack ever
-# gains/loses a provider) rather than relying on pamd to figure it out.
-# Read straight from community.general's pamd.py before relying on any
-# of this: `control` is a required match key for every state (including
-# `updated`/`absent`, not just `before`/`after`), and `module_path` for
-# matching an *existing* rule must be the bare path only (e.g.
-# `pam_unix.so`) -- the file parser splits path from trailing module
-# arguments via regex, so a combined "path args" string never matches
-# anything and silently no-ops (`new_module_path`, used only to
-# construct a brand new line, is the one place a combined string is
-# fine).
+# *Where* in the chain the script sits is the whole point, and the
+# earlier version of this role got it backwards. The script trusts
+# whatever credential it is handed -- it has no way to tell a correct
+# password from a typo -- so it must only ever be reached after a
+# Primary module (pam_unix/pam_sss) has accepted that credential. The
+# old role inserted it between pam_sss and pam_deny.so and bumped the
+# `success=N` jump counts to keep a successful auth off pam_deny.so;
+# the bumped counts jumped the script too, so it ran only when every
+# module had *failed*. Net effect: a correct login never synced, and a
+# failed one -- a typo, or anyone's guess -- became that user's Samba
+# password.
 #
-# Whether pam_winbind.so is stacked alongside pam_unix/pam_sss changes
-# pam_unix's correct jump-count (stortree_samba actively removes
-# winbind -- it's an unwanted side effect of samba's package
-# Recommends, not something this fleet wants authenticating anyone --
-# but a host may not have converged yet), so each chain below detects
-# winbind's actual presence in the live file first and branches on it,
-# rather than guessing from the numbers alone: a fixed host's winbind-
-# absent target value (pam_unix success=3 in the auth chain) is
-# numerically identical to the winbind-present case's *trigger* value,
-# so a naive "old -> new" pair that tried to handle both shapes would
-# misfire on a second run and drift the count upward forever.
+# pam-auth-update already has a slot with exactly the semantics
+# needed: the "Additional" block, rendered after the `requisite
+# pam_deny.so` / `required pam_permit.so` pair. The only way there is a
+# Primary module succeeding and jumping over pam_deny.so; a failure
+# hits pam_deny.so, which is requisite and aborts the stack. So the
+# script ships as a pam-auth-update profile (files/pam-config) rather
+# than as lines patched into common-{auth,password}, and pam-auth-
+# update computes every jump count itself. That also means
+# stortree_samba's `pam-auth-update --force`, which runs just before
+# this role, now preserves the line instead of wiping it.
 #
-# Each chain also unconditionally removes any existing copy of the
-# sync-script line before reinserting exactly one, rather than trusting
-# pamd's own before/after duplicate check -- that's what let this line
-# get inserted repeatedly in the past (4 copies observed in the wild)
-# despite the check existing in pamd's source. This way the sequence
-# self-heals to the same correct end state regardless of whether a host
-# has never been touched, is mid-way through the old broken config, or
-# has already been fixed by a previous run.
+# One exception pam-auth-update can't express: the distro sss profile
+# stacks pam_sss.so in the *password* chain as plain `sufficient`,
+# which on success returns straight to the caller and never reaches
+# the Additional block -- so an LDAP user's password change would never
+# sync. A task below rewrites that one control to the jump equivalent
+# of `sufficient` that lands on pam_permit.so instead of returning.
+# That edit is a local modification pam-auth-update doesn't know
+# about, so stortree_samba's regeneration undoes it every apply and
+# this role redoes it: that task reports `changed` every run. If
+# anything else regenerates the file in between, the password-change
+# sync stops for LDAP users until the next apply; auth sync is
+# unaffected, and nothing about it can sync a wrong password.
 #
-# `optional` (rather than pam_smbpass's old `sufficient`) is
-# deliberate: this module is a side effect, not a source of truth for
-# whether auth/password-change succeeds, so it must never be able to
-# short-circuit or gate the rest of the stack. `seteuid` matters most
-# for the password-chain stacking: `passwd` is setuid root, so its
-# real UID is the invoking user and only the effective UID is root --
-# without `seteuid`, pam_exec would run the sync script as that user,
-# who can't write the local smbpasswd database.
-#
-# The password chain's pam_sss.so line uses the simple `sufficient`
-# control rather than a `success=N` jump count: on success it returns
-# immediately to the caller, bypassing everything after it in the
-# stack. Inserting the sync script *after* it (mirroring the auth
-# chain) would mean the sync script never runs for an LDAP-driven
-# password change at all -- the exact case this whole role exists for.
-# So the password chain inserts it *before* pam_sss instead, where it's
-# reached unconditionally regardless of which provider ultimately
-# succeeds.
+# `optional` is deliberate: this module is a side effect, not a source
+# of truth for whether auth/password-change succeeds, so it must never
+# be able to gate the rest of the stack. `seteuid` matters for the
+# password chain: `passwd` is setuid root, so its real UID is the
+# invoking user and only the effective UID is root -- without
+# `seteuid`, pam_exec would run the sync script as that user, who can't
+# write the local smbpasswd database.
 
 - name: Install samba-common-bin (smbpasswd)
   ansible.builtin.apt:
@@ -98,138 +77,88 @@
     mode: "0700"
   tags: [pam_smbpass]
 
-- name: Check whether pam_winbind is still stacked in the auth chain
-  ansible.builtin.command: grep -q pam_winbind.so /etc/pam.d/common-auth
-  register: stortree_pam_winbind_in_auth
+- name: Deploy the sync script's pam-auth-update profile
+  ansible.builtin.copy:
+    src: pam-config
+    dest: /usr/share/pam-configs/stortree-smbpass-sync
+    owner: root
+    group: root
+    mode: "0644"
+  register: stortree_pam_smbpass_profile
+  tags: [pam_smbpass]
+
+# Exits non-zero unless each chain holds exactly one sync line, and it
+# sits after pam_permit.so -- i.e. in the Additional block, reachable
+# only on success. Anything else is either a fresh host or a host still
+# carrying the old role's layout.
+- name: Check that the sync script is stacked only on the success path
+  ansible.builtin.shell: |
+    for f in /etc/pam.d/common-auth /etc/pam.d/common-password; do
+      awk '/^[[:space:]]*#/ { next }
+           /pam_permit\.so/ { permit = 1 }
+           /stortree-pam-smbpass-sync/ { n++; if (!permit) bad = 1 }
+           END { exit (bad || n != 1) }' "$f" || exit 1
+    done
+  register: stortree_pam_smbpass_stack
   changed_when: false
   failed_when: false
   tags: [pam_smbpass]
 
-- name: Check whether pam_winbind is still stacked in the password chain
-  ansible.builtin.command: grep -q pam_winbind.so /etc/pam.d/common-password
-  register: stortree_pam_winbind_in_password
-  changed_when: false
-  failed_when: false
-  tags: [pam_smbpass]
-
-- name: Remove any previously-stacked sync script from the auth chain
-  community.general.pamd:
-    name: common-auth
-    type: auth
-    control: optional
-    module_path: pam_exec.so
+# The old role's lines are local modifications that pam-auth-update
+# does not reliably remove on its own, and one left sitting before
+# pam_deny.so while pam-auth-update recomputes the jump counts around
+# it would put pam_deny.so on the *success* path -- locking every
+# password login out. Remove every copy first, then regenerate from
+# the profiles, which puts back exactly one, in the right place.
+- name: Remove any stacked copy of the sync script before regenerating
+  ansible.builtin.lineinfile:
+    path: "/etc/pam.d/{{ item }}"
+    regexp: 'stortree-pam-smbpass-sync'
     state: absent
+  loop: [common-auth, common-password]
+  when: stortree_pam_smbpass_profile.changed or stortree_pam_smbpass_stack.rc != 0
   tags: [pam_smbpass]
 
-- name: Fix pam_unix's jump count in the auth chain (winbind present)
-  community.general.pamd:
-    name: common-auth
-    type: auth
-    control: "[success=3 default=ignore]"
-    module_path: pam_unix.so
-    new_control: "[success=4 default=ignore]"
-    state: updated
-  when: stortree_pam_winbind_in_auth.rc == 0
+- name: Enable the sync profile and regenerate the PAM chains
+  # DEBIAN_FRONTEND=noninteractive for the same reason stortree_samba
+  # gives it: --force alone does not stop pam-auth-update's
+  # whiptail/dialog frontend from waiting on a tty that never comes.
+  ansible.builtin.command: pam-auth-update --force --enable stortree-smbpass-sync
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  changed_when: true
+  when: stortree_pam_smbpass_profile.changed or stortree_pam_smbpass_stack.rc != 0
   tags: [pam_smbpass]
 
-- name: Fix pam_unix's jump count in the auth chain (winbind absent)
-  community.general.pamd:
-    name: common-auth
-    type: auth
-    control: "[success=2 default=ignore]"
-    module_path: pam_unix.so
-    new_control: "[success=3 default=ignore]"
-    state: updated
-  when: stortree_pam_winbind_in_auth.rc != 0
-  tags: [pam_smbpass]
-
-- name: Fix pam_winbind's jump count in the auth chain
-  community.general.pamd:
-    name: common-auth
-    type: auth
-    control: "[success=2 default=ignore]"
-    module_path: pam_winbind.so
-    new_control: "[success=3 default=ignore]"
-    state: updated
-  when: stortree_pam_winbind_in_auth.rc == 0
-  tags: [pam_smbpass]
-
-- name: Fix pam_sss's jump count in the auth chain
-  community.general.pamd:
-    name: common-auth
-    type: auth
-    control: "[success=1 default=ignore]"
-    module_path: pam_sss.so
-    new_control: "[success=2 default=ignore]"
-    state: updated
-  tags: [pam_smbpass]
-
-- name: Stack the sync script into the auth chain, after pam_sss
-  community.general.pamd:
-    name: common-auth
-    type: auth
-    control: "[success=2 default=ignore]"
-    module_path: pam_sss.so
-    new_type: auth
-    new_control: optional
-    new_module_path: pam_exec.so expose_authtok seteuid /usr/local/sbin/stortree-pam-smbpass-sync
-    state: after
-  tags: [pam_smbpass]
-
-- name: Remove any previously-stacked sync script from the password chain
-  community.general.pamd:
-    name: common-password
-    type: password
-    control: optional
-    module_path: pam_exec.so
-    state: absent
-  tags: [pam_smbpass]
-
-- name: Fix pam_unix's jump count in the password chain (winbind present)
-  community.general.pamd:
-    name: common-password
-    type: password
-    control: "[success=3 default=ignore]"
-    module_path: pam_unix.so
-    new_control: "[success=4 default=ignore]"
-    state: updated
-  when: stortree_pam_winbind_in_password.rc == 0
-  tags: [pam_smbpass]
-
-- name: Fix pam_unix's jump count in the password chain (winbind absent)
-  community.general.pamd:
-    name: common-password
-    type: password
-    control: "[success=2 default=ignore]"
-    module_path: pam_unix.so
-    new_control: "[success=3 default=ignore]"
-    state: updated
-  when: stortree_pam_winbind_in_password.rc != 0
-  tags: [pam_smbpass]
-
-- name: Fix pam_winbind's jump count in the password chain
-  community.general.pamd:
-    name: common-password
-    type: password
-    control: "[success=2 default=ignore]"
-    module_path: pam_winbind.so
-    new_control: "[success=3 default=ignore]"
-    state: updated
-  when: stortree_pam_winbind_in_password.rc == 0
-  tags: [pam_smbpass]
-
-# pam_sss.so itself needs no jump-count fix in the password chain: it
-# uses plain `sufficient` rather than a success=N jump count, so its
-# position relative to pam_deny.so doesn't matter.
-
-- name: Stack the sync script into the password chain, before pam_sss
+# `sufficient` is `[success=done new_authtok_reqd=done default=ignore]`;
+# this keeps everything but `success`, which now jumps over the
+# pam_deny.so that pam-auth-update renders directly after the last
+# Primary module (pam_sss sorts last: its profile priority is below
+# pam_unix's). The check below verifies that adjacency rather than
+# trusting it.
+- name: Let a successful pam_sss password change reach the sync script
   community.general.pamd:
     name: common-password
     type: password
     control: sufficient
     module_path: pam_sss.so
-    new_type: password
-    new_control: optional
-    new_module_path: pam_exec.so expose_authtok seteuid /usr/local/sbin/stortree-pam-smbpass-sync
-    state: before
+    new_control: "[success=1 new_authtok_reqd=done default=ignore]"
+    state: updated
+  tags: [pam_smbpass]
+
+- name: Check the resulting PAM chains
+  ansible.builtin.shell: |
+    for f in /etc/pam.d/common-auth /etc/pam.d/common-password; do
+      awk '/^[[:space:]]*#/ { next }
+           /pam_permit\.so/ { permit = 1 }
+           /stortree-pam-smbpass-sync/ { n++; if (!permit) bad = 1 }
+           END { exit (bad || n != 1) }' "$f" \
+        || { echo "$f: sync script is not stacked exactly once after pam_permit.so"; exit 1; }
+    done
+    awk '/^[[:space:]]*#/ || !NF { next }
+         sss { if (!/pam_deny\.so/) bad = 1; sss = 0 }
+         $1 == "password" && /pam_sss\.so/ { sss = 1; if (/sufficient/) bad = 1 }
+         END { exit bad }' /etc/pam.d/common-password \
+      || { echo "common-password: pam_sss.so is not a success jump directly over pam_deny.so"; exit 1; }
+  changed_when: false
   tags: [pam_smbpass]

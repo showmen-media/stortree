@@ -193,11 +193,11 @@
   # common-* files, so let it do that instead of us reverse-engineering
   # the correct shape for account/session by hand. `--force` is the
   # documented non-interactive form (the same one package postinst/
-  # postrm scripts use), safe for unattended runs. This wipes any custom
-  # line stortree_pam_smbpass previously stacked into common-auth/
-  # common-password -- that role runs immediately after this one in
-  # site.yml's role order and re-inserts it idempotently every apply, so
-  # that's expected and harmless. Runs unconditionally (not gated on the
+  # postrm scripts use), safe for unattended runs. stortree_pam_smbpass
+  # ships its sync script as a pam-auth-update profile, so this keeps
+  # that line; it does undo that role's one local edit (pam_sss's
+  # password control), which the role redoes immediately after this one
+  # in site.yml's role order. Runs unconditionally (not gated on the
   # removal task's changed-ness) so it also converges a host that already
   # had winbind removed by an earlier apply, and self-heals against any
   # future drift in these files -- idempotent from the system's

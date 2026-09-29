@@ -9,3 +9,77 @@
           - stortree is defined
           - stortree.server_subtrees is defined
           - stortree.subtree_mounts is defined
+
+    # The sync must fire on a correct password and never on a wrong
+    # one -- the old stacking had it exactly backwards (tasks/main.yml).
+    # A local user exercises pam_unix's jump over pam_deny.so; pam_sss's
+    # is the same shape, which the role's own final check enforces, but
+    # this scenario has no LDAP server to exercise it live.
+    - name: Install pamtester
+      become: true
+      ansible.builtin.apt:
+        name: pamtester
+        state: present
+
+    - name: Create a local test user with a known password
+      become: true
+      ansible.builtin.user:
+        name: stortree-pamtest
+        password: "{{ 'Correct-horse-1' | password_hash('sha512') }}"
+
+    - name: Authenticate with a wrong password
+      become: true
+      ansible.builtin.command: pamtester login stortree-pamtest authenticate
+      args:
+        stdin: typo-guess
+      register: stortree_pamtest_wrong
+      changed_when: false
+      failed_when: stortree_pamtest_wrong.rc == 0
+
+    - name: Read the Samba entry after the wrong password
+      become: true
+      ansible.builtin.command: pdbedit -L -w -u stortree-pamtest
+      register: stortree_pamtest_after_wrong
+      changed_when: false
+      failed_when: false
+
+    - name: A wrong password never reaches the sync script
+      ansible.builtin.assert:
+        that: stortree_pamtest_after_wrong.rc != 0
+
+    - name: Authenticate with the correct password
+      become: true
+      ansible.builtin.command: pamtester login stortree-pamtest authenticate
+      args:
+        stdin: Correct-horse-1
+      changed_when: false
+
+    - name: Read the synced Samba entry
+      become: true
+      ansible.builtin.command: pdbedit -L -w -u stortree-pamtest
+      register: stortree_pamtest_synced
+      changed_when: false
+
+    - name: Create a local reference user
+      become: true
+      ansible.builtin.user:
+        name: stortree-pamref
+
+    - name: Give the reference user a Samba entry with the same password
+      become: true
+      ansible.builtin.command: smbpasswd -s -a stortree-pamref
+      args:
+        stdin: "Correct-horse-1\nCorrect-horse-1"
+      changed_when: false
+
+    - name: Read the reference Samba entry
+      become: true
+      ansible.builtin.command: pdbedit -L -w -u stortree-pamref
+      register: stortree_pamtest_reference
+      changed_when: false
+
+    - name: A correct password syncs the matching NT hash
+      ansible.builtin.assert:
+        that: >-
+          stortree_pamtest_synced.stdout.split(':')[3]
+          == stortree_pamtest_reference.stdout.split(':')[3]

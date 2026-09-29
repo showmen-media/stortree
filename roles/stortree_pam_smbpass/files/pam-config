@@ -1,0 +1,9 @@
+Name: stortree Samba NT-hash sync (roles/stortree_pam_smbpass)
+Default: yes
+Priority: 0
+Auth-Type: Additional
+Auth:
+	optional	pam_exec.so expose_authtok seteuid /usr/local/sbin/stortree-pam-smbpass-sync
+Password-Type: Additional
+Password:
+	optional	pam_exec.so expose_authtok seteuid /usr/local/sbin/stortree-pam-smbpass-sync
